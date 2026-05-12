@@ -3570,12 +3570,10 @@ impl App {
 
     fn close_tab(&mut self, idx: usize) {
         if idx < self.open_tabs.len() {
+            let next_active =
+                next_active_tab_after_close(self.active_tab, idx, self.open_tabs.len() - 1);
             self.open_tabs.remove(idx);
-            self.active_tab = if self.open_tabs.is_empty() {
-                None
-            } else {
-                Some(idx.saturating_sub(1).min(self.open_tabs.len() - 1))
-            };
+            self.active_tab = next_active;
             if let Some(active_idx) = self.active_tab {
                 let table = self.open_tabs[active_idx].table_name.clone();
                 self.request_table_view(&table);
@@ -3648,6 +3646,25 @@ fn normalize_enumerated_values(values: Vec<String>, total_rows: i64) -> Vec<Stri
         Vec::new()
     } else {
         values
+    }
+}
+
+fn next_active_tab_after_close(
+    active_tab: Option<usize>,
+    closed_idx: usize,
+    remaining_tabs: usize,
+) -> Option<usize> {
+    if remaining_tabs == 0 {
+        return None;
+    }
+
+    match active_tab {
+        Some(active_idx) if active_idx == closed_idx => {
+            Some(closed_idx.saturating_sub(1).min(remaining_tabs - 1))
+        }
+        Some(active_idx) if closed_idx < active_idx => Some(active_idx - 1),
+        Some(active_idx) => Some(active_idx.min(remaining_tabs - 1)),
+        None => None,
     }
 }
 
@@ -4779,6 +4796,72 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert!(app.grid_scrollbar_drag.is_none());
+    }
+
+    #[test]
+    fn tabbar_hit_test_targets_visible_close_glyph() {
+        let (mut app, _rx) = make_test_app();
+        app.open_tabs = vec![TableTab {
+            table_name: "ghost".to_string(),
+        }];
+        app.active_tab = Some(0);
+
+        assert!(matches!(
+            crate::ui::tabbar::hit_test(
+                ratatui::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 3,
+                },
+                &app,
+                9,
+                1,
+                false,
+            ),
+            Some(TabMouseAction::Close(0))
+        ));
+    }
+
+    #[test]
+    fn mouse_click_on_tab_close_button_closes_tab() {
+        let (mut app, mut rx) = make_test_app();
+        app.open_tabs = vec![TableTab {
+            table_name: "ghost".to_string(),
+        }];
+        app.active_tab = Some(0);
+        app.tabbar_area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 3,
+        };
+        app.focus = FocusPane::Sidebar;
+
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 9,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        drain_messages(&mut app, &mut rx);
+
+        assert!(app.open_tabs.is_empty());
+        assert_eq!(app.active_tab, None);
+        assert!(matches!(app.focus, FocusPane::Grid));
+    }
+
+    #[test]
+    fn closing_inactive_tab_keeps_same_active_tab() {
+        assert_eq!(next_active_tab_after_close(Some(2), 0, 3), Some(1));
+        assert_eq!(next_active_tab_after_close(Some(1), 2, 3), Some(1));
+    }
+
+    #[test]
+    fn closing_active_tab_activates_previous_tab() {
+        assert_eq!(next_active_tab_after_close(Some(2), 2, 3), Some(1));
+        assert_eq!(next_active_tab_after_close(Some(0), 0, 2), Some(0));
+        assert_eq!(next_active_tab_after_close(Some(0), 0, 0), None);
     }
 
     // ---------- value picker tests (existing) ----------

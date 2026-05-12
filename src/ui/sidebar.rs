@@ -278,7 +278,33 @@ pub fn render_sidebar(
         .bg(theme.bg_raised)
         .add_modifier(Modifier::BOLD);
 
-    let mut items: Vec<ListItem> = Vec::new();
+    let items = build_sidebar_items(schema, state, theme, symbols, header_style, name_style);
+    let highlight_symbol = format!("{} ", symbols.selection);
+    let list = build_sidebar_list(items, theme, accent_style, &highlight_symbol);
+
+    frame.render_stateful_widget(list, list_area, &mut state.list_state);
+    if scrollbar_area.width > 0 {
+        render_scrollbar(
+            frame.buffer_mut(),
+            scrollbar_area,
+            state.list_state.offset(),
+            state.visible_count(schema),
+            list_area.height as usize,
+            theme,
+            symbols,
+        );
+    }
+}
+
+fn build_sidebar_items(
+    schema: &Schema,
+    state: &SidebarState,
+    theme: &Theme,
+    symbols: &Symbols,
+    header_style: Style,
+    name_style: Style,
+) -> Vec<ListItem<'static>> {
+    let mut items = Vec::new();
 
     let tables_arrow = if state.tables_expanded {
         &symbols.folder_open
@@ -340,23 +366,19 @@ pub fn render_sidebar(
         }
     }
 
-    let highlight_symbol = format!("{} ", symbols.selection);
-    let list = List::new(items)
-        .highlight_style(accent_style)
-        .highlight_symbol(&highlight_symbol);
+    items
+}
 
-    frame.render_stateful_widget(list, list_area, &mut state.list_state);
-    if scrollbar_area.width > 0 {
-        render_scrollbar(
-            frame.buffer_mut(),
-            scrollbar_area,
-            state.list_state.offset(),
-            state.visible_count(schema),
-            list_area.height as usize,
-            theme,
-            symbols,
-        );
-    }
+fn build_sidebar_list<'a>(
+    items: Vec<ListItem<'a>>,
+    theme: &Theme,
+    accent_style: Style,
+    highlight_symbol: &'a str,
+) -> List<'a> {
+    List::new(items)
+        .style(Style::default().bg(theme.bg_soft))
+        .highlight_style(accent_style)
+        .highlight_symbol(highlight_symbol)
 }
 
 fn render_scrollbar(
@@ -399,5 +421,75 @@ fn render_scrollbar(
             symbols.box_vertical.to_string()
         };
         buf.set_string(area.x, y, glyph, style);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{buffer::Buffer, widgets::StatefulWidget};
+
+    use super::*;
+    use crate::db::schema::{IndexMeta, Schema, TableMeta, ViewMeta};
+
+    fn make_schema() -> Schema {
+        Schema {
+            tables: vec![TableMeta {
+                name: "users".to_string(),
+                columns: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+            }],
+            views: vec![ViewMeta {
+                name: "active_users".to_string(),
+                sql: None,
+            }],
+            indexes: vec![IndexMeta {
+                name: "users_name_idx".to_string(),
+                table: "users".to_string(),
+                unique: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn sidebar_list_background_fills_full_panel() {
+        let theme = Theme::default();
+        let symbols = Symbols::default_with_nerd_font(false);
+        let state = SidebarState::default();
+        let schema = make_schema();
+        let header_style = Style::default()
+            .fg(theme.fg_mute)
+            .add_modifier(Modifier::BOLD);
+        let name_style = Style::default()
+            .fg(theme.fg_dim)
+            .add_modifier(Modifier::DIM);
+        let accent_style = Style::default()
+            .fg(theme.accent)
+            .bg(theme.bg_raised)
+            .add_modifier(Modifier::BOLD);
+        let items =
+            build_sidebar_items(&schema, &state, &theme, &symbols, header_style, name_style);
+        let highlight_symbol = format!("{} ", symbols.selection);
+        let list = build_sidebar_list(items, &theme, accent_style, &highlight_symbol);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 18,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(area);
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+
+        StatefulWidget::render(&list, area, &mut buf, &mut list_state);
+
+        assert_eq!(
+            buf[(area.right() - 1, area.top())].style().bg,
+            Some(theme.bg_raised)
+        );
+        assert_eq!(
+            buf[(area.right() - 1, area.bottom() - 1)].style().bg,
+            Some(theme.bg_soft)
+        );
     }
 }

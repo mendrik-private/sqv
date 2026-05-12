@@ -217,8 +217,8 @@ pub fn hit_test(
         let tab_width = name_w + sup_w + 6;
         let tab_end = cursor.saturating_add(tab_width).min(right);
         if x >= cursor && x < tab_end {
-            // │(1) space(1) name(name_w) [sup(sup_w)] → × is at cursor+2+name_w+sup_w
-            let close_x = cursor + 2 + name_w + sup_w;
+            // │(1) space(1) name(name_w) [sup(sup_w)] space(1) → × is at cursor+3+name_w+sup_w
+            let close_x = cursor + 3 + name_w + sup_w;
             if middle_click || x == close_x {
                 return Some(TabMouseAction::Close(idx));
             }

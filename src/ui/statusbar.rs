@@ -1,7 +1,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     Frame,
 };
 
@@ -171,24 +171,20 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
 
     let preview = truncate_preview(&cell_preview, area.width as usize / 3, app.symbols.ellipsis);
     let preview_width = preview.chars().count() as u16;
-    let preview_x = if preview.is_empty() {
-        area.x + area.width
-    } else {
-        area.x + area.width.saturating_sub(preview_width + 1)
-    };
+    let (content_right, preview_x) = preview_layout(area, preview_width);
 
     let mut x = area.x;
     for (idx, (text, style)) in segments.iter().enumerate() {
-        if x >= preview_x {
+        if x >= content_right {
             break;
         }
-        x = put(buf, x, area.y, preview_x, text, *style);
-        if idx + 1 < segments.len() && x < preview_x {
+        x = put(buf, x, area.y, content_right, text, *style);
+        if idx + 1 < segments.len() && x < content_right {
             x = put(
                 buf,
                 x,
                 area.y,
-                preview_x,
+                content_right,
                 &app.symbols.segment_separator(),
                 Style::default().fg(theme.line).bg(theme.bg_soft),
             );
@@ -202,7 +198,7 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
             area.y,
             area.x + area.width,
             &preview,
-            Style::default().fg(theme.fg).bg(theme.bg_soft),
+            preview_style(theme),
         );
     }
 }
@@ -217,6 +213,21 @@ fn truncate_preview(s: &str, max_chars: usize, ellipsis: char) -> String {
         out.push(ellipsis);
     }
     out
+}
+
+fn preview_layout(area: Rect, preview_width: u16) -> (u16, u16) {
+    let right = area.x + area.width;
+    if preview_width == 0 {
+        return (right, right);
+    }
+
+    let preview_x = right.saturating_sub(preview_width + 1);
+    let content_right = preview_x.saturating_sub(1);
+    (content_right, preview_x)
+}
+
+fn preview_style(theme: &crate::theme::Theme) -> Style {
+    Style::default().fg(Color::Black).bg(theme.accent)
 }
 
 fn action_hint_text(app: &App) -> Option<String> {
@@ -287,9 +298,10 @@ mod tests {
     use std::sync::Arc;
 
     use r2d2_sqlite::SqliteConnectionManager;
+    use ratatui::style::Color;
     use tokio::sync::mpsc;
 
-    use super::action_hint_text;
+    use super::{action_hint_text, preview_layout, preview_style};
     use crate::{
         app::{App, FocusPane},
         config::Config,
@@ -384,6 +396,47 @@ mod tests {
         let hints = action_hint_text(&app).expect("grid hints");
 
         assert!(!hints.contains("[n] set null"));
+    }
+
+    #[test]
+    fn preview_layout_reserves_gap_before_preview_text() {
+        let (content_right, preview_x) = preview_layout(
+            ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 1,
+            },
+            5,
+        );
+
+        assert_eq!(content_right, 13);
+        assert_eq!(preview_x, 14);
+    }
+
+    #[test]
+    fn preview_layout_uses_full_width_when_preview_is_empty() {
+        let (content_right, preview_x) = preview_layout(
+            ratatui::layout::Rect {
+                x: 3,
+                y: 0,
+                width: 20,
+                height: 1,
+            },
+            0,
+        );
+
+        assert_eq!(content_right, 23);
+        assert_eq!(preview_x, 23);
+    }
+
+    #[test]
+    fn preview_style_uses_black_text_on_accent_background() {
+        let theme = crate::theme::Theme::default();
+        let style = preview_style(&theme);
+
+        assert_eq!(style.fg, Some(Color::Black));
+        assert_eq!(style.bg, Some(theme.accent));
     }
 }
 

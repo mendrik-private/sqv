@@ -143,8 +143,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         );
         let msg = format!(" Loading {}...", tab.table_name);
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(msg)
-                .style(ratatui::style::Style::default().fg(app.theme.fg_dim)),
+            ratatui::widgets::Paragraph::new(msg).style(
+                ratatui::style::Style::default()
+                    .fg(app.theme.fg_dim)
+                    .bg(app.theme.bg),
+            ),
             inner,
         );
     } else {
