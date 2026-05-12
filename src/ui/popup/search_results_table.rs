@@ -14,6 +14,7 @@ use crate::{
         types::{affinity, ColAffinity, SqlValue},
     },
     grid::layout,
+    symbols::Symbols,
     theme::Theme,
 };
 
@@ -50,6 +51,7 @@ pub(crate) fn render_search_result_table(
     table_area: Rect,
     table: SearchResultTable<'_>,
     theme: &Theme,
+    symbols: &Symbols,
 ) {
     let SearchResultTable {
         headers,
@@ -92,8 +94,11 @@ pub(crate) fn render_search_result_table(
         table_area,
         table_area.y,
         &separator_positions,
-        TableRuleGlyphs { middle: '┬' },
+        TableRuleGlyphs {
+            middle: symbols.table_rule_header_mid,
+        },
         theme,
+        symbols,
     );
 
     let header_y = table_area.y + 1;
@@ -107,7 +112,14 @@ pub(crate) fn render_search_result_table(
         },
         Style::default().bg(theme.bg_raised),
     );
-    render_vertical_separators(buf, header_y, &separator_positions, theme, theme.bg_raised);
+    render_vertical_separators(
+        buf,
+        header_y,
+        &separator_positions,
+        theme,
+        theme.bg_raised,
+        symbols,
+    );
     let mut cell_x = table_area.x + 1 + SELECT_COL_WIDTH as u16 + 1;
     for (&col_idx, &width) in visible_columns.iter().zip(&column_widths) {
         draw_truncated_text(
@@ -136,8 +148,11 @@ pub(crate) fn render_search_result_table(
         table_area,
         table_area.y + 2,
         &separator_positions,
-        TableRuleGlyphs { middle: '┼' },
+        TableRuleGlyphs {
+            middle: symbols.table_rule_cross_mid,
+        },
         theme,
+        symbols,
     );
 
     let visible_result_rows = table_area.height.saturating_sub(3) as usize;
@@ -163,7 +178,14 @@ pub(crate) fn render_search_result_table(
             },
             Style::default().bg(theme.bg_raised),
         );
-        render_vertical_separators(buf, row_y, &separator_positions, theme, theme.bg_raised);
+        render_vertical_separators(
+            buf,
+            row_y,
+            &separator_positions,
+            theme,
+            theme.bg_raised,
+            symbols,
+        );
         draw_truncated_text(
             buf,
             table_area.x + 1 + SELECT_COL_WIDTH as u16 + 2,
@@ -206,12 +228,12 @@ pub(crate) fn render_search_result_table(
             },
             Style::default().bg(bg),
         );
-        render_vertical_separators(buf, row_y, &separator_positions, theme, bg);
+        render_vertical_separators(buf, row_y, &separator_positions, theme, bg, symbols);
         if is_selected {
             buf.set_string(
                 table_area.x + 1,
                 row_y,
-                "⏵",
+                symbols.selection.to_string(),
                 Style::default().fg(theme.accent).bg(bg),
             );
         }
@@ -222,7 +244,7 @@ pub(crate) fn render_search_result_table(
             let display = row
                 .get(col_idx)
                 .map(formatted_search_result_value)
-                .unwrap_or_else(|| "–".to_string());
+                .unwrap_or_else(|| symbols.missing_placeholder.to_string());
             draw_truncated_text(
                 buf,
                 cell_x + 1,
@@ -252,6 +274,7 @@ pub(crate) fn render_table_rule(
     separator_positions: &[u16],
     glyphs: TableRuleGlyphs,
     theme: &Theme,
+    symbols: &Symbols,
 ) {
     let left_x = table_area.x.saturating_add(1);
     let right_x = table_area.x + table_area.width.saturating_sub(2);
@@ -263,7 +286,7 @@ pub(crate) fn render_table_rule(
         let symbol = if separator_positions.contains(&x) {
             glyphs.middle
         } else {
-            '─'
+            symbols.box_horizontal
         };
         buf.set_string(
             x,
@@ -370,9 +393,15 @@ fn render_vertical_separators(
     separator_positions: &[u16],
     theme: &Theme,
     bg: Color,
+    symbols: &Symbols,
 ) {
     for &x in separator_positions {
-        buf.set_string(x, y, "│", Style::default().fg(theme.line).bg(bg));
+        buf.set_string(
+            x,
+            y,
+            symbols.box_vertical.to_string(),
+            Style::default().fg(theme.line).bg(bg),
+        );
     }
 }
 

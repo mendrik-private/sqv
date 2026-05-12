@@ -44,7 +44,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             &app.schema,
             &mut app.sidebar,
             &app.theme,
-            &app.config,
+            &app.symbols,
             focused,
         );
         app.sidebar_area = Some(horizontal[0]);
@@ -99,14 +99,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             if let Some(sort) = &grid.sort {
                 if let Some(col) = grid.columns.get(sort.col_idx) {
                     let arrow = if sort.direction == crate::grid::SortDir::Asc {
-                        "▲"
+                        app.symbols.sort_asc.to_string()
                     } else {
-                        "▼"
+                        app.symbols.sort_desc.to_string()
                     };
                     parts.push(format!("sort: {} {}", col.name, arrow));
                 }
             }
-            parts.join(" · ")
+            parts.join(&app.symbols.inline_separator())
         };
 
         let block = Block::bordered()
@@ -124,7 +124,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             &format!(" {} ", grid.table_name),
             &app.theme,
         );
-        crate::grid::render_grid(frame, inner, grid, &app.theme, &app.config);
+        crate::grid::render_grid(frame, inner, grid, &app.theme, &app.symbols);
     } else if let Some(active_idx) = app.active_tab {
         let tab = &app.open_tabs[active_idx];
         let block = Block::bordered()
@@ -163,7 +163,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     if let Some(ref mut popup) = app.popup {
-        crate::ui::popup::render_popup(frame, area, popup, &app.theme, &app.config);
+        crate::ui::popup::render_popup(frame, area, popup, &app.theme, &app.symbols);
     }
     crate::ui::toast::render_toasts(frame, area, &app.toast, &app.theme);
     if let Some(ref confirm) = app.pending_confirm {

@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::{config::Config, theme::Theme};
+use crate::{symbols::Symbols, theme::Theme};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PaletteCommand {
@@ -141,7 +141,7 @@ pub fn render(
     area: Rect,
     state: &CommandPaletteState,
     theme: &Theme,
-    _config: &Config,
+    symbols: &Symbols,
 ) {
     let popup_w = (area.width * 6 / 10).max(50).min(area.width);
     let popup_h = (area.height / 2).max(12).min(area.height);
@@ -169,7 +169,10 @@ pub fn render(
 
     let query_line = Line::from(vec![
         Span::styled(" > ", Style::default().fg(theme.accent)),
-        Span::styled(state.query.clone() + "▌", Style::default().fg(theme.fg)),
+        Span::styled(
+            format!("{}{}", state.query, symbols.cursor),
+            Style::default().fg(theme.fg),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(query_line).style(Style::default().bg(theme.bg_raised)),

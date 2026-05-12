@@ -4,6 +4,7 @@ use ratatui::{
     style::{Modifier, Style},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, FocusPane};
 
@@ -12,23 +13,8 @@ pub enum TabMouseAction {
     Close(usize),
 }
 
-/// Returns the superscript digit for tabs 0–9, or `None` for higher indices.
-/// The sequence is ¹ ² ³ ⁴ ⁵ ⁶ ⁷ ⁸ ⁹ ⁰ so pressing 1–9 activates tab 0–8
-/// and pressing 0 activates tab 9.
-pub fn superscript_for_tab(idx: usize) -> Option<&'static str> {
-    match idx {
-        0 => Some("¹"),
-        1 => Some("²"),
-        2 => Some("³"),
-        3 => Some("⁴"),
-        4 => Some("⁵"),
-        5 => Some("⁶"),
-        6 => Some("⁷"),
-        7 => Some("⁸"),
-        8 => Some("⁹"),
-        9 => Some("⁰"),
-        _ => None,
-    }
+pub fn superscript_for_tab(app: &App, idx: usize) -> Option<&str> {
+    app.symbols.tab_shortcut(idx)
 }
 
 pub fn render_tabbar(frame: &mut Frame, area: Rect, app: &App) {
@@ -95,8 +81,10 @@ pub fn render_tabbar(frame: &mut Frame, area: Rect, app: &App) {
             theme.bg_soft
         });
 
-        let sup = superscript_for_tab(idx);
-        let sup_w: u16 = if sup.is_some() { 1 } else { 0 };
+        let sup = superscript_for_tab(app, idx);
+        let sup_w: u16 = sup
+            .map(|value| UnicodeWidthStr::width(value) as u16)
+            .unwrap_or(0);
         let name_w = tab.table_name.chars().count() as u16;
         // │ space name [sup] space × space │
         let content_width = 1 + name_w + sup_w + 1 + 1 + 1;
@@ -105,41 +93,83 @@ pub fn render_tabbar(frame: &mut Frame, area: Rect, app: &App) {
 
         if has_roof {
             let mut roof_x = tab_x;
-            roof_x = put(buf, roof_x, top_y, right, "╭", border_style);
+            roof_x = put(
+                buf,
+                roof_x,
+                top_y,
+                right,
+                &app.symbols.tab_top_left.to_string(),
+                border_style,
+            );
             if tab_width > 2 {
                 roof_x = put(
                     buf,
                     roof_x,
                     top_y,
                     right,
-                    &"─".repeat(tab_width.saturating_sub(2) as usize),
+                    &app.symbols
+                        .box_horizontal
+                        .to_string()
+                        .repeat(tab_width.saturating_sub(2) as usize),
                     border_style,
                 );
             }
-            put(buf, roof_x, top_y, right, "╮", border_style);
+            put(
+                buf,
+                roof_x,
+                top_y,
+                right,
+                &app.symbols.tab_top_right.to_string(),
+                border_style,
+            );
         }
 
         let mut label_x = tab_x;
-        label_x = put(buf, label_x, label_y, right, "│", border_style);
+        label_x = put(
+            buf,
+            label_x,
+            label_y,
+            right,
+            &app.symbols.box_vertical.to_string(),
+            border_style,
+        );
         label_x = put(buf, label_x, label_y, right, " ", base);
         label_x = put(buf, label_x, label_y, right, &tab.table_name, base);
         if let Some(s) = sup {
             label_x = put(buf, label_x, label_y, right, s, num_style);
         }
         label_x = put(buf, label_x, label_y, right, " ", base);
-        label_x = put(buf, label_x, label_y, right, "×", close_style);
+        label_x = put(
+            buf,
+            label_x,
+            label_y,
+            right,
+            &app.symbols.tab_close.to_string(),
+            close_style,
+        );
         label_x = put(buf, label_x, label_y, right, " ", base);
-        put(buf, label_x, label_y, right, "│", border_style);
+        put(
+            buf,
+            label_x,
+            label_y,
+            right,
+            &app.symbols.box_vertical.to_string(),
+            border_style,
+        );
 
         if is_active && has_join {
             let mut join_x = tab_x;
-            let left_join = if tab_x == area.x { "│" } else { "┘" };
-            let right_join = if tab_x.saturating_add(tab_width) >= right {
-                "│"
+            let left_join = if tab_x == area.x {
+                app.symbols.box_vertical.to_string()
             } else {
-                "└"
+                app.symbols.tab_join_left.to_string()
             };
-            join_x = put(buf, join_x, join_y, right, left_join, border_style);
+            let right_join = if tab_x.saturating_add(tab_width) >= right {
+                app.symbols.box_vertical.to_string()
+            } else {
+                app.symbols.tab_join_right.to_string()
+            };
+            join_x = put(buf, join_x, join_y, right, &left_join, border_style);
             if tab_width > 2 {
                 join_x = put(
                     buf,
@@ -150,7 +180,7 @@ pub fn render_tabbar(frame: &mut Frame, area: Rect, app: &App) {
                     base,
                 );
             }
-            put(buf, join_x, join_y, right, right_join, border_style);
+            put(buf, join_x, join_y, right, &right_join, border_style);
         }
 
         x = tab_x.saturating_add(tab_width).min(right);
@@ -181,11 +211,9 @@ pub fn hit_test(
             break;
         }
         let name_w = tab.table_name.chars().count() as u16;
-        let sup_w: u16 = if superscript_for_tab(idx).is_some() {
-            1
-        } else {
-            0
-        };
+        let sup_w: u16 = superscript_for_tab(app, idx)
+            .map(|value| UnicodeWidthStr::width(value) as u16)
+            .unwrap_or(0);
         let tab_width = name_w + sup_w + 6;
         let tab_end = cursor.saturating_add(tab_width).min(right);
         if x >= cursor && x < tab_end {

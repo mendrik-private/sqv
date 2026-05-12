@@ -10,7 +10,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::{config::Config, db::types::SqlValue, theme::Theme};
+use crate::{db::types::SqlValue, symbols::Symbols, theme::Theme};
 
 use super::search_result_format::format_search_result_text;
 
@@ -171,7 +171,7 @@ pub fn render(
     area: Rect,
     state: &ValuePickerState,
     theme: &Theme,
-    _config: &Config,
+    symbols: &Symbols,
 ) {
     let popup_width = (area.width / 2).max(30).min(area.width);
     let popup_height = 15u16.min(area.height);
@@ -202,7 +202,10 @@ pub fn render(
             format!(" {} ", state.filter),
             Style::default().fg(theme.fg).bg(theme.bg_soft),
         ),
-        Span::styled("▌", Style::default().fg(theme.accent).bg(theme.bg_soft)),
+        Span::styled(
+            symbols.cursor.to_string(),
+            Style::default().fg(theme.accent).bg(theme.bg_soft),
+        ),
     ]);
 
     let entries = state.display_entries();
@@ -235,7 +238,7 @@ pub fn render(
         let mut spans: Vec<Span> = Vec::new();
         if is_selected {
             spans.push(Span::styled(
-                " ▶ ",
+                format!(" {} ", symbols.selection),
                 Style::default().fg(theme.accent).bg(bg),
             ));
         } else {
@@ -266,7 +269,10 @@ pub fn render(
     }
 
     lines.push(Line::from(Span::styled(
-        " ↵ select/add · text field above creates new entry · esc cancel",
+        format!(
+            " {} select/add {} text field above creates new entry {} esc cancel",
+            symbols.enter, symbols.separator, symbols.separator
+        ),
         Style::default().fg(theme.fg_faint),
     )));
 

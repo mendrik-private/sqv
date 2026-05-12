@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::{db::types::SqlValue, theme::Theme};
+use crate::{db::types::SqlValue, symbols::Symbols, theme::Theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DateFocus {
@@ -169,7 +169,13 @@ fn parse_date_text(text: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d").ok()
 }
 
-pub fn render(frame: &mut Frame, area: Rect, state: &DatePickerState, theme: &Theme) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &DatePickerState,
+    theme: &Theme,
+    symbols: &Symbols,
+) {
     let popup_width = 34u16.min(area.width);
     let popup_height = 16u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
@@ -198,7 +204,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &DatePickerState, theme: &Th
     let mut lines = vec![
         Line::from(""),
         render_date_inputs(state, selected, inner.width, theme),
-        divider(inner.width, theme),
+        divider(inner.width, theme, symbols),
         Line::from(""),
         Line::from(vec![
             Span::styled(calendar_pad.clone(), Style::default().bg(theme.bg_raised)),
@@ -217,9 +223,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &DatePickerState, theme: &Th
     ];
     lines.extend(render_calendar_lines(state, theme, inner.width));
     lines.push(Line::from(""));
-    lines.push(divider(inner.width, theme));
+    lines.push(divider(inner.width, theme, symbols));
     lines.push(Line::from(Span::styled(
-        " Tab next · Shift-Tab prev · PgUp/PgDn month · Enter ok",
+        format!(
+            " Tab next {} Shift-Tab prev {} PgUp/PgDn month {} Enter ok",
+            symbols.separator, symbols.separator, symbols.separator
+        ),
         Style::default().fg(theme.fg_faint).bg(theme.bg_raised),
     )));
 
@@ -346,9 +355,9 @@ fn centered_line(
     Line::from(spans)
 }
 
-fn divider(width: u16, theme: &Theme) -> Line<'static> {
+fn divider(width: u16, theme: &Theme, symbols: &Symbols) -> Line<'static> {
     Line::from(Span::styled(
-        "─".repeat(width as usize),
+        symbols.box_horizontal.to_string().repeat(width as usize),
         Style::default().fg(theme.line).bg(theme.bg_raised),
     ))
 }

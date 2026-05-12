@@ -7,8 +7,8 @@ use ratatui::{
 };
 
 use crate::{
-    config::Config,
     db::types::{affinity, ColAffinity, SqlValue},
+    symbols::Symbols,
     theme::Theme,
 };
 
@@ -229,10 +229,10 @@ impl TextEditorState {
         scroll_y
     }
 
-    fn display_lines(&self) -> Vec<String> {
+    fn display_lines(&self, cursor: char) -> Vec<String> {
         let before: String = self.current.chars().take(self.cursor_pos).collect();
         let after: String = self.current.chars().skip(self.cursor_pos).collect();
-        let display = format!("{before}▌{after}");
+        let display = format!("{before}{cursor}{after}");
         display
             .split('\n')
             .map(|line| {
@@ -251,7 +251,7 @@ pub fn render(
     area: Rect,
     state: &TextEditorState,
     theme: &Theme,
-    _config: &Config,
+    symbols: &Symbols,
 ) {
     let popup_width = (area.width * 6 / 10).max(40).min(area.width);
     let popup_height = if state.is_multiline { 14u16 } else { 5u16 };
@@ -308,7 +308,11 @@ pub fn render(
 
     let mut status_lines = Vec::new();
     if show_validity {
-        let vi = if state.valid { "✓" } else { "✗" };
+        let vi = if state.valid {
+            symbols.valid
+        } else {
+            symbols.invalid
+        };
         let vc = if state.valid { theme.green } else { theme.red };
         status_lines.push(Line::from(Span::styled(
             format!(" {} ", vi),
@@ -318,7 +322,7 @@ pub fn render(
 
     if state.readonly {
         status_lines.push(Line::from(Span::styled(
-            " ⊘ read-only",
+            format!(" {} read-only", symbols.readonly),
             Style::default().fg(theme.red),
         )));
     }
@@ -341,7 +345,7 @@ pub fn render(
         ])
         .split(sections[1]);
         let content_lines: Vec<Line<'static>> = state
-            .display_lines()
+            .display_lines(symbols.cursor)
             .into_iter()
             .map(|line| Line::from(Span::styled(line, input_style)))
             .collect();
@@ -360,15 +364,16 @@ pub fn render(
             state.line_count(),
             viewport_lines,
             theme,
+            symbols,
         );
     } else {
         let editor_chunks =
             Layout::horizontal([Constraint::Length(1), Constraint::Min(1)]).split(sections[1]);
-        let display_lines = state.display_lines();
+        let display_lines = state.display_lines(symbols.cursor);
         let line = display_lines
             .into_iter()
             .next()
-            .unwrap_or_else(|| "▌".to_string());
+            .unwrap_or_else(|| symbols.cursor.to_string());
         frame.render_widget(
             Paragraph::new(vec![Line::from(Span::styled(line, input_style))])
                 .style(Style::default().bg(theme.bg_raised)),
@@ -379,9 +384,12 @@ pub fn render(
     frame.render_widget(
         Paragraph::new(vec![Line::from(Span::styled(
             if state.is_multiline {
-                " Enter save · Alt-Enter newline · Esc cancel"
+                format!(
+                    " Enter save {} Alt-Enter newline {} Esc cancel",
+                    symbols.separator, symbols.separator
+                )
             } else {
-                " Enter save · Esc cancel"
+                format!(" Enter save {} Esc cancel", symbols.separator)
             },
             hint_style,
         ))])
@@ -397,6 +405,7 @@ fn render_scrollbar(
     total: usize,
     viewport: usize,
     theme: &Theme,
+    symbols: &Symbols,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -407,7 +416,7 @@ fn render_scrollbar(
         buf.set_string(
             area.x,
             area.y + row as u16,
-            "│",
+            symbols.box_vertical.to_string(),
             Style::default().fg(theme.line).bg(theme.bg_raised),
         );
     }
@@ -430,7 +439,7 @@ fn render_scrollbar(
         buf.set_string(
             area.x,
             area.y + row as u16,
-            "█",
+            symbols.scrollbar_thumb.to_string(),
             Style::default().fg(theme.fg_mute).bg(theme.bg_raised),
         );
     }

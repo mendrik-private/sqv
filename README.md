@@ -124,13 +124,27 @@ Configuration is read from:
 $XDG_CONFIG_HOME/sqview/config.toml
 ```
 
-Existing `sqv` config and filter state directories are still used automatically when present, so current users do not need to migrate anything immediately.
+On first launch, sqview creates this file automatically if it is missing. If only the legacy `sqv` config exists, sqview copies it forward to the current path before loading it.
 
 Example:
 
 ```toml
 nerd_font = true
+
+[theme]
+accent = "#d99a5e"
+bg = "#1d1b1a"
+
+[symbols]
+table_icon = "󰓫"
+view_icon = "󰈈"
+index_icon = "󰓹"
+filter_icon = "󰈲"
+selection = "⏵"
+tab_close = "×"
 ```
+
+Every theme token and every UI glyph/icon now lives in this config file, so users can fully restyle the palette and override the icon set without editing Rust sources. Single-cell drawing symbols such as borders, cursors, and selection markers must stay one character wide.
 
 ## Development
 

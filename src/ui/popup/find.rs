@@ -7,8 +7,8 @@ use ratatui::{
 };
 
 use crate::{
-    config::Config,
     db::{schema::Column, types::SqlValue},
+    symbols::Symbols,
     theme::Theme,
 };
 
@@ -126,7 +126,7 @@ impl FindState {
     }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, state: &FindState, theme: &Theme, _config: &Config) {
+pub fn render(frame: &mut Frame, area: Rect, state: &FindState, theme: &Theme, symbols: &Symbols) {
     let popup_width = ((area.width * 4) / 5).max(60).min(area.width);
     let popup_height = ((area.height * 3) / 5).max(12).min(area.height);
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
@@ -151,7 +151,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FindState, theme: &Theme, _
 
     if state.loading {
         frame.render_widget(
-            Paragraph::new(" Loading…")
+            Paragraph::new(symbols.loading_label("Loading"))
                 .style(Style::default().fg(theme.fg_dim).bg(theme.bg_raised)),
             inner,
         );
@@ -196,7 +196,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FindState, theme: &Theme, _
             format!(" {} ", state.query),
             Style::default().fg(theme.fg).bg(theme.bg_soft),
         ),
-        Span::styled("▌", Style::default().fg(theme.accent).bg(theme.bg_soft)),
+        Span::styled(
+            symbols.cursor.to_string(),
+            Style::default().fg(theme.accent).bg(theme.bg_soft),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(input_line).style(Style::default().bg(theme.bg_raised)),
@@ -232,6 +235,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FindState, theme: &Theme, _
                 visible_columns: &visible_columns,
             },
             theme,
+            symbols,
         );
     }
 
@@ -243,7 +247,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FindState, theme: &Theme, _
     let footer_line = Line::from(vec![
         Span::styled(count_text, Style::default().fg(theme.fg_mute)),
         Span::styled(
-            "  ↵ go · ↑↓ select · esc cancel",
+            format!(
+                "  {} go {} {}{} select {} esc cancel",
+                symbols.enter,
+                symbols.separator,
+                symbols.arrow_up,
+                symbols.arrow_down,
+                symbols.separator
+            ),
             Style::default().fg(theme.fg_faint),
         ),
     ]);

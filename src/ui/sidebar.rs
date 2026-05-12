@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::{config::Config, db::schema::Schema, theme::Theme};
+use crate::{db::schema::Schema, symbols::Symbols, theme::Theme};
 
 pub enum SidebarAction {
     OpenTable(String),
@@ -241,7 +241,7 @@ pub fn render_sidebar(
     schema: &Schema,
     state: &mut SidebarState,
     theme: &Theme,
-    config: &Config,
+    symbols: &Symbols,
     focused: bool,
 ) {
     let border_color = if focused { theme.accent } else { theme.line };
@@ -251,7 +251,7 @@ pub fn render_sidebar(
         .style(Style::default().bg(theme.bg_soft))
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
-            "─ SCHEMA ",
+            format!("{} SCHEMA ", symbols.box_horizontal),
             Style::default()
                 .fg(if focused { theme.accent } else { theme.fg_mute })
                 .add_modifier(Modifier::BOLD),
@@ -267,12 +267,6 @@ pub fn render_sidebar(
     let list_area = content[0];
     let scrollbar_area = content[1];
 
-    let (table_icon, view_icon, index_icon) = if config.nerd_font {
-        ("󰓫", "󰈈", "󰓹")
-    } else {
-        ("[T]", "[V]", "[I]")
-    };
-
     let header_style = Style::default()
         .fg(theme.fg_mute)
         .add_modifier(Modifier::BOLD);
@@ -287,9 +281,9 @@ pub fn render_sidebar(
     let mut items: Vec<ListItem> = Vec::new();
 
     let tables_arrow = if state.tables_expanded {
-        "📂"
+        &symbols.folder_open
     } else {
-        "📁"
+        &symbols.folder_closed
     };
     items.push(ListItem::new(Line::from(Span::styled(
         format!("{} TABLES ({})", tables_arrow, schema.tables.len()),
@@ -297,14 +291,20 @@ pub fn render_sidebar(
     ))));
     if state.tables_expanded {
         for table in &schema.tables {
-            let icon_span =
-                Span::styled(format!(" {} ", table_icon), Style::default().fg(theme.teal));
+            let icon_span = Span::styled(
+                format!(" {} ", symbols.table_icon),
+                Style::default().fg(theme.teal),
+            );
             let name_span = Span::styled(table.name.clone(), name_style);
             items.push(ListItem::new(Line::from(vec![icon_span, name_span])));
         }
     }
 
-    let views_arrow = if state.views_expanded { "📂" } else { "📁" };
+    let views_arrow = if state.views_expanded {
+        &symbols.folder_open
+    } else {
+        &symbols.folder_closed
+    };
     items.push(ListItem::new(Line::from(Span::styled(
         format!("{} VIEWS ({})", views_arrow, schema.views.len()),
         header_style,
@@ -312,7 +312,7 @@ pub fn render_sidebar(
     if state.views_expanded {
         for view in &schema.views {
             let icon_span = Span::styled(
-                format!(" {} ", view_icon),
+                format!(" {} ", symbols.view_icon),
                 Style::default().fg(theme.purple),
             );
             let name_span = Span::styled(view.name.clone(), name_style);
@@ -321,9 +321,9 @@ pub fn render_sidebar(
     }
 
     let indexes_arrow = if state.indexes_expanded {
-        "📂"
+        &symbols.folder_open
     } else {
-        "📁"
+        &symbols.folder_closed
     };
     items.push(ListItem::new(Line::from(Span::styled(
         format!("{} INDEXES ({})", indexes_arrow, schema.indexes.len()),
@@ -332,7 +332,7 @@ pub fn render_sidebar(
     if state.indexes_expanded {
         for index in &schema.indexes {
             let icon_span = Span::styled(
-                format!(" {} ", index_icon),
+                format!(" {} ", symbols.index_icon),
                 Style::default().fg(theme.yellow),
             );
             let name_span = Span::styled(index.name.clone(), name_style);
@@ -340,9 +340,10 @@ pub fn render_sidebar(
         }
     }
 
+    let highlight_symbol = format!("{} ", symbols.selection);
     let list = List::new(items)
         .highlight_style(accent_style)
-        .highlight_symbol("⏵ ");
+        .highlight_symbol(&highlight_symbol);
 
     frame.render_stateful_widget(list, list_area, &mut state.list_state);
     if scrollbar_area.width > 0 {
@@ -353,6 +354,7 @@ pub fn render_sidebar(
             state.visible_count(schema),
             list_area.height as usize,
             theme,
+            symbols,
         );
     }
 }
@@ -364,6 +366,7 @@ fn render_scrollbar(
     total: usize,
     viewport: usize,
     theme: &Theme,
+    symbols: &Symbols,
 ) {
     if area.width == 0 || area.height == 0 || total <= viewport || viewport == 0 {
         return;
@@ -391,9 +394,9 @@ fn render_scrollbar(
             Style::default().fg(theme.line).bg(theme.bg_soft)
         };
         let glyph = if row >= thumb_top && row < thumb_top + thumb_height {
-            "█"
+            symbols.scrollbar_thumb.to_string()
         } else {
-            "│"
+            symbols.box_vertical.to_string()
         };
         buf.set_string(area.x, y, glyph, style);
     }

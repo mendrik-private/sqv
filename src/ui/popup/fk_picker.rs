@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::{config::Config, db::types::SqlValue, theme::Theme};
+use crate::{db::types::SqlValue, symbols::Symbols, theme::Theme};
 
 use super::search_results_table::{
     formatted_search_result_value, render_search_result_table, value_is_numeric_or_temporal,
@@ -187,7 +187,7 @@ pub fn render(
     area: Rect,
     state: &FkPickerState,
     theme: &Theme,
-    _config: &Config,
+    symbols: &Symbols,
 ) {
     let popup_width = ((area.width * 3) / 5).max(54).min(area.width);
     let popup_height = ((area.height * 3) / 5).max(12).min(area.height);
@@ -207,8 +207,8 @@ pub fn render(
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.accent))
         .title(format!(
-            " FK: {} → {} ",
-            state.source_col, state.target_table
+            " FK: {} {} {} ",
+            state.source_col, symbols.foreign_key_arrow, state.target_table
         ))
         .style(Style::default().bg(theme.bg_raised));
     let inner = block.inner(popup_area);
@@ -216,7 +216,7 @@ pub fn render(
 
     if state.loading {
         frame.render_widget(
-            Paragraph::new(" Loading…")
+            Paragraph::new(symbols.loading_label("Loading"))
                 .style(Style::default().fg(theme.fg_dim).bg(theme.bg_raised)),
             inner,
         );
@@ -261,7 +261,10 @@ pub fn render(
             format!(" {} ", state.filter),
             Style::default().fg(theme.fg).bg(theme.bg_soft),
         ),
-        Span::styled("▌", Style::default().fg(theme.accent).bg(theme.bg_soft)),
+        Span::styled(
+            symbols.cursor.to_string(),
+            Style::default().fg(theme.accent).bg(theme.bg_soft),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(filter_line).style(Style::default().bg(theme.bg_raised)),
@@ -291,12 +294,13 @@ pub fn render(
             &table_rows,
             &visible_columns,
             theme,
+            symbols,
         );
     }
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " ↵ select · esc cancel",
+            format!(" {} select {} esc cancel", symbols.enter, symbols.separator),
             Style::default().fg(theme.fg_faint),
         )))
         .style(Style::default().bg(theme.bg_raised)),
@@ -311,6 +315,7 @@ fn render_result_table(
     visible_rows: &[SearchResultTableRow<'_>],
     visible_columns: &[usize],
     theme: &Theme,
+    symbols: &Symbols,
 ) {
     let headers = state.column_headers();
     render_search_result_table(
@@ -324,6 +329,7 @@ fn render_result_table(
             visible_columns,
         },
         theme,
+        symbols,
     );
 }
 
@@ -347,7 +353,7 @@ fn is_numeric_or_temporal_column(state: &FkPickerState, col_idx: usize) -> bool 
 mod tests {
     use super::{is_numeric_or_temporal_column, FkPickerState};
     use crate::ui::popup::search_results_table::{render_table_rule, TableRuleGlyphs};
-    use crate::{db::types::SqlValue, theme::Theme};
+    use crate::{db::types::SqlValue, symbols::Symbols, theme::Theme};
     use ratatui::{buffer::Buffer, layout::Rect};
 
     #[test]
@@ -410,6 +416,7 @@ mod tests {
     fn fk_table_rules_stay_inside_popup_frame() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 12, 4));
         let theme = Theme::default();
+        let symbols = Symbols::default_with_nerd_font(true);
 
         render_table_rule(
             &mut buf,
@@ -418,6 +425,7 @@ mod tests {
             &[3, 7],
             TableRuleGlyphs { middle: '┬' },
             &theme,
+            &symbols,
         );
 
         let left = buf.cell((0, 0)).unwrap();

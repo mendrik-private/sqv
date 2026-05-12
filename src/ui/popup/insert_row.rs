@@ -8,11 +8,11 @@ use ratatui::{
 };
 
 use crate::{
-    config::Config,
     db::{
         schema::Column,
         types::{affinity, ColAffinity, SqlValue},
     },
+    symbols::Symbols,
     theme::Theme,
 };
 
@@ -220,13 +220,13 @@ impl InsertFieldState {
         }
     }
 
-    fn display_editor_value(&self, editing: bool) -> String {
+    fn display_editor_value(&self, editing: bool, cursor: char) -> String {
         if !editing {
             return self.display_value();
         }
         let before: String = self.input.chars().take(self.cursor_pos).collect();
         let after: String = self.input.chars().skip(self.cursor_pos).collect();
-        format!("{before}▌{after}")
+        format!("{before}{cursor}{after}")
     }
 }
 
@@ -235,7 +235,7 @@ pub fn render(
     area: Rect,
     state: &InsertRowState,
     theme: &Theme,
-    _config: &Config,
+    symbols: &Symbols,
 ) {
     let popup_width = area.width.saturating_sub(6).max(48).min(area.width);
     let popup_height = area.height.saturating_sub(4).max(12).min(area.height);
@@ -300,7 +300,11 @@ pub fn render(
         } else {
             theme.bg_raised
         };
-        let marker = if selected { " ▶ " } else { "   " };
+        let marker = if selected {
+            format!(" {} ", symbols.selection)
+        } else {
+            "   ".to_string()
+        };
         let label = if field.is_pk {
             format!("{} [pk]", field.name)
         } else if field.not_null {
@@ -363,7 +367,7 @@ pub fn render(
     frame.render_widget(editor_block, chunks[2]);
     if let Some(field) = state.selected_field() {
         frame.render_widget(
-            Paragraph::new(field.display_editor_value(state.editing))
+            Paragraph::new(field.display_editor_value(state.editing, symbols.cursor))
                 .style(Style::default().fg(theme.fg).bg(theme.bg_soft)),
             editor_inner,
         );
@@ -377,11 +381,20 @@ pub fn render(
                     if state.editing { " done" } else { " edit" },
                     Style::default().fg(theme.green),
                 ),
-                Span::styled("  ·  ", Style::default().fg(theme.fg_faint)),
+                Span::styled(
+                    symbols.padded_separator(),
+                    Style::default().fg(theme.fg_faint),
+                ),
                 Span::styled("Ctrl-Enter save row", Style::default().fg(theme.accent)),
-                Span::styled("  ·  ", Style::default().fg(theme.fg_faint)),
+                Span::styled(
+                    symbols.padded_separator(),
+                    Style::default().fg(theme.fg_faint),
+                ),
                 Span::styled("Del reset field", Style::default().fg(theme.yellow)),
-                Span::styled("  ·  ", Style::default().fg(theme.fg_faint)),
+                Span::styled(
+                    symbols.padded_separator(),
+                    Style::default().fg(theme.fg_faint),
+                ),
                 Span::styled("Esc cancel", Style::default().fg(theme.fg)),
             ]),
             Line::from(Span::styled(

@@ -15,6 +15,7 @@ use crate::{
     },
     filter::predicate::filter_to_sql,
     grid::{SortDir, SortSpec},
+    symbols::Symbols,
     theme::Theme,
     ui::{
         popup::{
@@ -121,7 +122,7 @@ pub struct App {
     pub should_quit: bool,
     pub dirty: bool,
     pub theme: Theme,
-    pub config: Config,
+    pub symbols: Symbols,
     pub focus: FocusPane,
     pub open_tabs: Vec<TableTab>,
     pub active_tab: Option<usize>,
@@ -267,13 +268,19 @@ impl App {
         readonly: bool,
         db_path: String,
     ) -> Self {
+        let theme = config
+            .resolve_theme()
+            .expect("config should be validated before app creation");
+        let symbols = config
+            .resolve_symbols()
+            .expect("config should be validated before app creation");
         Self {
             schema,
             sidebar: SidebarState::default(),
             should_quit: false,
             dirty: true,
-            theme: Theme::default(),
-            config,
+            theme,
+            symbols,
             focus: FocusPane::Sidebar,
             open_tabs: Vec::new(),
             active_tab: None,

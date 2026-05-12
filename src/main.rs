@@ -6,6 +6,7 @@ mod event;
 mod export;
 mod filter;
 mod grid;
+mod symbols;
 mod theme;
 mod ui;
 
@@ -145,7 +146,7 @@ async fn open_database(options: OpenOptions) -> anyhow::Result<()> {
         orig_hook(info);
     }));
 
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load().context("Failed to load sqview config")?;
 
     let pool = Arc::new(
         db::open_pool(path, options.readonly)
@@ -292,9 +293,7 @@ fn check_terminal() {
     );
     println!("  Mouse support: {} (from TERM)", mouse);
     println!("  Unicode: yes");
-    println!(
-        "  Nerd fonts: not detectable (set ui.nerd_font = false in config if icons look wrong)"
-    );
+    println!("  Nerd fonts: not detectable (set nerd_font = false in config if icons look wrong)");
 }
 
 #[cfg(test)]

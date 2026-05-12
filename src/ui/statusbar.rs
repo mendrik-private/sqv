@@ -35,7 +35,7 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         .active_tab
         .and_then(|i| app.open_tabs.get(i))
         .map(|t| t.table_name.clone())
-        .unwrap_or_else(|| "—".to_string());
+        .unwrap_or_else(|| app.symbols.empty_placeholder.to_string());
 
     let (row_num, total_rows, col_num) = app.grid.as_ref().map_or((0i64, 0i64, 0usize), |g| {
         (
@@ -66,9 +66,10 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
 
     let pos_str = if total_rows > 0 {
         format!(
-            "r {}/{} · col {}",
+            "r {}/{}{}col {}",
             fmt_number(row_num),
             fmt_number(total_rows),
+            app.symbols.inline_separator(),
             col_num
         )
     } else {
@@ -96,9 +97,9 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
             g.sort.as_ref().and_then(|s| {
                 let col_name = g.columns.get(s.col_idx).map(|c| c.name.as_str())?;
                 let arrow = if s.direction == crate::grid::SortDir::Asc {
-                    "▲"
+                    app.symbols.sort_asc.to_string()
                 } else {
-                    "▼"
+                    app.symbols.sort_desc.to_string()
                 };
                 Some(format!("{} {}", arrow, col_name))
             })
@@ -124,7 +125,7 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
 
     if filter_count > 0 {
         segments.push((
-            format!("󰈲 {} filters", filter_count),
+            format!("{} {} filters", app.symbols.filter_icon, filter_count),
             Style::default().fg(theme.red).bg(theme.bg_soft),
         ));
     }
@@ -144,16 +145,19 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     if !app.jump_stack.is_empty() {
-        let current_table = app.grid.as_ref().map_or("—", |g| g.table_name.as_str());
+        let current_table = app.grid.as_ref().map_or_else(
+            || app.symbols.empty_placeholder.to_string(),
+            |g| g.table_name.clone(),
+        );
         let crumb: String = app
             .jump_stack
             .iter()
             .map(|f| f.table.as_str())
-            .chain(std::iter::once(current_table))
+            .chain(std::iter::once(current_table.as_str()))
             .collect::<Vec<_>>()
-            .join(" › ");
+            .join(&app.symbols.breadcrumb_separator);
         segments.push((
-            format!("↩ {}", crumb),
+            format!("{} {}", app.symbols.breadcrumb_prefix, crumb),
             Style::default().fg(theme.accent).bg(theme.bg_soft),
         ));
     }
@@ -165,7 +169,7 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     let buf = frame.buffer_mut();
     buf.set_style(area, Style::default().bg(theme.bg_soft));
 
-    let preview = truncate_preview(&cell_preview, area.width as usize / 3);
+    let preview = truncate_preview(&cell_preview, area.width as usize / 3, app.symbols.ellipsis);
     let preview_width = preview.chars().count() as u16;
     let preview_x = if preview.is_empty() {
         area.x + area.width
@@ -185,7 +189,7 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
                 x,
                 area.y,
                 preview_x,
-                "  │  ",
+                &app.symbols.segment_separator(),
                 Style::default().fg(theme.line).bg(theme.bg_soft),
             );
         }
@@ -203,14 +207,14 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn truncate_preview(s: &str, max_chars: usize) -> String {
+fn truncate_preview(s: &str, max_chars: usize, ellipsis: char) -> String {
     if max_chars == 0 {
         return String::new();
     }
     let mut out: String = s.chars().take(max_chars).collect();
     if s.chars().count() > max_chars && max_chars > 1 {
         out.pop();
-        out.push('…');
+        out.push(ellipsis);
     }
     out
 }
@@ -225,7 +229,10 @@ fn action_hint_text(app: &App) -> Option<String> {
     match app.focus {
         FocusPane::Sidebar => {
             hints.push("[enter] open".to_string());
-            hints.push("[←/→ h/l] fold".to_string());
+            hints.push(format!(
+                "[{}/{} h/l] fold",
+                app.symbols.arrow_left, app.symbols.arrow_right
+            ));
             if app.sidebar_visible {
                 hints.push("[tab] panel".to_string());
             }

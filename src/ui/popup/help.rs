@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::{config::Config, theme::Theme};
+use crate::{symbols::Symbols, theme::Theme};
 
 pub struct HelpState {
     pub scroll: usize,
@@ -31,46 +31,12 @@ impl HelpState {
     }
 }
 
-const HELP_TEXT: &str = r#"
-Navigation                     Editing
-  ↑↓←→ / h j k l  Move cell     Enter            Open picker / smart editor
-  Home / End       Col start/end Esc              Close popup / focus sidebar
-  Ctrl-Home/End    Table bounds  Alt-Enter        New line in text editor
-  PgUp / PgDn      Scroll page   Ctrl-Enter       Save staged row
-  Ctrl-↑ / Ctrl-↓  Scroll page   d                Delete row (confirm)
-  Mouse wheel      Scroll rows   i                Insert row (staged)
-  Shift-wheel      Scroll cols   e                Edit value directly
-  Click cell       Focus cell    n                Set NULL
-                                 Ctrl-Z           Undo last write
-
-Filtering & Sorting            Tabs & Sidebar
-  s                Cycle sort    Ctrl-B           Toggle sidebar
-  f                Filter col    Tab              Switch focus
-  Shift-F          Clear filters BackTab          Switch focus
-  Ctrl-F           Find in table 1-9 / 0          Activate tab 1–10
-  j (on FK)        Jump to FK    Click tab        Switch / close tab
-  Backspace        Jump back     Enter (sidebar)  Open table
-
-Navigation (sidebar)           Command Palette  (Ctrl-P / Ctrl-Shift-P)
-  ↑↓ / k j          Move up/down  Export CSV       Save to ~/sqview_export.csv
-  ←→ / h l          Close/open    Export JSON      Save to ~/sqview_export.json
-  Enter            Open table    Export SQL       Save to ~/sqview_export.sql
-Misc                            Copy cell        Clip to OSC52 clipboard
-  Ctrl-Q           Quit         Copy row JSON    Clip to OSC52 clipboard
-  ?                Help (this)  Toggle sidebar   Show/hide schema panel
-                                 Toggle read-only Safe inspection mode
-                                 Reload schema    Refresh table list
-                                 Reset col widths Recalculate layout
-                                 Clear filters    Remove all filters
-                                 Switch Table     Jump to another table
-"#;
-
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     state: &mut HelpState,
     theme: &Theme,
-    config: &Config,
+    symbols: &Symbols,
 ) {
     let popup_width = 72u16.min(area.width.saturating_sub(4));
     let popup_height = 24u16.min(area.height.saturating_sub(4));
@@ -85,15 +51,15 @@ pub fn render(
 
     super::paint_popup_surface(frame, popup_area, theme);
 
-    let icon = if config.nerd_font { "󰋖" } else { "?" };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(format!(" {}  Help  ", icon))
+        .title(format!(" {}  Help  ", symbols.help_icon))
         .border_style(Style::default().fg(theme.accent));
 
     let inner = block.inner(popup_area);
+    let help_text = help_text(symbols);
 
-    let lines: Vec<Line> = HELP_TEXT
+    let lines: Vec<Line> = help_text
         .lines()
         .skip(state.scroll)
         .map(|line| {
@@ -119,7 +85,7 @@ pub fn render(
         .collect();
 
     let visible = inner.height.saturating_sub(2) as usize;
-    state.max_scroll = HELP_TEXT.lines().count().saturating_sub(visible);
+    state.max_scroll = help_text.lines().count().saturating_sub(visible);
 
     let paragraph = Paragraph::new(Text::from(lines)).block(block);
 
@@ -127,7 +93,7 @@ pub fn render(
 
     let hint = format!(
         " {} scroll {} / {}",
-        icon,
+        symbols.help_icon,
         state.scroll + 1,
         state.max_scroll + 1
     );
@@ -140,4 +106,52 @@ pub fn render(
             Style::default().fg(theme.fg_mute),
         );
     }
+}
+
+fn help_text(symbols: &Symbols) -> String {
+    let all_arrows = format!(
+        "{}{}{}{}",
+        symbols.arrow_up, symbols.arrow_down, symbols.arrow_left, symbols.arrow_right
+    );
+    format!(
+        r#"
+Navigation                     Editing
+  {all_arrows} / h j k l  Move cell     Enter            Open picker / smart editor
+  Home / End       Col start/end Esc              Close popup / focus sidebar
+  Ctrl-Home/End    Table bounds  Alt-Enter        New line in text editor
+  PgUp / PgDn      Scroll page   Ctrl-Enter       Save staged row
+  Ctrl-{up} / Ctrl-{down}  Scroll page   d                Delete row (confirm)
+  Mouse wheel      Scroll rows   i                Insert row (staged)
+  Shift-wheel      Scroll cols   e                Edit value directly
+  Click cell       Focus cell    n                Set NULL
+                                 Ctrl-Z           Undo last write
+
+Filtering & Sorting            Tabs & Sidebar
+  s                Cycle sort    Ctrl-B           Toggle sidebar
+  f                Filter col    Tab              Switch focus
+  Shift-F          Clear filters BackTab          Switch focus
+  Ctrl-F           Find in table 1-9 / 0          Activate tab 1{range_dash}10
+  j (on FK)        Jump to FK    Click tab        Switch / close tab
+  Backspace        Jump back     Enter (sidebar)  Open table
+
+Navigation (sidebar)           Command Palette  (Ctrl-P / Ctrl-Shift-P)
+  {up}{down} / k j          Move up/down  Export CSV       Save to ~/sqview_export.csv
+  {left}{right} / h l          Close/open    Export JSON      Save to ~/sqview_export.json
+  Enter            Open table    Export SQL       Save to ~/sqview_export.sql
+Misc                            Copy cell        Clip to OSC52 clipboard
+  Ctrl-Q           Quit         Copy row JSON    Clip to OSC52 clipboard
+  ?                Help (this)  Toggle sidebar   Show/hide schema panel
+                                 Toggle read-only Safe inspection mode
+                                 Reload schema    Refresh table list
+                                 Reset col widths Recalculate layout
+                                 Clear filters    Remove all filters
+                                 Switch Table     Jump to another table
+ "#,
+        all_arrows = all_arrows,
+        up = symbols.arrow_up,
+        down = symbols.arrow_down,
+        left = symbols.arrow_left,
+        right = symbols.arrow_right,
+        range_dash = symbols.range_dash,
+    )
 }

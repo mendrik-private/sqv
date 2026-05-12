@@ -18,7 +18,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::{config::Config, theme::Theme};
+use crate::{symbols::Symbols, theme::Theme};
 
 pub use command_palette::{CommandPaletteState, PaletteCommand};
 pub use date_picker::{DateFocus, DatePickerState};
@@ -70,20 +70,22 @@ pub fn render_popup(
     area: Rect,
     popup: &mut PopupKind,
     theme: &Theme,
-    config: &Config,
+    symbols: &Symbols,
 ) {
     match popup {
-        PopupKind::TextEditor(state) => text_editor::render(frame, area, state, theme, config),
-        PopupKind::ValuePicker(state) => value_picker::render(frame, area, state, theme, config),
-        PopupKind::DatePicker(state) => date_picker::render(frame, area, state, theme),
-        PopupKind::DatetimePicker(state) => datetime_picker::render(frame, area, state, theme),
-        PopupKind::InsertRow(state) => insert_row::render(frame, area, state, theme, config),
-        PopupKind::FkPicker(state) => fk_picker::render(frame, area, state, theme, config),
-        PopupKind::FilterPopup(state) => filter::render(frame, area, state, theme, config),
-        PopupKind::CommandPalette(state) => {
-            command_palette::render(frame, area, state, theme, config)
+        PopupKind::TextEditor(state) => text_editor::render(frame, area, state, theme, symbols),
+        PopupKind::ValuePicker(state) => value_picker::render(frame, area, state, theme, symbols),
+        PopupKind::DatePicker(state) => date_picker::render(frame, area, state, theme, symbols),
+        PopupKind::DatetimePicker(state) => {
+            datetime_picker::render(frame, area, state, theme, symbols)
         }
-        PopupKind::Help(state) => help::render(frame, area, state, theme, config),
-        PopupKind::Find(state) => find::render(frame, area, state, theme, config),
+        PopupKind::InsertRow(state) => insert_row::render(frame, area, state, theme, symbols),
+        PopupKind::FkPicker(state) => fk_picker::render(frame, area, state, theme, symbols),
+        PopupKind::FilterPopup(state) => filter::render(frame, area, state, theme, symbols),
+        PopupKind::CommandPalette(state) => {
+            command_palette::render(frame, area, state, theme, symbols)
+        }
+        PopupKind::Help(state) => help::render(frame, area, state, theme, symbols),
+        PopupKind::Find(state) => find::render(frame, area, state, theme, symbols),
     }
 }

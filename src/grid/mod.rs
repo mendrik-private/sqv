@@ -13,11 +13,11 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    config::Config,
     db::{
         schema::Column,
         types::{affinity, ColAffinity, SqlValue},
     },
+    symbols::Symbols,
     theme::Theme,
 };
 
@@ -390,13 +390,22 @@ enum CellAlign {
     Center,
 }
 
-fn format_cell_content(val: &SqlValue, col: &Column, inner_w: usize) -> (String, CellAlign) {
+fn format_cell_content(
+    val: &SqlValue,
+    col: &Column,
+    inner_w: usize,
+    symbols: &Symbols,
+) -> (String, CellAlign) {
     let col_upper = col.col_type.to_uppercase();
     match val {
         SqlValue::Null => (truncate_to_display_width("NULL", inner_w), CellAlign::Left),
         SqlValue::Integer(n) => {
             if col_upper.contains("BOOL") {
-                let s = if *n != 0 { "✓" } else { "·" };
+                let s = if *n != 0 {
+                    symbols.bool_true
+                } else {
+                    symbols.bool_false
+                };
                 (s.to_string(), CellAlign::Center)
             } else {
                 (
@@ -525,6 +534,7 @@ fn render_header(
     visible_cols: &[(usize, u16)],
     state: &GridState,
     theme: &Theme,
+    symbols: &Symbols,
 ) {
     let header_y = area.y;
     let header_style = Style::default().bg(theme.bg_raised);
@@ -550,10 +560,10 @@ fn render_header(
         let is_pk = col.is_pk;
         let is_fk = state.fk_cols.get(col_idx).copied().unwrap_or(false);
         let pfx = match (is_pk, is_fk) {
-            (true, true) => " 🔑 🔗",
-            (true, false) => " 🔑",
-            (false, true) => " 🔗",
-            (false, false) => "",
+            (true, true) => Some(format!(" {} {}", symbols.pk_icon, symbols.fk_icon)),
+            (true, false) => Some(format!(" {}", symbols.pk_icon)),
+            (false, true) => Some(format!(" {}", symbols.fk_icon)),
+            (false, false) => None,
         };
 
         for y in 0..HEADER_ROWS.min(area.height) {
@@ -565,12 +575,12 @@ fn render_header(
             );
         }
 
-        let sort_arrow: Option<&str> = if let Some(s) = &state.sort {
+        let sort_arrow: Option<String> = if let Some(s) = &state.sort {
             if s.col_idx == col_idx {
                 Some(if s.direction == SortDir::Asc {
-                    "▲"
+                    symbols.sort_asc.to_string()
                 } else {
-                    "▼"
+                    symbols.sort_desc.to_string()
                 })
             } else {
                 None
@@ -604,17 +614,17 @@ fn render_header(
                 buf.set_string(
                     sort_x,
                     header_y,
-                    arrow,
+                    &arrow,
                     Style::default().fg(theme.accent).bg(theme.bg_raised),
                 );
             }
         }
 
-        let meta_text = match (pfx.is_empty(), filter_active) {
-            (false, true) => format!("{}{} ƒ", badge.trim_end(), pfx),
-            (false, false) => format!("{}{}", badge.trim_end(), pfx),
-            (true, true) => format!("{} ƒ", badge.trim_end()),
-            (true, false) => badge.trim_end().to_string(),
+        let meta_text = match (pfx.as_deref(), filter_active) {
+            (Some(pfx), true) => format!("{}{pfx} {}", badge.trim_end(), symbols.filter_marker),
+            (Some(pfx), false) => format!("{}{pfx}", badge.trim_end()),
+            (None, true) => format!("{} {}", badge.trim_end(), symbols.filter_marker),
+            (None, false) => badge.trim_end().to_string(),
         };
         let meta_truncated =
             truncate_to_display_width(&format!(" {}", meta_text), actual_w as usize);
@@ -634,14 +644,14 @@ fn render_header(
             buf.set_string(
                 col_x,
                 header_y,
-                "│",
+                symbols.box_vertical.to_string(),
                 Style::default().fg(theme.line).bg(theme.bg_raised),
             );
             if HEADER_ROWS > 1 && header_y + 1 < area.y + area.height {
                 buf.set_string(
                     col_x,
                     header_y + 1,
-                    "│",
+                    symbols.box_vertical.to_string(),
                     Style::default().fg(theme.line).bg(theme.bg_raised),
                 );
             }
@@ -655,7 +665,10 @@ fn render_header(
         buf.set_string(
             area.x,
             divider_y,
-            "─".repeat(area.width as usize),
+            symbols
+                .box_horizontal
+                .to_string()
+                .repeat(area.width as usize),
             Style::default().fg(theme.line).bg(theme.bg_raised),
         );
     }
@@ -674,7 +687,7 @@ fn render_header(
             buf.set_string(
                 chevron_x,
                 header_y,
-                "⏵",
+                symbols.selection.to_string(),
                 Style::default().fg(theme.fg_mute).bg(theme.bg_raised),
             );
         }
@@ -685,11 +698,12 @@ fn render_data_rows(
     buf: &mut Buffer,
     area: Rect,
     gutter_width: u16,
-    gutter_digits: usize,
     visible_cols: &[(usize, u16)],
     state: &GridState,
     theme: &Theme,
+    symbols: &Symbols,
 ) {
+    let gutter_digits = digits(state.window.total_rows.max(1));
     let viewport_rows = state.window.viewport_rows;
     for row_in_view in 0..viewport_rows {
         let abs_row = state.viewport_start + row_in_view as i64;
@@ -752,7 +766,7 @@ fn render_data_rows(
                 }
 
                 if let Some(val) = row_data.get(col_idx) {
-                    let (content, align) = format_cell_content(val, col, inner_w);
+                    let (content, align) = format_cell_content(val, col, inner_w, symbols);
                     let enum_values = state
                         .enumerated_values
                         .get(col_idx)
@@ -777,7 +791,7 @@ fn render_data_rows(
             buf.set_string(
                 area.x + gutter_width,
                 row_y,
-                "…",
+                symbols.ellipsis.to_string(),
                 Style::default().fg(theme.fg_faint).bg(row_bg),
             );
         }
@@ -791,6 +805,7 @@ fn render_focused_border(
     visible_cols: &[(usize, u16)],
     state: &GridState,
     theme: &Theme,
+    symbols: &Symbols,
 ) {
     let focused_row_in_view = state.focused_row as i64 - state.viewport_start;
     if focused_row_in_view < 0 || focused_row_in_view >= state.window.viewport_rows as i64 {
@@ -827,30 +842,61 @@ fn render_focused_border(
 
     if cell_y >= area.y + HEADER_ROWS {
         let ty = cell_y - 1;
-        buf.set_string(cell_x, ty, "┌", border_style);
+        buf.set_string(cell_x, ty, symbols.focus_top_left.to_string(), border_style);
         if cell_w > 2 {
-            let mid = "─".repeat((cell_w - 2) as usize);
+            let mid = symbols
+                .box_horizontal
+                .to_string()
+                .repeat((cell_w - 2) as usize);
             buf.set_string(cell_x + 1, ty, &mid, border_style);
         }
         if right_x < area.x + area.width {
-            buf.set_string(right_x, ty, "┐", border_style);
+            buf.set_string(
+                right_x,
+                ty,
+                symbols.focus_top_right.to_string(),
+                border_style,
+            );
         }
     }
 
-    buf.set_string(cell_x, cell_y, "│", border_style);
+    buf.set_string(
+        cell_x,
+        cell_y,
+        symbols.box_vertical.to_string(),
+        border_style,
+    );
     if right_x < area.x + area.width {
-        buf.set_string(right_x, cell_y, "│", border_style);
+        buf.set_string(
+            right_x,
+            cell_y,
+            symbols.box_vertical.to_string(),
+            border_style,
+        );
     }
 
     let by = cell_y + 1;
     if by < area.y + area.height {
-        buf.set_string(cell_x, by, "└", border_style);
+        buf.set_string(
+            cell_x,
+            by,
+            symbols.focus_bottom_left.to_string(),
+            border_style,
+        );
         if cell_w > 2 {
-            let mid = "─".repeat((cell_w - 2) as usize);
+            let mid = symbols
+                .box_horizontal
+                .to_string()
+                .repeat((cell_w - 2) as usize);
             buf.set_string(cell_x + 1, by, &mid, border_style);
         }
         if right_x < area.x + area.width {
-            buf.set_string(right_x, by, "┘", border_style);
+            buf.set_string(
+                right_x,
+                by,
+                symbols.focus_bottom_right.to_string(),
+                border_style,
+            );
         }
     }
 }
@@ -896,7 +942,13 @@ fn vertical_scrollbar_metrics(area: Rect, state: &GridState) -> Option<Scrollbar
     })
 }
 
-fn render_vertical_scrollbar(buf: &mut Buffer, area: Rect, state: &GridState, theme: &Theme) {
+fn render_vertical_scrollbar(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &GridState,
+    theme: &Theme,
+    symbols: &Symbols,
+) {
     let Some(metrics) = vertical_scrollbar_metrics(area, state) else {
         return;
     };
@@ -905,7 +957,7 @@ fn render_vertical_scrollbar(buf: &mut Buffer, area: Rect, state: &GridState, th
         buf.set_string(
             metrics.track_x,
             metrics.track_y_start + ty as u16,
-            "│",
+            symbols.box_vertical.to_string(),
             Style::default().fg(theme.line_soft),
         );
     }
@@ -916,7 +968,7 @@ fn render_vertical_scrollbar(buf: &mut Buffer, area: Rect, state: &GridState, th
             buf.set_string(
                 metrics.track_x,
                 ty_abs,
-                "█",
+                symbols.scrollbar_thumb.to_string(),
                 Style::default().fg(theme.fg_mute),
             );
         }
@@ -967,7 +1019,13 @@ pub(crate) fn scrollbar_drag_target_row(
     )
 }
 
-fn render_loading_indicator(buf: &mut Buffer, area: Rect, state: &GridState, theme: &Theme) {
+fn render_loading_indicator(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &GridState,
+    theme: &Theme,
+    symbols: &Symbols,
+) {
     if !state.window.fetch_in_flight {
         return;
     }
@@ -979,7 +1037,12 @@ fn render_loading_indicator(buf: &mut Buffer, area: Rect, state: &GridState, the
     let y = area.y + HEADER_ROWS + pos as u16;
     let x = area.x + area.width.saturating_sub(1);
     if y < area.y + area.height {
-        buf.set_string(x, y, "•", Style::default().fg(theme.accent).bg(theme.bg));
+        buf.set_string(
+            x,
+            y,
+            symbols.loading.to_string(),
+            Style::default().fg(theme.accent).bg(theme.bg),
+        );
     }
 }
 
@@ -990,7 +1053,7 @@ pub fn render_grid(
     area: Rect,
     state: &mut GridState,
     theme: &Theme,
-    _config: &Config,
+    symbols: &Symbols,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1021,7 +1084,15 @@ pub fn render_grid(
     buf.set_style(area, Style::default().bg(theme.bg));
 
     if area.height >= HEADER_ROWS {
-        render_header(buf, area, gutter_width, &visible_cols, state, theme);
+        render_header(
+            buf,
+            area,
+            gutter_width,
+            &visible_cols,
+            state,
+            theme,
+            symbols,
+        );
     }
 
     if state.window.total_rows == 0 && area.height > HEADER_ROWS {
@@ -1039,14 +1110,22 @@ pub fn render_grid(
             buf,
             area,
             gutter_width,
-            gutter_digits,
             &visible_cols,
             state,
             theme,
+            symbols,
         );
-        render_focused_border(buf, area, gutter_width, &visible_cols, state, theme);
-        render_vertical_scrollbar(buf, area, state, theme);
-        render_loading_indicator(buf, area, state, theme);
+        render_focused_border(
+            buf,
+            area,
+            gutter_width,
+            &visible_cols,
+            state,
+            theme,
+            symbols,
+        );
+        render_vertical_scrollbar(buf, area, state, theme, symbols);
+        render_loading_indicator(buf, area, state, theme, symbols);
     }
     let _ = buf;
     alphabet_rail::render_rail(frame, area, state, theme);

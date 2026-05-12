@@ -8,9 +8,9 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    config::Config,
     db::types::SqlValue,
     filter::{rule::FilterRule, FilterOp, FilterValue},
+    symbols::Symbols,
     theme::Theme,
 };
 
@@ -235,7 +235,7 @@ impl FilterPopupState {
         Ok(())
     }
 
-    pub fn display_draft_value(&self) -> String {
+    pub fn display_draft_value(&self, cursor: char) -> String {
         let before: String = self
             .draft_value
             .chars()
@@ -246,7 +246,7 @@ impl FilterPopupState {
             .chars()
             .skip(self.draft_cursor_pos)
             .collect();
-        format!("{before}▌{after}")
+        format!("{before}{cursor}{after}")
     }
 
     fn build_rule(&self) -> Result<FilterRule, String> {
@@ -399,7 +399,7 @@ pub fn render(
     area: Rect,
     state: &FilterPopupState,
     theme: &Theme,
-    _config: &Config,
+    symbols: &Symbols,
 ) {
     let layout = popup_layout(area);
     let popup_area = layout.popup_area;
@@ -418,14 +418,14 @@ pub fn render(
         frame.buffer_mut().set_string(
             layout.divider_area.x,
             layout.divider_area.y + row,
-            "│",
+            symbols.box_vertical.to_string(),
             Style::default().fg(theme.line).bg(theme.bg_raised),
         );
     }
 
-    render_rule_list(frame, layout.rule_list_area, state, theme);
-    render_editor(frame, &layout, state, theme);
-    render_footer(frame, layout.footer_area, state, theme);
+    render_rule_list(frame, layout.rule_list_area, state, theme, symbols);
+    render_editor(frame, &layout, state, theme, symbols);
+    render_footer(frame, layout.footer_area, state, theme, symbols);
 }
 
 pub fn hit_test(area: Rect, state: &FilterPopupState, x: u16, y: u16) -> Option<FilterPopupHit> {
@@ -551,13 +551,19 @@ fn format_rule_summary(col_name: &str, rule: &FilterRule) -> String {
     format!("{col_name} {}", format_rule(rule))
 }
 
-fn render_rule_list(frame: &mut Frame, area: Rect, state: &FilterPopupState, theme: &Theme) {
+fn render_rule_list(
+    frame: &mut Frame,
+    area: Rect,
+    state: &FilterPopupState,
+    theme: &Theme,
+    symbols: &Symbols,
+) {
     let buf = frame.buffer_mut();
     let title = format!(" Rules in {} ", state.col_name);
     buf.set_string(
         area.x,
         area.y,
-        truncate(&title, area.width as usize),
+        truncate(&title, area.width as usize, symbols.ellipsis),
         Style::default()
             .fg(theme.fg_faint)
             .bg(theme.bg_raised)
@@ -623,13 +629,22 @@ fn render_rule_list(frame: &mut Frame, area: Rect, state: &FilterPopupState, the
         let text = if is_new_row {
             "+ New rule".to_string()
         } else if let Some(rule) = state.col_filter.rules.get(row_index) {
-            let checkbox = if rule.enabled { "[✓]" } else { "[ ]" };
+            let checkbox = if rule.enabled {
+                format!("[{}]", symbols.valid)
+            } else {
+                "[ ]".to_string()
+            };
             format!("{checkbox} {}", format_rule_summary(&state.col_name, rule))
         } else {
             String::new()
         };
 
-        buf.set_string(area.x, y, truncate(&text, text_width), base_style);
+        buf.set_string(
+            area.x,
+            y,
+            truncate(&text, text_width, symbols.ellipsis),
+            base_style,
+        );
         if !actions.is_empty() {
             let action_x = area.x + area.width.saturating_sub(actions_width as u16);
             buf.set_string(
@@ -648,7 +663,12 @@ fn render_rule_list(frame: &mut Frame, area: Rect, state: &FilterPopupState, the
         }
 
         if is_active {
-            buf.set_string(area.x, y, "▌", Style::default().fg(theme.accent).bg(bg));
+            buf.set_string(
+                area.x,
+                y,
+                symbols.active_bar.to_string(),
+                Style::default().fg(theme.accent).bg(bg),
+            );
         }
     }
 }
@@ -658,6 +678,7 @@ fn render_editor(
     layout: &FilterPopupLayout,
     state: &FilterPopupState,
     theme: &Theme,
+    symbols: &Symbols,
 ) {
     let area = layout.editor_area;
     let chunks = Layout::default()
@@ -677,7 +698,7 @@ fn render_editor(
     frame.buffer_mut().set_string(
         area.x,
         area.y,
-        truncate(heading, area.width as usize),
+        truncate(heading, area.width as usize, symbols.ellipsis),
         Style::default()
             .fg(theme.fg_faint)
             .bg(theme.bg_raised)
@@ -711,8 +732,9 @@ fn render_editor(
         layout.operator_inner.x,
         layout.operator_inner.y,
         truncate(
-            &format!("{} ▾", popup_op_label(state.draft_op)),
+            &format!("{} {}", popup_op_label(state.draft_op), symbols.dropdown),
             layout.operator_inner.width as usize,
+            symbols.ellipsis,
         ),
         Style::default()
             .fg(if state.focus == FilterPopupFocus::Operator {
@@ -724,14 +746,18 @@ fn render_editor(
     );
 
     let editor_value = if state.focus == FilterPopupFocus::Value {
-        state.display_draft_value()
+        state.display_draft_value(symbols.cursor)
     } else {
         state.draft_value.clone()
     };
     frame.buffer_mut().set_string(
         layout.value_inner.x,
         layout.value_inner.y,
-        truncate(&editor_value, layout.value_inner.width as usize),
+        truncate(
+            &editor_value,
+            layout.value_inner.width as usize,
+            symbols.ellipsis,
+        ),
         Style::default()
             .fg(if state.focus == FilterPopupFocus::Value {
                 theme.fg
@@ -788,11 +814,20 @@ fn render_editor(
     );
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, state: &FilterPopupState, theme: &Theme) {
+fn render_footer(
+    frame: &mut Frame,
+    area: Rect,
+    state: &FilterPopupState,
+    theme: &Theme,
+    symbols: &Symbols,
+) {
     frame.buffer_mut().set_string(
         area.x,
         area.y,
-        "─".repeat(area.width as usize),
+        symbols
+            .box_horizontal
+            .to_string()
+            .repeat(area.width as usize),
         Style::default().fg(theme.line).bg(theme.bg_raised),
     );
 
@@ -802,13 +837,25 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &FilterPopupState, theme:
         "Enter edit rule"
     };
     let action_line = Line::from(vec![
-        Span::styled("✓ ", Style::default().fg(theme.green)),
+        Span::styled(
+            format!("{} ", symbols.valid),
+            Style::default().fg(theme.green),
+        ),
         Span::styled(save_label, Style::default().fg(theme.green)),
-        Span::styled("  ·  ", Style::default().fg(theme.fg_faint)),
+        Span::styled(
+            symbols.padded_separator(),
+            Style::default().fg(theme.fg_faint),
+        ),
         Span::styled("Space activate", Style::default().fg(theme.yellow)),
-        Span::styled("  ·  ", Style::default().fg(theme.fg_faint)),
+        Span::styled(
+            symbols.padded_separator(),
+            Style::default().fg(theme.fg_faint),
+        ),
         Span::styled("Del remove", Style::default().fg(theme.red)),
-        Span::styled("  ·  ", Style::default().fg(theme.fg_faint)),
+        Span::styled(
+            symbols.padded_separator(),
+            Style::default().fg(theme.fg_faint),
+        ),
         Span::styled("Esc close", Style::default().fg(theme.fg)),
     ]);
 
@@ -816,7 +863,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &FilterPopupState, theme:
         Paragraph::new(vec![
             action_line,
             Line::from(vec![Span::styled(
-                "Rules in this column use OR · different columns use AND.",
+                format!(
+                    "Rules in this column use OR {} different columns use AND.",
+                    symbols.separator
+                ),
                 Style::default().fg(theme.fg_dim),
             )]),
         ])
@@ -830,7 +880,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &FilterPopupState, theme:
     );
 }
 
-fn truncate(text: &str, max_width: usize) -> String {
+fn truncate(text: &str, max_width: usize, ellipsis: char) -> String {
     if max_width == 0 {
         return String::new();
     }
@@ -846,7 +896,7 @@ fn truncate(text: &str, max_width: usize) -> String {
     }
     if UnicodeWidthStr::width(text) > max_width && max_width > 1 {
         out.pop();
-        out.push('…');
+        out.push(ellipsis);
     }
     out
 }
