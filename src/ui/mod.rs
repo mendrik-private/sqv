@@ -7,7 +7,7 @@ pub mod toast;
 use crate::app::{App, FocusPane};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::Style,
     text::Span,
     widgets::{block::BorderType, Block, Paragraph},
     Frame,
@@ -118,12 +118,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.grid_outer_area = Some(body_area);
         app.grid_inner_area = Some(inner);
         frame.render_widget(block, body_area);
-        render_right_frame_label(
-            frame,
-            body_area,
-            &format!(" {} ", grid.table_name),
-            &app.theme,
-        );
         crate::grid::render_grid(frame, inner, grid, &app.theme, &app.symbols);
     } else if let Some(active_idx) = app.active_tab {
         let tab = &app.open_tabs[active_idx];
@@ -135,12 +129,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.grid_outer_area = Some(body_area);
         app.grid_inner_area = Some(inner);
         frame.render_widget(block, body_area);
-        render_right_frame_label(
-            frame,
-            body_area,
-            &format!(" {} ", tab.table_name),
-            &app.theme,
-        );
         let msg = format!(" Loading {}...", tab.table_name);
         frame.render_widget(
             ratatui::widgets::Paragraph::new(msg).style(
@@ -188,31 +176,4 @@ fn fmt_count(n: i64) -> String {
     } else {
         grouped
     }
-}
-
-fn render_right_frame_label(
-    frame: &mut Frame,
-    area: Rect,
-    label: &str,
-    theme: &crate::theme::Theme,
-) {
-    if area.width <= 2 || area.height == 0 {
-        return;
-    }
-    let max_width = area.width.saturating_sub(4) as usize;
-    let trimmed: String = label.chars().take(max_width).collect();
-    let label_width = trimmed.chars().count() as u16;
-    if label_width == 0 {
-        return;
-    }
-    let x = area.x + area.width.saturating_sub(label_width + 2);
-    frame.buffer_mut().set_string(
-        x,
-        area.y,
-        trimmed,
-        Style::default()
-            .fg(theme.accent)
-            .bg(theme.bg)
-            .add_modifier(Modifier::BOLD),
-    );
 }

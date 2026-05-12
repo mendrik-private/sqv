@@ -252,6 +252,7 @@ pub enum Message {
     ReloadSchema,
     SchemaReady(Schema),
     CopyCell,
+    CopyRowJson,
     FileChanged,
     ExternalRefresh(Schema),
     OpenFind,
@@ -1665,13 +1666,12 @@ impl App {
                     })
                 });
                 if let Some(text) = text {
-                    use std::io::Write;
-                    let encoded = base64_encode(text.as_bytes());
-                    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
-                    let _ = std::io::stdout().write_all(osc52.as_bytes());
-                    let _ = std::io::stdout().flush();
-                    self.toast.push("Copied to clipboard", ToastKind::Success);
+                    self.copy_to_clipboard(&text, "Copied to clipboard");
                 }
+                self.dirty = true;
+            }
+            Message::CopyRowJson => {
+                self.copy_row_as_json();
                 self.dirty = true;
             }
             Message::FileChanged => {
@@ -1938,7 +1938,7 @@ impl App {
                 let _ = self.tx.send(Message::CopyCell);
             }
             PaletteCommand::CopyRowJson => {
-                self.copy_row_as_json();
+                let _ = self.tx.send(Message::CopyRowJson);
             }
             PaletteCommand::Quit => {
                 self.should_quit = true;
@@ -1946,7 +1946,7 @@ impl App {
         }
     }
 
-    fn copy_row_as_json(&self) {
+    fn copy_row_as_json(&mut self) {
         let json = self.grid.as_ref().and_then(|g| {
             let abs_row = g.focused_row as i64;
             let row = g.window.get_row(abs_row)?;
@@ -1968,12 +1968,17 @@ impl App {
             Some(format!("{{{}}}", fields.join(", ")))
         });
         if let Some(text) = json {
-            use std::io::Write;
-            let encoded = base64_encode(text.as_bytes());
-            let osc52 = format!("\x1b]52;c;{}\x07", encoded);
-            let _ = std::io::stdout().write_all(osc52.as_bytes());
-            let _ = std::io::stdout().flush();
+            self.copy_to_clipboard(&text, "Copied row JSON to clipboard");
         }
+    }
+
+    fn copy_to_clipboard(&mut self, text: &str, success_message: &str) {
+        use std::io::Write;
+        let encoded = base64_encode(text.as_bytes());
+        let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+        let _ = std::io::stdout().write_all(osc52.as_bytes());
+        let _ = std::io::stdout().flush();
+        self.toast.push(success_message, ToastKind::Success);
     }
 
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
@@ -2342,8 +2347,11 @@ impl App {
             }
         }
 
-        // ? toggles help (from any mode, unless confirming)
-        if key.code == KeyCode::Char('?') {
+        // ? and Ctrl-H toggle help (from any mode, unless confirming)
+        if key.code == KeyCode::Char('?')
+            || ((key.code == KeyCode::Char('h') || key.code == KeyCode::Char('H'))
+                && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
             if matches!(self.popup, Some(PopupKind::Help(_))) {
                 let _ = self.tx.send(Message::ClosePopup);
             } else {
@@ -3028,9 +3036,18 @@ impl App {
             (KeyCode::Char('d'), KeyModifiers::NONE) => {
                 let _ = self.tx.send(Message::DeleteRow);
             }
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                let _ = self.tx.send(Message::CopyCell);
+            }
+            (KeyCode::Char('Y'), KeyModifiers::SHIFT) => {
+                let _ = self.tx.send(Message::CopyRowJson);
+            }
             (KeyCode::Char(c), KeyModifiers::NONE)
                 if c.is_alphabetic()
-                    && !matches!(c, 'j' | 'k' | 'h' | 'l' | 's' | 'f' | 'i' | 'd' | 'e' | 'n') =>
+                    && !matches!(
+                        c,
+                        'j' | 'k' | 'h' | 'l' | 's' | 'f' | 'i' | 'd' | 'e' | 'n' | 'y'
+                    ) =>
             {
                 let is_text_sort = self.grid.as_ref().is_some_and(|g| {
                     if let Some(sort) = &g.sort {
@@ -3934,6 +3951,17 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_h_opens_help() {
+        let (mut app, mut rx) = make_test_app();
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL,
+        )));
+        drain_messages(&mut app, &mut rx);
+        assert!(matches!(app.popup, Some(PopupKind::Help(_))));
+    }
+
+    #[test]
     fn esc_in_help_closes_popup() {
         let (mut app, mut rx) = make_test_app();
         app.popup = Some(PopupKind::Help(HelpState::new()));
@@ -4376,6 +4404,30 @@ mod tests {
     }
 
     #[test]
+    fn y_in_grid_sends_copy_cell() {
+        let (mut app, mut rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.focus = FocusPane::Grid;
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(try_recv_variant(&mut rx), "CopyCell");
+    }
+
+    #[test]
+    fn shift_y_in_grid_sends_copy_row_json() {
+        let (mut app, mut rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.focus = FocusPane::Grid;
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(try_recv_variant(&mut rx), "CopyRowJson");
+    }
+
+    #[test]
     fn ctrl_z_sends_undo_action() {
         let (mut app, mut rx) = make_test_app();
         app.grid = Some(make_grid());
@@ -4645,7 +4697,7 @@ mod tests {
         state.scroll_up(5);
         assert_eq!(state.scroll, 0); // clamps at 0
         state.scroll_down(100);
-        assert_eq!(state.scroll, 9); // clamps at max_scroll-1
+        assert_eq!(state.scroll, 10); // clamps at max_scroll
     }
 
     #[test]

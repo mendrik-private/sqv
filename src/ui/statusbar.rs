@@ -252,28 +252,11 @@ fn action_hint_text(app: &App) -> Option<String> {
             if app.grid.is_some() && !app.readonly {
                 hints.push("[enter] open".to_string());
                 hints.push("[e] modify".to_string());
-                if app.focused_cell_can_be_set_null() {
-                    hints.push("[n] set null".to_string());
-                }
-                hints.push("[i] add row".to_string());
-                hints.push("[d] delete row".to_string());
             }
             if app.grid.is_some() {
                 hints.push("[s] sort".to_string());
                 hints.push("[f] filter".to_string());
                 hints.push("[ctrl-f] find".to_string());
-            }
-            if app
-                .grid
-                .as_ref()
-                .and_then(|g| g.fk_cols.get(g.focused_col))
-                .copied()
-                .unwrap_or(false)
-            {
-                hints.push("[j] jump".to_string());
-            }
-            if !app.jump_stack.is_empty() {
-                hints.push("[backspace] back".to_string());
             }
             if app.sidebar_visible {
                 hints.push("[tab] panel".to_string());
@@ -281,9 +264,7 @@ fn action_hint_text(app: &App) -> Option<String> {
         }
     }
 
-    if app.sidebar_visible {
-        hints.push("[ctrl-b] sidebar".to_string());
-    }
+    hints.push("[ctrl-h] help".to_string());
     hints.push("[ctrl-q] quit".to_string());
 
     if hints.is_empty() {
@@ -371,21 +352,25 @@ mod tests {
     }
 
     #[test]
-    fn grid_hints_include_row_actions_when_writable() {
+    fn grid_hints_focus_on_primary_actions() {
         let mut app = make_test_app();
         app.grid = Some(make_grid());
         app.focus = FocusPane::Grid;
 
         let hints = action_hint_text(&app).expect("grid hints");
 
+        assert!(hints.contains("[enter] open"));
         assert!(hints.contains("[e] modify"));
-        assert!(hints.contains("[n] set null"));
-        assert!(hints.contains("[i] add row"));
-        assert!(hints.contains("[d] delete row"));
+        assert!(hints.contains("[f] filter"));
+        assert!(hints.contains("[ctrl-f] find"));
+        assert!(hints.contains("[ctrl-h] help"));
+        assert!(!hints.contains("[n] set null"));
+        assert!(!hints.contains("[i] add row"));
+        assert!(!hints.contains("[d] delete row"));
     }
 
     #[test]
-    fn grid_hints_hide_set_null_when_focused_cell_is_null() {
+    fn grid_hints_leave_secondary_actions_in_help_dialog() {
         let mut app = make_test_app();
         let mut grid = make_grid();
         grid.window.rows[0][1] = SqlValue::Null;
@@ -395,7 +380,20 @@ mod tests {
 
         let hints = action_hint_text(&app).expect("grid hints");
 
+        assert!(!hints.contains("[y]"));
+        assert!(!hints.contains("[Y]"));
         assert!(!hints.contains("[n] set null"));
+    }
+
+    #[test]
+    fn sidebar_hints_include_ctrl_h_help() {
+        let mut app = make_test_app();
+        app.focus = FocusPane::Sidebar;
+
+        let hints = action_hint_text(&app).expect("sidebar hints");
+
+        assert!(hints.contains("[ctrl-h] help"));
+        assert!(hints.contains("[enter] open"));
     }
 
     #[test]
