@@ -10,7 +10,7 @@ mod symbols;
 mod theme;
 mod ui;
 
-use std::sync::Arc;
+use std::{io::Write, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
@@ -92,27 +92,68 @@ impl Cli {
 struct TerminalGuard;
 
 impl TerminalGuard {
-    fn new() -> anyhow::Result<Self> {
+    fn new(theme: &theme::Theme) -> anyhow::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(
+        if let Err(err) = set_terminal_background(theme) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(err.into());
+        }
+        if let Err(err) = crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
             crossterm::event::EnableMouseCapture,
             crossterm::cursor::Hide,
-        )?;
+        ) {
+            let _ = reset_terminal_background();
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(err.into());
+        }
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::event::DisableMouseCapture,
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show,
-        );
+        restore_terminal();
+    }
+}
+
+fn restore_terminal() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show,
+    );
+    let _ = reset_terminal_background();
+}
+
+fn set_terminal_background(theme: &theme::Theme) -> std::io::Result<()> {
+    if let Some(osc) = terminal_background_osc(theme) {
+        write_osc(&osc)?;
+    }
+    Ok(())
+}
+
+fn reset_terminal_background() -> std::io::Result<()> {
+    write_osc("\x1b]111\x07")
+}
+
+fn write_osc(sequence: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout();
+    stdout.write_all(sequence.as_bytes())?;
+    stdout.flush()
+}
+
+fn terminal_background_osc(theme: &theme::Theme) -> Option<String> {
+    color_osc_spec(theme.bg).map(|color| format!("\x1b]11;{color}\x07"))
+}
+
+fn color_osc_spec(color: ratatui::style::Color) -> Option<String> {
+    match color {
+        ratatui::style::Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+        _ => None,
     }
 }
 
@@ -136,13 +177,7 @@ async fn open_database(options: OpenOptions) -> anyhow::Result<()> {
 
     let orig_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::event::DisableMouseCapture,
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show,
-        );
+        restore_terminal();
         orig_hook(info);
     }));
 
@@ -161,10 +196,9 @@ async fn open_database(options: OpenOptions) -> anyhow::Result<()> {
 
     let _watcher = create_file_watcher(path, options.watch, tx.clone())?;
 
-    let _guard = TerminalGuard::new()?;
-
-    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     let mut app = App::new(schema, config, pool, tx, options.readonly, path.to_string());
+    let _guard = TerminalGuard::new(&app.theme)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
 
     run_event_loop(&mut terminal, &mut app, &mut rx).await?;
 
@@ -368,5 +402,14 @@ mod tests {
         assert!(!should_watch_database(":memory:", true));
         assert!(!should_watch_database("demo.db", false));
         assert!(should_watch_database("demo.db", true));
+    }
+
+    #[test]
+    fn terminal_background_osc_uses_theme_background() {
+        let theme = crate::theme::Theme::default();
+        assert_eq!(
+            terminal_background_osc(&theme),
+            Some("\u{1b}]11;#1d1b1a\u{7}".to_string())
+        );
     }
 }
