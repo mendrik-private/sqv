@@ -104,6 +104,81 @@ pub fn delete_row(conn: &Connection, table: &str, rowid: i64) -> anyhow::Result<
     }
 }
 
+fn delete_order_terms(order_by: Option<(&str, bool)>) -> String {
+    match order_by {
+        Some((col, asc)) => format!(
+            "\"{}\" {}, rowid ASC",
+            col,
+            if asc { "ASC" } else { "DESC" }
+        ),
+        None => "rowid ASC".to_string(),
+    }
+}
+
+fn delete_where_part(where_clause: &str) -> String {
+    if where_clause.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_clause)
+    }
+}
+
+pub fn delete_rows_in_view(
+    conn: &Connection,
+    table: &str,
+    start_offset: i64,
+    end_offset: i64,
+    order_by: Option<(&str, bool)>,
+    where_clause: &str,
+    where_params: &[rusqlite::types::Value],
+) -> anyhow::Result<usize> {
+    if end_offset < start_offset {
+        return Ok(0);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let count = end_offset - start_offset + 1;
+    let where_part = delete_where_part(where_clause);
+    let order_terms = delete_order_terms(order_by);
+    let limit_param = where_params.len() + 1;
+    let offset_param = where_params.len() + 2;
+    let sql = format!(
+        "DELETE FROM \"{table}\" WHERE rowid IN (
+            SELECT rowid FROM \"{table}\"{where_part}
+            ORDER BY {order_terms}
+            LIMIT ?{limit_param} OFFSET ?{offset_param}
+        )"
+    );
+    let mut params = where_params.to_vec();
+    params.push(rusqlite::types::Value::Integer(count));
+    params.push(rusqlite::types::Value::Integer(start_offset));
+
+    match tx.execute(&sql, rusqlite::params_from_iter(params.iter())) {
+        Ok(deleted) => {
+            tx.commit()?;
+            Ok(deleted)
+        }
+        Err(err) => {
+            let _ = tx.rollback();
+            Err(anyhow::anyhow!("{}", err))
+        }
+    }
+}
+
+pub fn clear_table(conn: &Connection, table: &str) -> anyhow::Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    match tx.execute(&format!("DELETE FROM \"{}\"", table), []) {
+        Ok(deleted) => {
+            tx.commit()?;
+            Ok(deleted)
+        }
+        Err(err) => {
+            let _ = tx.rollback();
+            Err(anyhow::anyhow!("{}", err))
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub fn fetch_row_by_rowid(
     conn: &Connection,
@@ -188,7 +263,7 @@ pub fn reinsert_row(
 
 #[cfg(test)]
 mod tests {
-    use super::insert_row;
+    use super::{clear_table, delete_rows_in_view, insert_row};
     use crate::db::types::SqlValue;
     use rusqlite::Connection;
 
@@ -221,5 +296,54 @@ mod tests {
 
         assert_eq!(name, "Alice");
         assert_eq!(age, 18);
+    }
+
+    #[test]
+    fn delete_rows_in_view_respects_order_and_offset() {
+        let conn = Connection::open_in_memory().expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+            INSERT INTO users (id, name) VALUES
+                (1, 'carol'),
+                (2, 'alice'),
+                (3, 'bravo'),
+                (4, 'delta');",
+        )
+        .expect("seed data");
+
+        let deleted = delete_rows_in_view(&conn, "users", 1, 2, Some(("name", true)), "", &[])
+            .expect("delete selected rows");
+
+        let remaining: Vec<String> = conn
+            .prepare("SELECT name FROM users ORDER BY name ASC")
+            .expect("prepare remaining")
+            .query_map([], |row| row.get(0))
+            .expect("query remaining")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect remaining");
+
+        assert_eq!(deleted, 2);
+        assert_eq!(remaining, vec!["alice".to_string(), "delta".to_string()]);
+    }
+
+    #[test]
+    fn clear_table_deletes_every_row_in_one_call() {
+        let conn = Connection::open_in_memory().expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+            INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');",
+        )
+        .expect("seed data");
+
+        let deleted = clear_table(&conn, "users").expect("clear table");
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .expect("count rows");
+
+        assert_eq!(deleted, 2);
+        assert_eq!(remaining, 0);
     }
 }

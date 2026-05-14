@@ -31,11 +31,12 @@ pub struct InsertRowState {
     pub table: String,
     pub fields: Vec<InsertFieldState>,
     pub selected: usize,
+    pub insert_position: usize,
     pub editing: bool,
 }
 
 impl InsertRowState {
-    pub fn new(table: String, columns: Vec<Column>) -> Self {
+    pub fn new(table: String, columns: Vec<Column>, insert_position: usize) -> Self {
         let fields: Vec<InsertFieldState> = columns
             .into_iter()
             .map(|col| InsertFieldState {
@@ -57,6 +58,7 @@ impl InsertRowState {
             table,
             fields,
             selected,
+            insert_position,
             editing: false,
         }
     }
@@ -71,10 +73,17 @@ impl InsertRowState {
         }
     }
 
+    pub fn move_prev_field(&mut self) {
+        self.move_up();
+    }
+
+    pub fn move_next_field(&mut self) {
+        self.move_down();
+    }
+
     pub fn start_editing(&mut self) {
         self.editing = true;
         if let Some(field) = self.selected_field_mut() {
-            field.touched = true;
             field.cursor_pos = field.input.chars().count();
         }
     }
@@ -136,7 +145,6 @@ impl InsertRowState {
     }
 
     pub fn reset_selected(&mut self) {
-        self.editing = false;
         if let Some(field) = self.selected_field_mut() {
             field.input.clear();
             field.touched = false;
@@ -227,6 +235,28 @@ impl InsertFieldState {
         let before: String = self.input.chars().take(self.cursor_pos).collect();
         let after: String = self.input.chars().skip(self.cursor_pos).collect();
         format!("{before}{cursor}{after}")
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.is_input_valid()
+    }
+
+    pub fn grid_display_value(&self, selected: bool, cursor: char) -> String {
+        if self.touched && selected {
+            return self.display_editor_value(true, cursor);
+        }
+        if self.touched {
+            return self.display_value();
+        }
+        if self.is_pk {
+            "<auto>".to_string()
+        } else if let Some(default_value) = &self.default_value {
+            default_value.clone()
+        } else if self.not_null {
+            "<required>".to_string()
+        } else {
+            "NULL".to_string()
+        }
     }
 }
 
@@ -428,6 +458,7 @@ mod tests {
         let state = InsertRowState::new(
             "users".to_string(),
             vec![column("name", "TEXT", true, None)],
+            0,
         );
 
         let err = state
@@ -445,6 +476,7 @@ mod tests {
                 column("name", "TEXT", true, None),
                 column("age", "INTEGER", false, Some("18")),
             ],
+            0,
         );
         state.start_editing();
         state.insert_char('A');

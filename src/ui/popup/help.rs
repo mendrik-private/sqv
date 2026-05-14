@@ -157,12 +157,18 @@ fn help_text(symbols: &Symbols) -> String {
                     "Save staged row",
                 ),
                 help_row(
+                    format!("Shift-{} / Shift-{}", symbols.arrow_up, symbols.arrow_down),
+                    "Select rows",
+                    "Delete / d",
+                    "Delete selected row(s)",
+                ),
+                help_row(
                     format!("Ctrl-{} / Ctrl-{}", symbols.arrow_up, symbols.arrow_down),
                     "Scroll page",
-                    "d",
-                    "Delete row (confirm)",
+                    "Ctrl-A",
+                    "Select all rows",
                 ),
-                help_row("Mouse wheel", "Scroll rows", "i", "Insert row (staged)"),
+                help_row("Mouse wheel", "Scroll rows", "Ins / i", "Insert row below"),
                 help_row("Shift-wheel", "Scroll cols", "e", "Edit value directly"),
                 help_row("Click cell", "Focus cell", "n", "Set NULL"),
                 help_row("", "", "Ctrl-Z", "Undo last write"),
@@ -182,7 +188,8 @@ fn help_text(symbols: &Symbols) -> String {
                     format!("Activate tab 1{}10", symbols.range_dash),
                 ),
                 help_row("j (on FK)", "Jump to FK", "Click tab", "Switch / close tab"),
-                help_row("Backspace", "Jump back", "Enter (sidebar)", "Open table"),
+                help_row("Backspace", "Jump back", "Ctrl-W", "Close current tab"),
+                help_row("Enter (sidebar)", "Open table", "", ""),
             ],
         },
         HelpSection {
@@ -433,5 +440,16 @@ mod tests {
             right_key_start(open_line, "Export SQL"),
             right_key_start(help_line, "Y")
         );
+    }
+
+    #[test]
+    fn help_text_lists_new_selection_and_tab_shortcuts() {
+        let symbols = Symbols::default_with_nerd_font(false);
+        let help = help_text(&symbols);
+
+        assert!(help.contains("Select rows"));
+        assert!(help.contains("Delete / d"));
+        assert!(help.contains("Ctrl-A"));
+        assert!(help.contains("Ctrl-W"));
     }
 }

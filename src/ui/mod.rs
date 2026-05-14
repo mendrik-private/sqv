@@ -118,7 +118,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.grid_outer_area = Some(body_area);
         app.grid_inner_area = Some(inner);
         frame.render_widget(block, body_area);
-        crate::grid::render_grid(frame, inner, grid, &app.theme, &app.symbols);
+        let insert_row = app.popup.as_ref().and_then(|popup| match popup {
+            crate::ui::popup::PopupKind::InsertRow(state) => Some(state),
+            _ => None,
+        });
+        crate::grid::render_grid(frame, inner, grid, insert_row, &app.theme, &app.symbols);
     } else if let Some(active_idx) = app.active_tab {
         let tab = &app.open_tabs[active_idx];
         let block = Block::bordered()
@@ -154,6 +158,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     if let Some(ref mut popup) = app.popup {
+        if matches!(popup, crate::ui::popup::PopupKind::InsertRow(_)) {
+            crate::ui::toast::render_toasts(frame, area, &app.toast, &app.theme);
+            if let Some(ref confirm) = app.pending_confirm {
+                crate::ui::toast::render_confirm(frame, area, &confirm.message, &app.theme);
+            }
+            return;
+        }
         crate::ui::popup::render_popup(frame, area, popup, &app.theme, &app.symbols);
     }
     crate::ui::toast::render_toasts(frame, area, &app.toast, &app.theme);

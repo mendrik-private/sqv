@@ -19,6 +19,7 @@ use crate::{
     },
     symbols::Symbols,
     theme::Theme,
+    ui::popup::InsertRowState,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +32,13 @@ pub enum SortDir {
 pub struct SortSpec {
     pub col_idx: usize,
     pub direction: SortDir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowSelection {
+    None,
+    Range { anchor: usize, head: usize },
+    All,
 }
 
 pub struct GridInit {
@@ -62,6 +70,7 @@ pub struct GridState {
     pub avail_col_width: u16,
     pub sort: Option<SortSpec>,
     pub filter: crate::filter::FilterSet,
+    pub row_selection: RowSelection,
 }
 
 const HEADER_ROWS: u16 = 3;
@@ -107,6 +116,7 @@ impl GridState {
             avail_col_width: area_width,
             sort: None,
             filter: crate::filter::FilterSet::default(),
+            row_selection: RowSelection::None,
         };
         state.recompute_col_widths(area_width);
         state
@@ -206,7 +216,89 @@ impl GridState {
         }
     }
 
+    pub fn clear_row_selection(&mut self) {
+        self.row_selection = RowSelection::None;
+    }
+
+    pub fn extend_row_selection_down(&mut self, n: usize) {
+        if self.window.total_rows <= 0 {
+            return;
+        }
+        if matches!(self.row_selection, RowSelection::All) {
+            self.scroll_down(n);
+            return;
+        }
+        let anchor = match self.row_selection {
+            RowSelection::Range { anchor, .. } => anchor,
+            RowSelection::None => self.focused_row,
+            RowSelection::All => self.focused_row,
+        };
+        self.scroll_down(n);
+        self.row_selection = RowSelection::Range {
+            anchor,
+            head: self.focused_row,
+        };
+    }
+
+    pub fn extend_row_selection_up(&mut self, n: usize) {
+        if self.window.total_rows <= 0 {
+            return;
+        }
+        if matches!(self.row_selection, RowSelection::All) {
+            self.scroll_up(n);
+            return;
+        }
+        let anchor = match self.row_selection {
+            RowSelection::Range { anchor, .. } => anchor,
+            RowSelection::None => self.focused_row,
+            RowSelection::All => self.focused_row,
+        };
+        self.scroll_up(n);
+        self.row_selection = RowSelection::Range {
+            anchor,
+            head: self.focused_row,
+        };
+    }
+
+    pub fn select_all_rows(&mut self) {
+        self.row_selection = if self.window.total_rows > 0 {
+            RowSelection::All
+        } else {
+            RowSelection::None
+        };
+    }
+
+    pub fn has_row_selection(&self) -> bool {
+        !matches!(self.row_selection, RowSelection::None)
+    }
+
+    pub fn selected_row_range(&self) -> Option<(usize, usize)> {
+        match self.row_selection {
+            RowSelection::Range { anchor, head } => {
+                let start = anchor.min(head);
+                let end = anchor.max(head);
+                Some((start, end))
+            }
+            RowSelection::None | RowSelection::All => None,
+        }
+    }
+
+    pub fn is_row_selected(&self, abs_row: i64) -> bool {
+        if abs_row < 0 {
+            return false;
+        }
+        let abs_row = abs_row as usize;
+        match self.row_selection {
+            RowSelection::None => false,
+            RowSelection::Range { .. } => self
+                .selected_row_range()
+                .is_some_and(|(start, end)| abs_row >= start && abs_row <= end),
+            RowSelection::All => abs_row < self.window.total_rows.max(0) as usize,
+        }
+    }
+
     pub fn focus_cell(&mut self, row: usize, col: usize) {
+        self.clear_row_selection();
         if self.columns.is_empty() {
             self.focused_row = row.min(self.window.total_rows.saturating_sub(1) as usize);
             self.focused_col = 0;
@@ -700,14 +792,17 @@ fn render_data_rows(
     gutter_width: u16,
     visible_cols: &[(usize, u16)],
     state: &GridState,
+    insert_row: Option<&InsertRowState>,
     theme: &Theme,
     symbols: &Symbols,
 ) {
     let gutter_digits = digits(state.window.total_rows.max(1));
     let viewport_rows = state.window.viewport_rows;
+    let display_start = display_viewport_start(state, insert_row);
+    let display_total_rows = total_display_rows(state, insert_row);
     for row_in_view in 0..viewport_rows {
-        let abs_row = state.viewport_start + row_in_view as i64;
-        if abs_row >= state.window.total_rows {
+        let display_abs_row = display_start + row_in_view as i64;
+        if display_abs_row >= display_total_rows {
             break;
         }
         let row_y = area.y + HEADER_ROWS + row_in_view as u16;
@@ -715,85 +810,31 @@ fn render_data_rows(
             break;
         }
 
-        let is_focused = abs_row == state.focused_row as i64;
-        let row_bg = if is_focused {
-            theme.bg_raised
-        } else if abs_row % 2 == 0 {
-            theme.bg
-        } else {
-            theme.bg_soft
-        };
-
-        buf.set_string(
-            area.x,
-            row_y,
-            " ".repeat(area.width as usize),
-            Style::default().bg(row_bg),
-        );
-
-        let row_num_str = format!("{:>width$} ", abs_row + 1, width = gutter_digits);
-        let gutter_fg = if is_focused {
-            theme.accent
-        } else {
-            theme.fg_faint
-        };
-        buf.set_string(
-            area.x,
-            row_y,
-            &row_num_str,
-            Style::default().bg(row_bg).fg(gutter_fg),
-        );
-
-        let mut col_x = area.x + gutter_width;
-
-        if let Some(row_data) = state.window.get_row(abs_row) {
-            for &(col_idx, cell_w) in visible_cols {
-                if col_x >= area.x + area.width {
-                    break;
-                }
-                let col = &state.columns[col_idx];
-                let actual_w = cell_w.min(area.x + area.width - col_x);
-                let inner_w = (actual_w as usize).saturating_sub(2);
-
-                let is_focused_cell = is_focused && col_idx == state.focused_col;
-                if actual_w > 0 {
-                    buf.set_string(
-                        col_x,
-                        row_y,
-                        " ".repeat(actual_w as usize),
-                        Style::default().bg(row_bg),
-                    );
-                }
-
-                if let Some(val) = row_data.get(col_idx) {
-                    let (content, align) = format_cell_content(val, col, inner_w, symbols);
-                    let enum_values = state
-                        .enumerated_values
-                        .get(col_idx)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]);
-                    let style =
-                        cell_val_style(val, col, theme, is_focused_cell, enum_values).bg(row_bg);
-                    let display_w = UnicodeWidthStr::width(content.as_str());
-                    let content_x = match align {
-                        CellAlign::Left => col_x + 1,
-                        CellAlign::Right => col_x + 1 + inner_w.saturating_sub(display_w) as u16,
-                        CellAlign::Center => {
-                            col_x + 1 + (inner_w.saturating_sub(display_w) / 2) as u16
-                        }
-                    };
-                    buf.set_string(content_x, row_y, &content, style);
-                }
-
-                col_x += cell_w;
-            }
-        } else {
-            buf.set_string(
-                area.x + gutter_width,
+        match display_row_kind(state, insert_row, display_abs_row) {
+            Some(VisibleGridRow::Data { real_abs }) => render_existing_row(
+                buf,
+                area,
+                gutter_width,
+                visible_cols,
+                state,
+                theme,
+                symbols,
+                gutter_digits,
                 row_y,
-                symbols.ellipsis.to_string(),
-                Style::default().fg(theme.fg_faint).bg(row_bg),
-            );
+                real_abs,
+            ),
+            Some(VisibleGridRow::Insert(insert_state)) => render_insert_row(
+                buf,
+                area,
+                gutter_width,
+                visible_cols,
+                theme,
+                symbols,
+                gutter_digits,
+                row_y,
+                insert_state,
+            ),
+            None => break,
         }
     }
 }
@@ -804,14 +845,38 @@ fn render_focused_border(
     gutter_width: u16,
     visible_cols: &[(usize, u16)],
     state: &GridState,
+    insert_row: Option<&InsertRowState>,
     theme: &Theme,
     symbols: &Symbols,
 ) {
+    if let Some(insert_row) = insert_row {
+        let focused_col = insert_row.selected;
+        let focused_row_in_view =
+            insert_row.insert_position as i64 - display_viewport_start(state, Some(insert_row));
+        if focused_row_in_view < 0 || focused_row_in_view >= state.window.viewport_rows as i64 {
+            return;
+        }
+        let vis_pos = match visible_cols.iter().position(|&(c, _)| c == focused_col) {
+            Some(p) => p,
+            None => return,
+        };
+        let cell_y = area.y + HEADER_ROWS + focused_row_in_view as u16;
+        let mut cell_x = area.x + gutter_width;
+        for &(_, cell_w) in &visible_cols[..vis_pos] {
+            cell_x += cell_w;
+        }
+        let cell_w = visible_cols[vis_pos].1;
+        let focused_bg = insert_row_background(theme, true);
+        draw_cell_border(
+            buf, area, cell_x, cell_y, cell_w, focused_bg, theme, symbols,
+        );
+        return;
+    }
+
     let focused_row_in_view = state.focused_row as i64 - state.viewport_start;
     if focused_row_in_view < 0 || focused_row_in_view >= state.window.viewport_rows as i64 {
         return;
     }
-    let focused_row_in_view = focused_row_in_view as usize;
     let focused_col = state.focused_col;
 
     let vis_pos = match visible_cols.iter().position(|&(c, _)| c == focused_col) {
@@ -829,14 +894,29 @@ fn render_focused_border(
         cell_x += cell_w;
     }
     let cell_w = visible_cols[vis_pos].1;
+    let focused_bg = row_background(state, theme, state.focused_row as i64, true);
+    draw_cell_border(
+        buf, area, cell_x, cell_y, cell_w, focused_bg, theme, symbols,
+    );
+}
 
-    if cell_x >= area.x + area.width || cell_w < 2 {
+fn draw_cell_border(
+    buf: &mut Buffer,
+    area: Rect,
+    cell_x: u16,
+    cell_y: u16,
+    cell_w: u16,
+    cell_bg: Color,
+    theme: &Theme,
+    symbols: &Symbols,
+) {
+    if cell_y >= area.y + area.height || cell_x >= area.x + area.width || cell_w < 2 {
         return;
     }
 
     let border_style = Style::default()
         .fg(theme.accent)
-        .bg(theme.bg_raised)
+        .bg(cell_bg)
         .remove_modifier(Modifier::all());
     let right_x = cell_x + cell_w - 1;
 
@@ -898,6 +978,241 @@ fn render_focused_border(
                 border_style,
             );
         }
+    }
+}
+
+fn row_background(state: &GridState, theme: &Theme, abs_row: i64, is_focused: bool) -> Color {
+    let base = if is_focused {
+        theme.bg_raised
+    } else if abs_row % 2 == 0 {
+        theme.bg
+    } else {
+        theme.bg_soft
+    };
+    if state.is_row_selected(abs_row) {
+        mix_color(base, theme.accent, if is_focused { 0.28 } else { 0.18 })
+    } else {
+        base
+    }
+}
+
+fn insert_row_background(theme: &Theme, is_selected_cell: bool) -> Color {
+    if is_selected_cell {
+        mix_color(theme.bg_raised, theme.accent, 0.16)
+    } else {
+        mix_color(theme.bg_raised, theme.accent, 0.08)
+    }
+}
+
+enum VisibleGridRow<'a> {
+    Data { real_abs: i64 },
+    Insert(&'a InsertRowState),
+}
+
+fn total_display_rows(state: &GridState, insert_row: Option<&InsertRowState>) -> i64 {
+    state.window.total_rows + i64::from(insert_row.is_some())
+}
+
+fn display_viewport_start(state: &GridState, insert_row: Option<&InsertRowState>) -> i64 {
+    if let Some(insert_row) = insert_row {
+        if (insert_row.insert_position as i64) < state.viewport_start {
+            state.viewport_start + 1
+        } else {
+            state.viewport_start
+        }
+    } else {
+        state.viewport_start
+    }
+}
+
+fn display_row_kind<'a>(
+    state: &GridState,
+    insert_row: Option<&'a InsertRowState>,
+    display_abs_row: i64,
+) -> Option<VisibleGridRow<'a>> {
+    if let Some(insert_row) = insert_row {
+        let insert_pos = insert_row.insert_position as i64;
+        if display_abs_row == insert_pos {
+            return Some(VisibleGridRow::Insert(insert_row));
+        }
+        let real_abs = if display_abs_row > insert_pos {
+            display_abs_row - 1
+        } else {
+            display_abs_row
+        };
+        if real_abs >= 0 && real_abs < state.window.total_rows {
+            Some(VisibleGridRow::Data { real_abs })
+        } else {
+            None
+        }
+    } else if display_abs_row >= 0 && display_abs_row < state.window.total_rows {
+        Some(VisibleGridRow::Data {
+            real_abs: display_abs_row,
+        })
+    } else {
+        None
+    }
+}
+
+fn render_existing_row(
+    buf: &mut Buffer,
+    area: Rect,
+    gutter_width: u16,
+    visible_cols: &[(usize, u16)],
+    state: &GridState,
+    theme: &Theme,
+    symbols: &Symbols,
+    gutter_digits: usize,
+    row_y: u16,
+    abs_row: i64,
+) {
+    let is_focused = abs_row == state.focused_row as i64;
+    let is_selected = state.is_row_selected(abs_row);
+    let row_bg = row_background(state, theme, abs_row, is_focused);
+
+    buf.set_string(
+        area.x,
+        row_y,
+        " ".repeat(area.width as usize),
+        Style::default().bg(row_bg),
+    );
+
+    let row_num_str = format!("{:>width$} ", abs_row + 1, width = gutter_digits);
+    let gutter_fg = if is_focused || is_selected {
+        theme.accent
+    } else {
+        theme.fg_faint
+    };
+    buf.set_string(
+        area.x,
+        row_y,
+        &row_num_str,
+        Style::default().bg(row_bg).fg(gutter_fg),
+    );
+
+    let mut col_x = area.x + gutter_width;
+
+    if let Some(row_data) = state.window.get_row(abs_row) {
+        for &(col_idx, cell_w) in visible_cols {
+            if col_x >= area.x + area.width {
+                break;
+            }
+            let col = &state.columns[col_idx];
+            let actual_w = cell_w.min(area.x + area.width - col_x);
+            let inner_w = (actual_w as usize).saturating_sub(2);
+
+            let is_focused_cell = is_focused && col_idx == state.focused_col;
+            if actual_w > 0 {
+                buf.set_string(
+                    col_x,
+                    row_y,
+                    " ".repeat(actual_w as usize),
+                    Style::default().bg(row_bg),
+                );
+            }
+
+            if let Some(val) = row_data.get(col_idx) {
+                let (content, align) = format_cell_content(val, col, inner_w, symbols);
+                let enum_values = state
+                    .enumerated_values
+                    .get(col_idx)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let style =
+                    cell_val_style(val, col, theme, is_focused_cell, enum_values).bg(row_bg);
+                let display_w = UnicodeWidthStr::width(content.as_str());
+                let content_x = match align {
+                    CellAlign::Left => col_x + 1,
+                    CellAlign::Right => col_x + 1 + inner_w.saturating_sub(display_w) as u16,
+                    CellAlign::Center => col_x + 1 + (inner_w.saturating_sub(display_w) / 2) as u16,
+                };
+                buf.set_string(content_x, row_y, &content, style);
+            }
+
+            col_x += cell_w;
+        }
+    } else {
+        buf.set_string(
+            area.x + gutter_width,
+            row_y,
+            symbols.ellipsis.to_string(),
+            Style::default().fg(theme.fg_faint).bg(row_bg),
+        );
+    }
+}
+
+fn render_insert_row(
+    buf: &mut Buffer,
+    area: Rect,
+    gutter_width: u16,
+    visible_cols: &[(usize, u16)],
+    theme: &Theme,
+    symbols: &Symbols,
+    gutter_digits: usize,
+    row_y: u16,
+    insert_row: &InsertRowState,
+) {
+    let row_bg = insert_row_background(theme, false);
+    buf.set_string(
+        area.x,
+        row_y,
+        " ".repeat(area.width as usize),
+        Style::default().bg(row_bg),
+    );
+
+    let row_num_str = format!("{:>width$} ", "+", width = gutter_digits);
+    buf.set_string(
+        area.x,
+        row_y,
+        &row_num_str,
+        Style::default()
+            .bg(row_bg)
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let mut col_x = area.x + gutter_width;
+    for &(col_idx, cell_w) in visible_cols {
+        if col_x >= area.x + area.width {
+            break;
+        }
+        let actual_w = cell_w.min(area.x + area.width - col_x);
+        let inner_w = (actual_w as usize).saturating_sub(2);
+        let selected = col_idx == insert_row.selected;
+        let cell_bg = insert_row_background(theme, selected);
+
+        if actual_w > 0 {
+            buf.set_string(
+                col_x,
+                row_y,
+                " ".repeat(actual_w as usize),
+                Style::default().bg(cell_bg),
+            );
+        }
+
+        if let Some(field) = insert_row.fields.get(col_idx) {
+            let content = truncate_to_display_width(
+                &field.grid_display_value(selected, symbols.cursor),
+                inner_w,
+            );
+            let style = if selected {
+                Style::default()
+                    .fg(if field.is_valid() {
+                        theme.accent
+                    } else {
+                        theme.red
+                    })
+                    .bg(cell_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else if field.is_valid() {
+                Style::default().fg(theme.fg_dim).bg(cell_bg)
+            } else {
+                Style::default().fg(theme.red).bg(cell_bg)
+            };
+            buf.set_string(col_x + 1, row_y, &content, style);
+        }
+
+        col_x += cell_w;
     }
 }
 
@@ -1052,6 +1367,7 @@ pub fn render_grid(
     frame: &mut Frame,
     area: Rect,
     state: &mut GridState,
+    insert_row: Option<&InsertRowState>,
     theme: &Theme,
     symbols: &Symbols,
 ) {
@@ -1095,7 +1411,7 @@ pub fn render_grid(
         );
     }
 
-    if state.window.total_rows == 0 && area.height > HEADER_ROWS {
+    if state.window.total_rows == 0 && insert_row.is_none() && area.height > HEADER_ROWS {
         buf.set_string(
             area.x + gutter_width,
             area.y + HEADER_ROWS,
@@ -1112,6 +1428,7 @@ pub fn render_grid(
             gutter_width,
             &visible_cols,
             state,
+            insert_row,
             theme,
             symbols,
         );
@@ -1121,6 +1438,7 @@ pub fn render_grid(
             gutter_width,
             &visible_cols,
             state,
+            insert_row,
             theme,
             symbols,
         );
@@ -1225,7 +1543,7 @@ fn hit_test_col(
 mod tests {
     use super::{
         compute_visible_cols, enum_value_color, scrollbar_drag_start, scrollbar_drag_target_row,
-        GridInit, GridState,
+        GridInit, GridState, RowSelection,
     };
     use crate::db::{schema::Column, types::SqlValue};
     use crate::theme::Theme;
@@ -1381,5 +1699,51 @@ mod tests {
 
         assert_eq!(grid.focused_row, 5);
         assert_eq!(grid.viewport_start, 1);
+    }
+
+    #[test]
+    fn extending_row_selection_tracks_anchor_and_head() {
+        let columns = vec![make_col("name", "TEXT", false)];
+        let mut grid = GridState::new(GridInit {
+            table_name: "customers".to_string(),
+            columns,
+            fk_cols: vec![false],
+            enumerated_values: vec![Vec::new()],
+            rows: vec![vec![SqlValue::Text("Alice".to_string())]; 10],
+            width_sample_rows: vec![],
+            total_rows: 10,
+            area_width: 40,
+        });
+
+        grid.extend_row_selection_down(2);
+
+        assert_eq!(grid.focused_row, 2);
+        assert_eq!(
+            grid.row_selection,
+            RowSelection::Range { anchor: 0, head: 2 }
+        );
+        assert!(grid.is_row_selected(1));
+        assert!(!grid.is_row_selected(3));
+    }
+
+    #[test]
+    fn focus_cell_clears_row_selection() {
+        let columns = vec![make_col("name", "TEXT", false)];
+        let mut grid = GridState::new(GridInit {
+            table_name: "customers".to_string(),
+            columns,
+            fk_cols: vec![false],
+            enumerated_values: vec![Vec::new()],
+            rows: vec![vec![SqlValue::Text("Alice".to_string())]; 10],
+            width_sample_rows: vec![],
+            total_rows: 10,
+            area_width: 40,
+        });
+        grid.select_all_rows();
+
+        grid.focus_cell(4, 0);
+
+        assert_eq!(grid.row_selection, RowSelection::None);
+        assert_eq!(grid.focused_row, 4);
     }
 }

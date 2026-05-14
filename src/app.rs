@@ -14,7 +14,7 @@ use crate::{
         DbPool,
     },
     filter::predicate::filter_to_sql,
-    grid::{SortDir, SortSpec},
+    grid::{RowSelection, SortDir, SortSpec},
     symbols::Symbols,
     theme::Theme,
     ui::{
@@ -74,7 +74,20 @@ pub struct UndoFrame {
 
 #[derive(Debug, Clone)]
 pub enum ConfirmKind {
-    DeleteRow { table: String, rowid: i64 },
+    DeleteRow {
+        table: String,
+        rowid: i64,
+    },
+    DeleteSelectedRows {
+        table: String,
+        start_offset: i64,
+        end_offset: i64,
+        sort: Option<(String, bool)>,
+        filter: crate::filter::FilterSet,
+    },
+    ClearTable {
+        table: String,
+    },
 }
 
 pub struct PendingConfirm {
@@ -240,6 +253,10 @@ pub enum Message {
     RowDeleted {
         table: String,
         rowid: i64,
+    },
+    RowsDeleted {
+        table: String,
+        count: usize,
     },
     OpenCommandPalette,
     OpenHelp,
@@ -438,6 +455,7 @@ impl App {
             }
             Message::ScrollToEnd => {
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
+                    grid.clear_row_selection();
                     grid.scroll_to_end();
                     if grid.needs_fetch && !grid.window.fetch_in_flight {
                         grid.window.fetch_in_flight = true;
@@ -467,63 +485,11 @@ impl App {
                 self.dirty = true;
             }
             Message::MoveDown => {
-                let maybe_fetch = if let Some(ref mut grid) = self.grid {
-                    grid.scroll_down(1);
-                    if grid.needs_fetch && !grid.window.fetch_in_flight {
-                        grid.window.fetch_in_flight = true;
-                        grid.needs_fetch = false;
-                        let (off, lim) = grid.window.fetch_params(grid.focused_row as i64);
-                        let sort = grid.sort.as_ref().and_then(|s| {
-                            grid.columns
-                                .get(s.col_idx)
-                                .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
-                        });
-                        Some((
-                            grid.table_name.clone(),
-                            grid.columns.clone(),
-                            sort,
-                            off,
-                            lim,
-                        ))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some((table, cols, sort, off, lim)) = maybe_fetch {
-                    self.spawn_window_fetch(&table, &cols, sort, off, lim);
-                }
+                self.scroll_grid_down(1);
                 self.dirty = true;
             }
             Message::MoveUp => {
-                let maybe_fetch = if let Some(ref mut grid) = self.grid {
-                    grid.scroll_up(1);
-                    if grid.needs_fetch && !grid.window.fetch_in_flight {
-                        grid.window.fetch_in_flight = true;
-                        grid.needs_fetch = false;
-                        let (off, lim) = grid.window.fetch_params(grid.focused_row as i64);
-                        let sort = grid.sort.as_ref().and_then(|s| {
-                            grid.columns
-                                .get(s.col_idx)
-                                .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
-                        });
-                        Some((
-                            grid.table_name.clone(),
-                            grid.columns.clone(),
-                            sort,
-                            off,
-                            lim,
-                        ))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some((table, cols, sort, off, lim)) = maybe_fetch {
-                    self.spawn_window_fetch(&table, &cols, sort, off, lim);
-                }
+                self.scroll_grid_up(1);
                 self.dirty = true;
             }
             Message::MoveRight => {
@@ -554,6 +520,7 @@ impl App {
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
                     grid.focused_col = 0;
                     grid.h_scroll = 0;
+                    grid.clear_row_selection();
                     grid.scroll_to_row(0);
                     if grid.needs_fetch && !grid.window.fetch_in_flight {
                         grid.window.fetch_in_flight = true;
@@ -585,6 +552,7 @@ impl App {
             Message::MoveLastCell => {
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
                     grid.move_col_last();
+                    grid.clear_row_selection();
                     grid.scroll_to_end();
                     if grid.needs_fetch && !grid.window.fetch_in_flight {
                         grid.window.fetch_in_flight = true;
@@ -857,6 +825,9 @@ impl App {
             Message::ClosePopup => {
                 self.popup = None;
                 self.mode = AppMode::Browse;
+                if let Some(ref mut grid) = self.grid {
+                    Self::clamp_grid_viewport(grid);
+                }
                 if self.pending_external_refresh {
                     self.pending_external_refresh = false;
                     if let Some(ref mut grid) = self.grid {
@@ -1139,6 +1110,7 @@ impl App {
             Message::JumpToSortedOffset { table, offset } => {
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
                     if grid.table_name == table {
+                        grid.clear_row_selection();
                         grid.scroll_to_row(offset);
                         if grid.needs_fetch && !grid.window.fetch_in_flight {
                             grid.window.fetch_in_flight = true;
@@ -1333,12 +1305,25 @@ impl App {
                     self.toast.push("Read-only database", ToastKind::Error);
                     return;
                 }
-                if let Some(ref grid) = self.grid {
-                    self.popup = Some(PopupKind::InsertRow(InsertRowState::new(
+                if let Some(ref mut grid) = self.grid {
+                    let insert_position = if grid.window.total_rows <= 0 {
+                        0
+                    } else {
+                        (grid.focused_row + 1).min(grid.window.total_rows as usize)
+                    };
+                    grid.clear_row_selection();
+                    let mut state = InsertRowState::new(
                         grid.table_name.clone(),
                         grid.columns.clone(),
-                    )));
+                        insert_position,
+                    );
+                    state.start_editing();
+                    let focused_row = grid.focused_row;
+                    grid.focus_cell(focused_row, state.selected);
+                    Self::ensure_inline_insert_visible(grid, insert_position);
+                    self.popup = Some(PopupKind::InsertRow(state));
                     self.mode = AppMode::Edit;
+                    self.toast.push("Ctrl-Enter commits", ToastKind::Info);
                 }
                 self.dirty = true;
             }
@@ -1411,30 +1396,124 @@ impl App {
                     self.toast.push("Read-only database", ToastKind::Error);
                     return;
                 }
-                let delete_context = self.grid.as_ref().map(|grid| {
-                    let row_num = grid.focused_row + 1;
+                enum DeleteTarget {
+                    CurrentRow {
+                        row_num: usize,
+                        table: String,
+                        abs_row: i64,
+                        sort: Option<(String, bool)>,
+                        filter: crate::filter::FilterSet,
+                    },
+                    SelectedRows {
+                        table: String,
+                        start_offset: i64,
+                        end_offset: i64,
+                        count: usize,
+                        sort: Option<(String, bool)>,
+                        filter: crate::filter::FilterSet,
+                    },
+                    AllRows {
+                        table: String,
+                    },
+                }
+
+                let delete_target = self.grid.as_ref().and_then(|grid| {
                     let table = grid.table_name.clone();
-                    let abs_row = grid.focused_row as i64;
                     let sort = grid.sort.as_ref().and_then(|s| {
                         grid.columns
                             .get(s.col_idx)
                             .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
                     });
-                    (row_num, table, abs_row, sort, grid.filter.clone())
+                    match grid.row_selection {
+                        RowSelection::All => Some(DeleteTarget::AllRows { table }),
+                        RowSelection::Range { .. } => {
+                            grid.selected_row_range().map(|(start, end)| {
+                                DeleteTarget::SelectedRows {
+                                    table,
+                                    start_offset: start as i64,
+                                    end_offset: end as i64,
+                                    count: end.saturating_sub(start) + 1,
+                                    sort,
+                                    filter: grid.filter.clone(),
+                                }
+                            })
+                        }
+                        RowSelection::None => Some(DeleteTarget::CurrentRow {
+                            row_num: grid.focused_row + 1,
+                            table,
+                            abs_row: grid.focused_row as i64,
+                            sort,
+                            filter: grid.filter.clone(),
+                        }),
+                    }
                 });
-                if let Some((row_num, table, abs_row, sort, filter)) = delete_context {
-                    let Some(rowid) = self.resolve_rowid_at_offset(&table, abs_row, sort, filter)
-                    else {
-                        self.dirty = true;
-                        return;
-                    };
-                    let msg = format!("Delete row #{}? [y/n]", row_num);
-                    self.pending_confirm = Some(PendingConfirm {
-                        message: msg,
-                        kind: ConfirmKind::DeleteRow { table, rowid },
-                        created: std::time::Instant::now(),
-                        timeout_secs: 5,
-                    });
+
+                if let Some(delete_target) = delete_target {
+                    match delete_target {
+                        DeleteTarget::CurrentRow {
+                            row_num,
+                            table,
+                            abs_row,
+                            sort,
+                            filter,
+                        } => {
+                            let Some(rowid) =
+                                self.resolve_rowid_at_offset(&table, abs_row, sort, filter)
+                            else {
+                                self.dirty = true;
+                                return;
+                            };
+                            let msg = format!("Delete row #{}? [y/n]", row_num);
+                            self.pending_confirm = Some(PendingConfirm {
+                                message: msg,
+                                kind: ConfirmKind::DeleteRow { table, rowid },
+                                created: std::time::Instant::now(),
+                                timeout_secs: 5,
+                            });
+                        }
+                        DeleteTarget::SelectedRows {
+                            table,
+                            start_offset,
+                            end_offset,
+                            count,
+                            sort,
+                            filter,
+                        } => {
+                            let noun = if count == 1 { "row" } else { "rows" };
+                            let msg = format!("Delete {} selected {}? [y/n]", count, noun);
+                            self.pending_confirm = Some(PendingConfirm {
+                                message: msg,
+                                kind: ConfirmKind::DeleteSelectedRows {
+                                    table,
+                                    start_offset,
+                                    end_offset,
+                                    sort,
+                                    filter,
+                                },
+                                created: std::time::Instant::now(),
+                                timeout_secs: 5,
+                            });
+                        }
+                        DeleteTarget::AllRows { table } => {
+                            let Some(total_rows) = self.count_table_rows(&table) else {
+                                self.dirty = true;
+                                return;
+                            };
+                            if total_rows <= 0 {
+                                self.toast.push("Table is empty", ToastKind::Info);
+                                self.dirty = true;
+                                return;
+                            }
+                            let msg =
+                                format!("Delete all {} rows from {}? [y/n]", total_rows, table);
+                            self.pending_confirm = Some(PendingConfirm {
+                                message: msg,
+                                kind: ConfirmKind::ClearTable { table },
+                                created: std::time::Instant::now(),
+                                timeout_secs: 5,
+                            });
+                        }
+                    }
                 }
                 self.dirty = true;
             }
@@ -1469,6 +1548,73 @@ impl App {
                                 }
                             });
                         }
+                        ConfirmKind::DeleteSelectedRows {
+                            table,
+                            start_offset,
+                            end_offset,
+                            sort,
+                            filter,
+                        } => {
+                            let pool = Arc::clone(&self.pool);
+                            let tx = self.tx.clone();
+                            let (where_clause, where_params) = filter_to_sql(&filter);
+                            let table_c = table.clone();
+                            tokio::task::spawn(async move {
+                                let tx_err = tx.clone();
+                                let result = tokio::task::spawn_blocking(
+                                    move || -> anyhow::Result<usize> {
+                                        let conn = pool.get()?;
+                                        crate::db::write::delete_rows_in_view(
+                                            &conn,
+                                            &table_c,
+                                            start_offset,
+                                            end_offset,
+                                            sort.as_ref().map(|(col, asc)| (col.as_str(), *asc)),
+                                            &where_clause,
+                                            &where_params,
+                                        )
+                                    },
+                                )
+                                .await;
+                                match result {
+                                    Ok(Ok(count)) => {
+                                        let _ = tx.send(Message::RowsDeleted { table, count });
+                                    }
+                                    Ok(Err(err)) => {
+                                        let _ = tx_err.send(Message::EditFailed(err.to_string()));
+                                    }
+                                    Err(err) => {
+                                        let _ = tx_err.send(Message::EditFailed(err.to_string()));
+                                    }
+                                }
+                            });
+                        }
+                        ConfirmKind::ClearTable { table } => {
+                            let pool = Arc::clone(&self.pool);
+                            let tx = self.tx.clone();
+                            let table_c = table.clone();
+                            tokio::task::spawn(async move {
+                                let tx_err = tx.clone();
+                                let result = tokio::task::spawn_blocking(
+                                    move || -> anyhow::Result<usize> {
+                                        let conn = pool.get()?;
+                                        crate::db::write::clear_table(&conn, &table_c)
+                                    },
+                                )
+                                .await;
+                                match result {
+                                    Ok(Ok(count)) => {
+                                        let _ = tx.send(Message::RowsDeleted { table, count });
+                                    }
+                                    Ok(Err(err)) => {
+                                        let _ = tx_err.send(Message::EditFailed(err.to_string()));
+                                    }
+                                    Err(err) => {
+                                        let _ = tx_err.send(Message::EditFailed(err.to_string()));
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
                 self.dirty = true;
@@ -1486,12 +1632,60 @@ impl App {
                 }
                 if let Some(ref mut grid) = self.grid {
                     if grid.table_name == table {
+                        grid.clear_row_selection();
                         grid.window.rows.clear();
                         grid.window.total_rows = grid.window.total_rows.saturating_sub(1);
+                        if grid.window.total_rows <= 0 {
+                            grid.focused_row = 0;
+                            grid.viewport_start = 0;
+                        } else {
+                            let max_row = (grid.window.total_rows - 1) as usize;
+                            if grid.focused_row > max_row {
+                                grid.focused_row = max_row;
+                            }
+                            let max_start =
+                                (grid.window.total_rows - grid.window.viewport_rows as i64).max(0);
+                            if grid.viewport_start > max_start {
+                                grid.viewport_start = max_start;
+                            }
+                        }
                         grid.needs_fetch = true;
                     }
                 }
                 self.toast.push("Row deleted", ToastKind::Success);
+                self.dirty = true;
+            }
+            Message::RowsDeleted { table, count } => {
+                self.last_own_write_at = Some(std::time::Instant::now());
+                if let Some(ref mut grid) = self.grid {
+                    if grid.table_name == table {
+                        grid.clear_row_selection();
+                        grid.window.rows.clear();
+                        grid.window.total_rows =
+                            grid.window.total_rows.saturating_sub(count as i64);
+                        if grid.window.total_rows <= 0 {
+                            grid.focused_row = 0;
+                            grid.viewport_start = 0;
+                        } else {
+                            let max_row = (grid.window.total_rows - 1) as usize;
+                            if grid.focused_row > max_row {
+                                grid.focused_row = max_row;
+                            }
+                            let max_start =
+                                (grid.window.total_rows - grid.window.viewport_rows as i64).max(0);
+                            if grid.viewport_start > max_start {
+                                grid.viewport_start = max_start;
+                            }
+                        }
+                        grid.needs_fetch = true;
+                    }
+                }
+                let message = match count {
+                    0 => "No rows deleted".to_string(),
+                    1 => "1 row deleted".to_string(),
+                    _ => format!("{} rows deleted", count),
+                };
+                self.toast.push(message, ToastKind::Success);
                 self.dirty = true;
             }
             Message::CancelConfirm => {
@@ -2201,6 +2395,7 @@ impl App {
 
     fn scroll_grid_down(&mut self, n: usize) {
         let maybe_fetch = if let Some(ref mut grid) = self.grid {
+            grid.clear_row_selection();
             grid.scroll_down(n);
             if grid.needs_fetch && !grid.window.fetch_in_flight {
                 grid.window.fetch_in_flight = true;
@@ -2231,6 +2426,7 @@ impl App {
 
     fn scroll_grid_to_row(&mut self, row: i64) {
         let maybe_fetch = if let Some(ref mut grid) = self.grid {
+            grid.clear_row_selection();
             grid.scroll_to_row(row);
             if grid.needs_fetch && !grid.window.fetch_in_flight {
                 grid.window.fetch_in_flight = true;
@@ -2261,6 +2457,7 @@ impl App {
 
     fn scroll_grid_up(&mut self, n: usize) {
         let maybe_fetch = if let Some(ref mut grid) = self.grid {
+            grid.clear_row_selection();
             grid.scroll_up(n);
             if grid.needs_fetch && !grid.window.fetch_in_flight {
                 grid.window.fetch_in_flight = true;
@@ -2286,6 +2483,50 @@ impl App {
         };
         if let Some((table, cols, sort, off, lim)) = maybe_fetch {
             self.spawn_window_fetch(&table, &cols, sort, off, lim);
+        }
+    }
+
+    fn ensure_inline_insert_visible(grid: &mut crate::grid::GridState, insert_position: usize) {
+        let viewport_rows = grid.window.viewport_rows.max(1) as i64;
+        let insert_position = insert_position as i64;
+        let current_display_start = if insert_position < grid.viewport_start {
+            grid.viewport_start + 1
+        } else {
+            grid.viewport_start
+        };
+
+        let target_display_start = if insert_position < current_display_start {
+            insert_position
+        } else if insert_position >= current_display_start + viewport_rows {
+            insert_position - viewport_rows + 1
+        } else {
+            current_display_start
+        };
+
+        let target_real_start = if insert_position < target_display_start {
+            target_display_start - 1
+        } else {
+            target_display_start
+        };
+        let max_start = (grid.window.total_rows - viewport_rows + 1).max(0);
+        grid.viewport_start = target_real_start.clamp(0, max_start);
+    }
+
+    fn clamp_grid_viewport(grid: &mut crate::grid::GridState) {
+        let viewport_rows = grid.window.viewport_rows.max(1) as i64;
+        let max_start = (grid.window.total_rows - viewport_rows).max(0);
+        if grid.viewport_start > max_start {
+            grid.viewport_start = max_start;
+        }
+        if grid.viewport_start < 0 {
+            grid.viewport_start = 0;
+        }
+    }
+
+    fn sync_inline_insert_column(&mut self, selected_col: usize) {
+        if let Some(ref mut grid) = self.grid {
+            let focused_row = grid.focused_row;
+            grid.focus_cell(focused_row, selected_col);
         }
     }
 
@@ -2337,14 +2578,13 @@ impl App {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     let _ = self.tx.send(Message::ConfirmDelete);
-                    return;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     let _ = self.tx.send(Message::CancelConfirm);
-                    return;
                 }
                 _ => {}
             }
+            return;
         }
 
         // ? and Ctrl-H toggle help (from any mode, unless confirming)
@@ -2388,6 +2628,11 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                 self.should_quit = true;
+            }
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) if self.active_tab.is_some() => {
+                let _ = self
+                    .tx
+                    .send(Message::CloseTab(self.active_tab.unwrap_or_default()));
             }
             (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
                 let _ = self.tx.send(Message::UndoAction);
@@ -2660,52 +2905,72 @@ impl App {
                 }
                 _ => {}
             },
-            Some(PopupKind::InsertRow(state)) => match key.code {
-                KeyCode::Esc => {
-                    let _ = self.tx.send(Message::ClosePopup);
-                }
-                KeyCode::Enter => {
-                    if state.editing {
-                        state.stop_editing();
-                    } else {
-                        state.start_editing();
+            Some(PopupKind::InsertRow(state)) => {
+                let mut sync_col = None;
+                match key.code {
+                    KeyCode::Esc => {
+                        let _ = self.tx.send(Message::ClosePopup);
                     }
-                    self.dirty = true;
+                    KeyCode::Enter => {
+                        state.move_next_field();
+                        state.start_editing();
+                        sync_col = Some(state.selected);
+                        self.dirty = true;
+                    }
+                    KeyCode::Tab => {
+                        state.move_next_field();
+                        state.start_editing();
+                        sync_col = Some(state.selected);
+                        self.dirty = true;
+                    }
+                    KeyCode::BackTab => {
+                        state.move_prev_field();
+                        state.start_editing();
+                        sync_col = Some(state.selected);
+                        self.dirty = true;
+                    }
+                    KeyCode::Up => {
+                        state.move_prev_field();
+                        state.start_editing();
+                        sync_col = Some(state.selected);
+                        self.dirty = true;
+                    }
+                    KeyCode::Down => {
+                        state.move_next_field();
+                        state.start_editing();
+                        sync_col = Some(state.selected);
+                        self.dirty = true;
+                    }
+                    KeyCode::Left => {
+                        state.move_cursor_left();
+                        self.dirty = true;
+                    }
+                    KeyCode::Right => {
+                        state.move_cursor_right();
+                        self.dirty = true;
+                    }
+                    KeyCode::Backspace => {
+                        state.delete_backward();
+                        self.dirty = true;
+                    }
+                    KeyCode::Delete => {
+                        state.reset_selected();
+                        state.start_editing();
+                        self.dirty = true;
+                    }
+                    KeyCode::Char(c)
+                        if key.modifiers == KeyModifiers::NONE
+                            || key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        state.insert_char(c);
+                        self.dirty = true;
+                    }
+                    _ => {}
                 }
-                KeyCode::Up if !state.editing => {
-                    state.move_up();
-                    self.dirty = true;
+                if let Some(selected_col) = sync_col {
+                    self.sync_inline_insert_column(selected_col);
                 }
-                KeyCode::Down if !state.editing => {
-                    state.move_down();
-                    self.dirty = true;
-                }
-                KeyCode::Left if state.editing => {
-                    state.move_cursor_left();
-                    self.dirty = true;
-                }
-                KeyCode::Right if state.editing => {
-                    state.move_cursor_right();
-                    self.dirty = true;
-                }
-                KeyCode::Backspace if state.editing => {
-                    state.delete_backward();
-                    self.dirty = true;
-                }
-                KeyCode::Delete => {
-                    state.reset_selected();
-                    self.dirty = true;
-                }
-                KeyCode::Char(c)
-                    if state.editing
-                        && (key.modifiers == KeyModifiers::NONE
-                            || key.modifiers == KeyModifiers::SHIFT) =>
-                {
-                    state.insert_char(c);
-                    self.dirty = true;
-                }
-                _ => {}
-            },
+            }
             Some(PopupKind::FkPicker(state)) => match key.code {
                 KeyCode::Esc => {
                     let _ = self.tx.send(Message::ClosePopup);
@@ -2957,6 +3222,30 @@ impl App {
         use crossterm::event::{KeyCode, KeyModifiers};
         let vp = self.grid.as_ref().map_or(20, |g| g.window.viewport_rows);
         match (key.code, key.modifiers) {
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                if let Some(ref mut grid) = self.grid {
+                    grid.select_all_rows();
+                    if grid.has_row_selection() {
+                        self.toast.push(
+                            "All rows selected; Delete will clear the table",
+                            ToastKind::Info,
+                        );
+                    }
+                    self.dirty = true;
+                }
+            }
+            (KeyCode::Down, KeyModifiers::SHIFT) => {
+                if let Some(ref mut grid) = self.grid {
+                    grid.extend_row_selection_down(1);
+                    self.dirty = true;
+                }
+            }
+            (KeyCode::Up, KeyModifiers::SHIFT) => {
+                if let Some(ref mut grid) = self.grid {
+                    grid.extend_row_selection_up(1);
+                    self.dirty = true;
+                }
+            }
             (KeyCode::Down, KeyModifiers::CONTROL) => {
                 let _ = self.tx.send(Message::ScrollDown(vp.saturating_sub(1)));
             }
@@ -3030,8 +3319,14 @@ impl App {
             (KeyCode::Char('F'), KeyModifiers::SHIFT) => {
                 let _ = self.tx.send(Message::ClearFilters);
             }
+            (KeyCode::Insert, KeyModifiers::NONE) => {
+                let _ = self.tx.send(Message::InsertRow);
+            }
             (KeyCode::Char('i'), KeyModifiers::NONE) => {
                 let _ = self.tx.send(Message::InsertRow);
+            }
+            (KeyCode::Delete, KeyModifiers::NONE) => {
+                let _ = self.tx.send(Message::DeleteRow);
             }
             (KeyCode::Char('d'), KeyModifiers::NONE) => {
                 let _ = self.tx.send(Message::DeleteRow);
@@ -3519,6 +3814,25 @@ impl App {
         }
     }
 
+    fn count_table_rows(&mut self, table: &str) -> Option<i64> {
+        let conn = match self.pool.get() {
+            Ok(conn) => conn,
+            Err(err) => {
+                self.toast
+                    .push(format!("DB connection failed: {}", err), ToastKind::Error);
+                return None;
+            }
+        };
+        match db::count_rows(&conn, table, "", &[]) {
+            Ok(count) => Some(count),
+            Err(err) => {
+                self.toast
+                    .push(format!("Row count failed: {}", err), ToastKind::Error);
+                None
+            }
+        }
+    }
+
     fn resolve_offset_for_rowid(
         &mut self,
         table: &str,
@@ -3777,6 +4091,23 @@ mod tests {
         .expect("seed user row");
     }
 
+    fn seed_user_rows(app: &App, count: usize) {
+        let conn = app.pool.get().expect("test conn");
+        for index in 0..count {
+            let id = index as i64 + 1;
+            conn.execute(
+                "INSERT INTO users (id, name, age, email) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    id,
+                    format!("User {id}"),
+                    20 + (id % 30),
+                    format!("user{id}@example.com")
+                ],
+            )
+            .expect("seed user row");
+        }
+    }
+
     fn make_constrained_insert_app() -> (App, mpsc::UnboundedReceiver<Message>) {
         let manager = SqliteConnectionManager::memory();
         let pool = Arc::new(
@@ -3884,6 +4215,24 @@ mod tests {
             KeyModifiers::CONTROL,
         )));
         assert!(app.sidebar_visible);
+    }
+
+    #[test]
+    fn ctrl_w_closes_current_tab() {
+        let (mut app, mut rx) = make_test_app();
+        app.open_tabs = vec![TableTab {
+            table_name: "users".to_string(),
+        }];
+        app.active_tab = Some(0);
+
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )));
+        drain_messages(&mut app, &mut rx);
+
+        assert!(app.open_tabs.is_empty());
+        assert_eq!(app.active_tab, None);
     }
 
     #[test]
@@ -4078,6 +4427,61 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert_eq!(try_recv_variant(&mut rx), "MoveUp");
+    }
+
+    #[test]
+    fn shift_down_selects_rows_from_focused_row() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.focus = FocusPane::Grid;
+
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::SHIFT,
+        )));
+
+        let grid = app.grid.as_ref().expect("grid");
+        assert_eq!(grid.focused_row, 1);
+        assert_eq!(
+            grid.row_selection,
+            crate::grid::RowSelection::Range { anchor: 0, head: 1 }
+        );
+    }
+
+    #[test]
+    fn shift_up_extends_selection_toward_previous_rows() {
+        let (mut app, _rx) = make_test_app();
+        let mut grid = make_grid();
+        grid.focused_row = 3;
+        app.grid = Some(grid);
+        app.focus = FocusPane::Grid;
+
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::SHIFT,
+        )));
+
+        let grid = app.grid.as_ref().expect("grid");
+        assert_eq!(grid.focused_row, 2);
+        assert_eq!(
+            grid.row_selection,
+            crate::grid::RowSelection::Range { anchor: 3, head: 2 }
+        );
+    }
+
+    #[test]
+    fn ctrl_a_selects_all_rows_in_grid() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.focus = FocusPane::Grid;
+
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )));
+
+        let grid = app.grid.as_ref().expect("grid");
+        assert_eq!(grid.row_selection, crate::grid::RowSelection::All);
     }
 
     #[test]
@@ -4381,13 +4785,48 @@ mod tests {
     }
 
     #[test]
+    fn insert_key_in_grid_sends_insert_row() {
+        let (mut app, mut rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.focus = FocusPane::Grid;
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Insert,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(try_recv_variant(&mut rx), "InsertRow");
+    }
+
+    #[test]
     fn insert_row_opens_insert_popup_for_constrained_table() {
         let (mut app, _rx) = make_constrained_insert_app();
         app.focus = FocusPane::Grid;
 
         app.update(Message::InsertRow);
 
+        assert!(matches!(
+            app.popup,
+            Some(PopupKind::InsertRow(ref state))
+                if state.editing && state.insert_position == 0
+        ));
+        assert!(matches!(
+            app.toast.toasts.back(),
+            Some(toast) if toast.message == "Ctrl-Enter commits" && toast.kind == ToastKind::Info
+        ));
+    }
+
+    #[test]
+    fn invalid_insert_commit_shows_error_toast() {
+        let (mut app, _rx) = make_constrained_insert_app();
+        app.focus = FocusPane::Grid;
+        app.update(Message::InsertRow);
+
+        app.update(Message::CommitInsertRow);
+
         assert!(matches!(app.popup, Some(PopupKind::InsertRow(_))));
+        assert!(matches!(
+            app.toast.toasts.back(),
+            Some(toast) if toast.message == "name is required" && toast.kind == ToastKind::Error
+        ));
     }
 
     #[test]
@@ -4401,6 +4840,60 @@ mod tests {
         )));
         // sends DeleteRow - confirm dialog appears as side-effect
         assert_eq!(try_recv_variant(&mut rx), "DeleteRow");
+    }
+
+    #[test]
+    fn delete_key_in_grid_sends_delete_row() {
+        let (mut app, mut rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.focus = FocusPane::Grid;
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Delete,
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(try_recv_variant(&mut rx), "DeleteRow");
+    }
+
+    #[test]
+    fn delete_row_confirms_selected_row_range() {
+        let (mut app, _rx) = make_test_app();
+        let mut grid = make_grid();
+        grid.row_selection = crate::grid::RowSelection::Range { anchor: 1, head: 3 };
+        app.grid = Some(grid);
+
+        app.update(Message::DeleteRow);
+
+        assert!(matches!(
+            app.pending_confirm.as_ref().map(|confirm| &confirm.kind),
+            Some(ConfirmKind::DeleteSelectedRows {
+                start_offset: 1,
+                end_offset: 3,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn delete_row_confirms_table_clear_for_select_all() {
+        let (mut app, _rx) = make_test_app();
+        let mut grid = make_grid();
+        grid.row_selection = crate::grid::RowSelection::All;
+        app.grid = Some(grid);
+        seed_user_rows(&app, 5);
+
+        app.update(Message::DeleteRow);
+
+        assert!(matches!(
+            app.pending_confirm.as_ref().map(|confirm| &confirm.kind),
+            Some(ConfirmKind::ClearTable { table }) if table == "users"
+        ));
+        let message = app
+            .pending_confirm
+            .as_ref()
+            .map(|confirm| confirm.message.clone())
+            .expect("confirm message");
+        assert!(message.contains("Delete all 5 rows from users?"));
     }
 
     #[test]
