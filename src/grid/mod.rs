@@ -2,7 +2,7 @@ pub mod alphabet_rail;
 pub mod layout;
 pub mod virtual_scroll;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use ratatui::{
     buffer::Buffer,
@@ -37,7 +37,7 @@ pub struct SortSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowSelection {
     None,
-    Range { anchor: usize, head: usize },
+    Rows(BTreeSet<usize>),
     All,
 }
 
@@ -71,6 +71,8 @@ pub struct GridState {
     pub sort: Option<SortSpec>,
     pub filter: crate::filter::FilterSet,
     pub row_selection: RowSelection,
+    row_selection_anchor: Option<usize>,
+    row_selection_base: Option<BTreeSet<usize>>,
 }
 
 const HEADER_ROWS: u16 = 3;
@@ -117,6 +119,8 @@ impl GridState {
             sort: None,
             filter: crate::filter::FilterSet::default(),
             row_selection: RowSelection::None,
+            row_selection_anchor: None,
+            row_selection_base: None,
         };
         state.recompute_col_widths(area_width);
         state
@@ -218,46 +222,103 @@ impl GridState {
 
     pub fn clear_row_selection(&mut self) {
         self.row_selection = RowSelection::None;
+        self.row_selection_anchor = None;
+        self.row_selection_base = None;
+    }
+
+    pub fn commit_row_selection(&mut self) {
+        self.row_selection_anchor = None;
+        self.row_selection_base = None;
+        if matches!(&self.row_selection, RowSelection::Rows(rows) if rows.is_empty()) {
+            self.row_selection = RowSelection::None;
+        }
+    }
+
+    pub fn selected_rows(&self) -> Vec<usize> {
+        match &self.row_selection {
+            RowSelection::None => Vec::new(),
+            RowSelection::Rows(rows) => rows
+                .iter()
+                .copied()
+                .filter(|row| *row < self.window.total_rows.max(0) as usize)
+                .collect(),
+            RowSelection::All => (0..self.window.total_rows.max(0) as usize).collect(),
+        }
+    }
+
+    pub fn selected_row_count(&self) -> usize {
+        match &self.row_selection {
+            RowSelection::None => 0,
+            RowSelection::Rows(rows) => rows
+                .iter()
+                .copied()
+                .filter(|row| *row < self.window.total_rows.max(0) as usize)
+                .count(),
+            RowSelection::All => self.window.total_rows.max(0) as usize,
+        }
+    }
+
+    pub fn select_only_row(&mut self, row: usize) {
+        self.clear_row_selection();
+        if row < self.window.total_rows.max(0) as usize {
+            let mut rows = BTreeSet::new();
+            rows.insert(row);
+            self.row_selection = RowSelection::Rows(rows);
+        }
+    }
+
+    pub fn toggle_row_selected(&mut self, row: usize) {
+        self.commit_row_selection();
+        let total_rows = self.window.total_rows.max(0) as usize;
+        if row >= total_rows {
+            return;
+        }
+
+        let mut rows = match &self.row_selection {
+            RowSelection::None => BTreeSet::new(),
+            RowSelection::Rows(rows) => rows.clone(),
+            RowSelection::All => {
+                let mut all_rows = BTreeSet::new();
+                all_rows.extend(0..total_rows);
+                all_rows
+            }
+        };
+
+        if !rows.remove(&row) {
+            rows.insert(row);
+        }
+
+        self.row_selection = if rows.is_empty() {
+            RowSelection::None
+        } else {
+            RowSelection::Rows(rows)
+        };
     }
 
     pub fn extend_row_selection_down(&mut self, n: usize) {
         if self.window.total_rows <= 0 {
             return;
         }
-        if matches!(self.row_selection, RowSelection::All) {
+        if matches!(&self.row_selection, RowSelection::All) {
             self.scroll_down(n);
             return;
         }
-        let anchor = match self.row_selection {
-            RowSelection::Range { anchor, .. } => anchor,
-            RowSelection::None => self.focused_row,
-            RowSelection::All => self.focused_row,
-        };
+        self.ensure_shift_selection_started();
         self.scroll_down(n);
-        self.row_selection = RowSelection::Range {
-            anchor,
-            head: self.focused_row,
-        };
+        self.refresh_shift_selection();
     }
 
     pub fn extend_row_selection_up(&mut self, n: usize) {
         if self.window.total_rows <= 0 {
             return;
         }
-        if matches!(self.row_selection, RowSelection::All) {
+        if matches!(&self.row_selection, RowSelection::All) {
             self.scroll_up(n);
             return;
         }
-        let anchor = match self.row_selection {
-            RowSelection::Range { anchor, .. } => anchor,
-            RowSelection::None => self.focused_row,
-            RowSelection::All => self.focused_row,
-        };
+        self.ensure_shift_selection_started();
         self.scroll_up(n);
-        self.row_selection = RowSelection::Range {
-            anchor,
-            head: self.focused_row,
-        };
+        self.refresh_shift_selection();
     }
 
     pub fn select_all_rows(&mut self) {
@@ -269,18 +330,7 @@ impl GridState {
     }
 
     pub fn has_row_selection(&self) -> bool {
-        !matches!(self.row_selection, RowSelection::None)
-    }
-
-    pub fn selected_row_range(&self) -> Option<(usize, usize)> {
-        match self.row_selection {
-            RowSelection::Range { anchor, head } => {
-                let start = anchor.min(head);
-                let end = anchor.max(head);
-                Some((start, end))
-            }
-            RowSelection::None | RowSelection::All => None,
-        }
+        self.selected_row_count() > 0
     }
 
     pub fn is_row_selected(&self, abs_row: i64) -> bool {
@@ -288,17 +338,19 @@ impl GridState {
             return false;
         }
         let abs_row = abs_row as usize;
-        match self.row_selection {
+        match &self.row_selection {
             RowSelection::None => false,
-            RowSelection::Range { .. } => self
-                .selected_row_range()
-                .is_some_and(|(start, end)| abs_row >= start && abs_row <= end),
+            RowSelection::Rows(rows) => rows.contains(&abs_row),
             RowSelection::All => abs_row < self.window.total_rows.max(0) as usize,
         }
     }
 
     pub fn focus_cell(&mut self, row: usize, col: usize) {
         self.clear_row_selection();
+        self.focus_cell_preserve_selection(row, col);
+    }
+
+    pub fn focus_cell_preserve_selection(&mut self, row: usize, col: usize) {
         if self.columns.is_empty() {
             self.focused_row = row.min(self.window.total_rows.saturating_sub(1) as usize);
             self.focused_col = 0;
@@ -309,6 +361,42 @@ impl GridState {
         self.adjust_viewport();
         self.adjust_h_scroll();
         self.check_needs_fetch();
+    }
+
+    fn ensure_shift_selection_started(&mut self) {
+        if self.row_selection_anchor.is_some() {
+            return;
+        }
+
+        self.row_selection_anchor = Some(self.focused_row);
+        self.row_selection_base = Some(match &self.row_selection {
+            RowSelection::None => BTreeSet::new(),
+            RowSelection::Rows(rows) => rows.clone(),
+            RowSelection::All => BTreeSet::new(),
+        });
+    }
+
+    fn refresh_shift_selection(&mut self) {
+        let Some(anchor) = self.row_selection_anchor else {
+            return;
+        };
+
+        let mut rows = self.row_selection_base.clone().unwrap_or_default();
+        match self.focused_row.cmp(&anchor) {
+            std::cmp::Ordering::Greater => {
+                rows.extend(anchor..self.focused_row);
+            }
+            std::cmp::Ordering::Less => {
+                rows.extend((self.focused_row + 1)..=anchor);
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+
+        self.row_selection = if rows.is_empty() {
+            RowSelection::None
+        } else {
+            RowSelection::Rows(rows)
+        };
     }
 
     fn adjust_h_scroll(&mut self) {
@@ -786,6 +874,7 @@ fn render_header(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_data_rows(
     buf: &mut Buffer,
     area: Rect,
@@ -839,6 +928,7 @@ fn render_data_rows(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_focused_border(
     buf: &mut Buffer,
     area: Rect,
@@ -900,6 +990,7 @@ fn render_focused_border(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_cell_border(
     buf: &mut Buffer,
     area: Rect,
@@ -1054,6 +1145,7 @@ fn display_row_kind<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_existing_row(
     buf: &mut Buffer,
     area: Rect,
@@ -1141,6 +1233,7 @@ fn render_existing_row(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_insert_row(
     buf: &mut Buffer,
     area: Rect,
@@ -1541,6 +1634,8 @@ fn hit_test_col(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         compute_visible_cols, enum_value_color, scrollbar_drag_start, scrollbar_drag_target_row,
         GridInit, GridState, RowSelection,
@@ -1718,12 +1813,56 @@ mod tests {
         grid.extend_row_selection_down(2);
 
         assert_eq!(grid.focused_row, 2);
+        assert_eq!(grid.selected_rows(), vec![0, 1]);
         assert_eq!(
             grid.row_selection,
-            RowSelection::Range { anchor: 0, head: 2 }
+            RowSelection::Rows(BTreeSet::from([0, 1]))
         );
         assert!(grid.is_row_selected(1));
-        assert!(!grid.is_row_selected(3));
+        assert!(!grid.is_row_selected(2));
+    }
+
+    #[test]
+    fn shift_selection_retracts_when_cursor_moves_back() {
+        let columns = vec![make_col("name", "TEXT", false)];
+        let mut grid = GridState::new(GridInit {
+            table_name: "customers".to_string(),
+            columns,
+            fk_cols: vec![false],
+            enumerated_values: vec![Vec::new()],
+            rows: vec![vec![SqlValue::Text("Alice".to_string())]; 10],
+            width_sample_rows: vec![],
+            total_rows: 10,
+            area_width: 40,
+        });
+
+        grid.extend_row_selection_down(2);
+        grid.extend_row_selection_up(1);
+
+        assert_eq!(grid.focused_row, 1);
+        assert_eq!(grid.selected_rows(), vec![0]);
+        assert_eq!(grid.row_selection, RowSelection::Rows(BTreeSet::from([0])));
+    }
+
+    #[test]
+    fn toggling_row_selection_preserves_existing_rows() {
+        let columns = vec![make_col("name", "TEXT", false)];
+        let mut grid = GridState::new(GridInit {
+            table_name: "customers".to_string(),
+            columns,
+            fk_cols: vec![false],
+            enumerated_values: vec![Vec::new()],
+            rows: vec![vec![SqlValue::Text("Alice".to_string())]; 10],
+            width_sample_rows: vec![],
+            total_rows: 10,
+            area_width: 40,
+        });
+
+        grid.toggle_row_selected(1);
+        grid.toggle_row_selected(4);
+        grid.toggle_row_selected(1);
+
+        assert_eq!(grid.selected_rows(), vec![4]);
     }
 
     #[test]

@@ -87,6 +87,8 @@ sqview paths
 | `PgUp` / `PgDn` / `Ctrl-↑` / `Ctrl-↓` | Scroll one viewport |
 | `Mouse wheel` | Scroll rows |
 | `Shift-wheel` | Scroll columns |
+| `Click gutter` | Select a row |
+| `Ctrl-click gutter` | Toggle a row in the selection |
 | `Click cell` | Focus cell |
 
 ### Editing
@@ -97,8 +99,8 @@ sqview paths
 | `Alt-Enter` | Insert a newline in the direct text editor |
 | `e` | Open the focused cell in the direct editor |
 | `n` | Set the focused cell to `NULL` when allowed |
-| `Esc` | Close popup |
-| `Ctrl-Enter` | Save an inserted row from the staged row editor |
+| `Esc` | Clear selection or close popup |
+| `Alt-Enter` | Save an inserted row from the staged row editor |
 | `i` | Insert row in a staged editor, then validate on save |
 | `d` | Delete row |
 | `Ctrl-z` | Undo last write |
@@ -172,6 +174,6 @@ GitHub Actions provides:
 To cut a release:
 
 ```bash
-git tag v0.1.5
-git push origin v0.1.5
+git tag v0.2.2
+git push origin v0.2.2
 ```

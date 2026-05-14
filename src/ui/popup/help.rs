@@ -138,27 +138,17 @@ fn help_text(symbols: &Symbols) -> String {
                     "Enter",
                     "Open picker / smart editor",
                 ),
-                help_row(
-                    "Home / End",
-                    "Col start/end",
-                    "Esc",
-                    "Close popup / focus sidebar",
-                ),
+                help_row("Home / End", "Col start/end", "Esc", "Clear selection"),
                 help_row(
                     "Ctrl-Home/End",
                     "Table bounds",
                     "Alt-Enter",
-                    "New line in text editor",
+                    "Text-editor newline",
                 ),
-                help_row(
-                    "PgUp / PgDn",
-                    "Scroll page",
-                    "Ctrl-Enter",
-                    "Save staged row",
-                ),
+                help_row("PgUp / PgDn", "Scroll page", "Alt-Enter", "Save staged row"),
                 help_row(
                     format!("Shift-{} / Shift-{}", symbols.arrow_up, symbols.arrow_down),
-                    "Select rows",
+                    "Select rows left behind",
                     "Delete / d",
                     "Delete selected row(s)",
                 ),
@@ -170,8 +160,14 @@ fn help_text(symbols: &Symbols) -> String {
                 ),
                 help_row("Mouse wheel", "Scroll rows", "Ins / i", "Insert row below"),
                 help_row("Shift-wheel", "Scroll cols", "e", "Edit value directly"),
-                help_row("Click cell", "Focus cell", "n", "Set NULL"),
-                help_row("", "", "Ctrl-Z", "Undo last write"),
+                help_row("Click gutter", "Select row", "n", "Set NULL"),
+                help_row(
+                    "Ctrl-click gutter",
+                    "Toggle row",
+                    "Ctrl-Z",
+                    "Undo last write",
+                ),
+                help_row("Click cell", "Focus cell", "", ""),
             ],
         },
         HelpSection {
@@ -447,9 +443,10 @@ mod tests {
         let symbols = Symbols::default_with_nerd_font(false);
         let help = help_text(&symbols);
 
-        assert!(help.contains("Select rows"));
+        assert!(help.contains("Select rows left behind"));
         assert!(help.contains("Delete / d"));
         assert!(help.contains("Ctrl-A"));
         assert!(help.contains("Ctrl-W"));
+        assert!(help.contains("Ctrl-click gutter"));
     }
 }

@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::db::schema::Column;
 use crate::db::types::SqlValue;
@@ -123,46 +123,60 @@ fn delete_where_part(where_clause: &str) -> String {
     }
 }
 
-pub fn delete_rows_in_view(
+pub fn delete_rows_by_offsets(
     conn: &Connection,
     table: &str,
-    start_offset: i64,
-    end_offset: i64,
+    row_offsets: &[i64],
     order_by: Option<(&str, bool)>,
     where_clause: &str,
     where_params: &[rusqlite::types::Value],
 ) -> anyhow::Result<usize> {
-    if end_offset < start_offset {
+    if row_offsets.is_empty() {
         return Ok(0);
     }
 
     let tx = conn.unchecked_transaction()?;
-    let count = end_offset - start_offset + 1;
     let where_part = delete_where_part(where_clause);
     let order_terms = delete_order_terms(order_by);
-    let limit_param = where_params.len() + 1;
-    let offset_param = where_params.len() + 2;
-    let sql = format!(
-        "DELETE FROM \"{table}\" WHERE rowid IN (
-            SELECT rowid FROM \"{table}\"{where_part}
-            ORDER BY {order_terms}
-            LIMIT ?{limit_param} OFFSET ?{offset_param}
-        )"
+    let offset_param = where_params.len() + 1;
+    let select_sql = format!(
+        "SELECT rowid FROM \"{table}\"{where_part}
+         ORDER BY {order_terms}
+         LIMIT 1 OFFSET ?{offset_param}"
     );
-    let mut params = where_params.to_vec();
-    params.push(rusqlite::types::Value::Integer(count));
-    params.push(rusqlite::types::Value::Integer(start_offset));
+    let delete_sql = format!("DELETE FROM \"{table}\" WHERE rowid = ?1");
 
-    match tx.execute(&sql, rusqlite::params_from_iter(params.iter())) {
-        Ok(deleted) => {
-            tx.commit()?;
-            Ok(deleted)
+    let mut offsets = row_offsets.to_vec();
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    let rowids = {
+        let mut select_stmt = tx.prepare(&select_sql)?;
+        let mut resolved: Vec<i64> = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            let mut params = where_params.to_vec();
+            params.push(rusqlite::types::Value::Integer(offset));
+            let rowid = select_stmt
+                .query_row(rusqlite::params_from_iter(params.iter()), |row| row.get(0))
+                .optional()?;
+            if let Some(rowid) = rowid {
+                resolved.push(rowid);
+            }
         }
-        Err(err) => {
-            let _ = tx.rollback();
-            Err(anyhow::anyhow!("{}", err))
+        resolved
+    };
+
+    let deleted = {
+        let mut delete_stmt = tx.prepare(&delete_sql)?;
+        let mut deleted = 0usize;
+        for rowid in rowids {
+            deleted += delete_stmt.execute(rusqlite::params![rowid])?;
         }
-    }
+        deleted
+    };
+
+    tx.commit()?;
+    Ok(deleted)
 }
 
 pub fn clear_table(conn: &Connection, table: &str) -> anyhow::Result<usize> {
@@ -263,7 +277,7 @@ pub fn reinsert_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_table, delete_rows_in_view, insert_row};
+    use super::{clear_table, delete_rows_by_offsets, insert_row};
     use crate::db::types::SqlValue;
     use rusqlite::Connection;
 
@@ -314,8 +328,9 @@ mod tests {
         )
         .expect("seed data");
 
-        let deleted = delete_rows_in_view(&conn, "users", 1, 2, Some(("name", true)), "", &[])
-            .expect("delete selected rows");
+        let deleted =
+            delete_rows_by_offsets(&conn, "users", &[1, 2], Some(("name", true)), "", &[])
+                .expect("delete selected rows");
 
         let remaining: Vec<String> = conn
             .prepare("SELECT name FROM users ORDER BY name ASC")
@@ -345,5 +360,41 @@ mod tests {
 
         assert_eq!(deleted, 2);
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn delete_rows_by_offsets_uses_original_view_offsets() {
+        let conn = Connection::open_in_memory().expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+            INSERT INTO users (id, name) VALUES
+                (1, 'carol'),
+                (2, 'alice'),
+                (3, 'bravo'),
+                (4, 'delta'),
+                (5, 'echo');",
+        )
+        .expect("seed data");
+
+        let deleted =
+            delete_rows_by_offsets(&conn, "users", &[1, 3], Some(("name", true)), "", &[])
+                .expect("delete selected rows");
+
+        let remaining: Vec<String> = conn
+            .prepare("SELECT name FROM users ORDER BY name ASC")
+            .expect("prepare remaining")
+            .query_map([], |row| row.get(0))
+            .expect("query remaining")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect remaining");
+
+        assert_eq!(deleted, 2);
+        assert_eq!(
+            remaining,
+            vec!["alice".to_string(), "carol".to_string(), "echo".to_string()]
+        );
     }
 }

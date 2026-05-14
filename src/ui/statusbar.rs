@@ -137,6 +137,22 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    if let Some(selection_text) = app.grid.as_ref().and_then(|grid| {
+        let selected = grid.selected_row_count();
+        if selected == 0 {
+            None
+        } else if selected == grid.window.total_rows.max(0) as usize {
+            Some("sel all".to_string())
+        } else {
+            Some(format!("sel {}", fmt_number(selected as i64)))
+        }
+    }) {
+        segments.push((
+            selection_text,
+            Style::default().fg(theme.yellow).bg(theme.bg_soft),
+        ));
+    }
+
     if !pos_str.is_empty() {
         segments.push((
             pos_str,

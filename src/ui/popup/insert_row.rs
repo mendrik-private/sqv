@@ -88,10 +88,6 @@ impl InsertRowState {
         }
     }
 
-    pub fn stop_editing(&mut self) {
-        self.editing = false;
-    }
-
     pub fn insert_char(&mut self, ch: char) {
         let Some(field) = self.selected_field_mut() else {
             return;
@@ -415,7 +411,7 @@ pub fn render(
                     symbols.padded_separator(),
                     Style::default().fg(theme.fg_faint),
                 ),
-                Span::styled("Ctrl-Enter save row", Style::default().fg(theme.accent)),
+                Span::styled("Alt-Enter save row", Style::default().fg(theme.accent)),
                 Span::styled(
                     symbols.padded_separator(),
                     Style::default().fg(theme.fg_faint),
@@ -484,7 +480,7 @@ mod tests {
         state.insert_char('i');
         state.insert_char('c');
         state.insert_char('e');
-        state.stop_editing();
+        state.editing = false;
 
         let values = state.build_insert_values().expect("build insert values");
 

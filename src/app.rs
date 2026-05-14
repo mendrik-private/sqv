@@ -80,8 +80,7 @@ pub enum ConfirmKind {
     },
     DeleteSelectedRows {
         table: String,
-        start_offset: i64,
-        end_offset: i64,
+        row_offsets: Vec<i64>,
         sort: Option<(String, bool)>,
         filter: crate::filter::FilterSet,
     },
@@ -455,7 +454,7 @@ impl App {
             }
             Message::ScrollToEnd => {
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
-                    grid.clear_row_selection();
+                    grid.commit_row_selection();
                     grid.scroll_to_end();
                     if grid.needs_fetch && !grid.window.fetch_in_flight {
                         grid.window.fetch_in_flight = true;
@@ -520,7 +519,7 @@ impl App {
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
                     grid.focused_col = 0;
                     grid.h_scroll = 0;
-                    grid.clear_row_selection();
+                    grid.commit_row_selection();
                     grid.scroll_to_row(0);
                     if grid.needs_fetch && !grid.window.fetch_in_flight {
                         grid.window.fetch_in_flight = true;
@@ -552,7 +551,7 @@ impl App {
             Message::MoveLastCell => {
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
                     grid.move_col_last();
-                    grid.clear_row_selection();
+                    grid.commit_row_selection();
                     grid.scroll_to_end();
                     if grid.needs_fetch && !grid.window.fetch_in_flight {
                         grid.window.fetch_in_flight = true;
@@ -1110,7 +1109,7 @@ impl App {
             Message::JumpToSortedOffset { table, offset } => {
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
                     if grid.table_name == table {
-                        grid.clear_row_selection();
+                        grid.commit_row_selection();
                         grid.scroll_to_row(offset);
                         if grid.needs_fetch && !grid.window.fetch_in_flight {
                             grid.window.fetch_in_flight = true;
@@ -1323,7 +1322,7 @@ impl App {
                     Self::ensure_inline_insert_visible(grid, insert_position);
                     self.popup = Some(PopupKind::InsertRow(state));
                     self.mode = AppMode::Edit;
-                    self.toast.push("Ctrl-Enter commits", ToastKind::Info);
+                    self.toast.push("Alt-Enter commits", ToastKind::Info);
                 }
                 self.dirty = true;
             }
@@ -1406,8 +1405,7 @@ impl App {
                     },
                     SelectedRows {
                         table: String,
-                        start_offset: i64,
-                        end_offset: i64,
+                        row_offsets: Vec<i64>,
                         count: usize,
                         sort: Option<(String, bool)>,
                         filter: crate::filter::FilterSet,
@@ -1424,18 +1422,20 @@ impl App {
                             .get(s.col_idx)
                             .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
                     });
-                    match grid.row_selection {
+                    match &grid.row_selection {
                         RowSelection::All => Some(DeleteTarget::AllRows { table }),
-                        RowSelection::Range { .. } => {
-                            grid.selected_row_range().map(|(start, end)| {
-                                DeleteTarget::SelectedRows {
-                                    table,
-                                    start_offset: start as i64,
-                                    end_offset: end as i64,
-                                    count: end.saturating_sub(start) + 1,
-                                    sort,
-                                    filter: grid.filter.clone(),
-                                }
+                        RowSelection::Rows(_) => {
+                            let row_offsets = grid
+                                .selected_rows()
+                                .into_iter()
+                                .map(|row| row as i64)
+                                .collect::<Vec<_>>();
+                            (!row_offsets.is_empty()).then_some(DeleteTarget::SelectedRows {
+                                table,
+                                count: row_offsets.len(),
+                                row_offsets,
+                                sort,
+                                filter: grid.filter.clone(),
                             })
                         }
                         RowSelection::None => Some(DeleteTarget::CurrentRow {
@@ -1473,8 +1473,7 @@ impl App {
                         }
                         DeleteTarget::SelectedRows {
                             table,
-                            start_offset,
-                            end_offset,
+                            row_offsets,
                             count,
                             sort,
                             filter,
@@ -1485,8 +1484,7 @@ impl App {
                                 message: msg,
                                 kind: ConfirmKind::DeleteSelectedRows {
                                     table,
-                                    start_offset,
-                                    end_offset,
+                                    row_offsets,
                                     sort,
                                     filter,
                                 },
@@ -1550,8 +1548,7 @@ impl App {
                         }
                         ConfirmKind::DeleteSelectedRows {
                             table,
-                            start_offset,
-                            end_offset,
+                            row_offsets,
                             sort,
                             filter,
                         } => {
@@ -1564,11 +1561,10 @@ impl App {
                                 let result = tokio::task::spawn_blocking(
                                     move || -> anyhow::Result<usize> {
                                         let conn = pool.get()?;
-                                        crate::db::write::delete_rows_in_view(
+                                        crate::db::write::delete_rows_by_offsets(
                                             &conn,
                                             &table_c,
-                                            start_offset,
-                                            end_offset,
+                                            &row_offsets,
                                             sort.as_ref().map(|(col, asc)| (col.as_str(), *asc)),
                                             &where_clause,
                                             &where_params,
@@ -2176,7 +2172,7 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
-        use crossterm::event::{MouseButton, MouseEventKind};
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 
         if matches!(self.popup, Some(PopupKind::FilterPopup(_))) {
             self.handle_filter_popup_mouse(mouse);
@@ -2217,6 +2213,7 @@ impl App {
 
         let middle_click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Middle));
         let left_click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+        let ctrl_click = mouse.modifiers.contains(KeyModifiers::CONTROL);
         if !left_click && !middle_click {
             return;
         }
@@ -2273,7 +2270,14 @@ impl App {
                                 cycle_sort = true;
                             }
                             crate::grid::GridHit::RowGutter(row) => {
-                                grid.focus_cell(row, grid.focused_col);
+                                let focused_col = grid.focused_col;
+                                if ctrl_click {
+                                    grid.toggle_row_selected(row);
+                                } else {
+                                    grid.select_only_row(row);
+                                }
+                                grid.focus_cell_preserve_selection(row, focused_col);
+                                self.dirty = true;
                             }
                             crate::grid::GridHit::Cell { row, col } => {
                                 grid.focus_cell(row, col);
@@ -2395,7 +2399,7 @@ impl App {
 
     fn scroll_grid_down(&mut self, n: usize) {
         let maybe_fetch = if let Some(ref mut grid) = self.grid {
-            grid.clear_row_selection();
+            grid.commit_row_selection();
             grid.scroll_down(n);
             if grid.needs_fetch && !grid.window.fetch_in_flight {
                 grid.window.fetch_in_flight = true;
@@ -2426,7 +2430,7 @@ impl App {
 
     fn scroll_grid_to_row(&mut self, row: i64) {
         let maybe_fetch = if let Some(ref mut grid) = self.grid {
-            grid.clear_row_selection();
+            grid.commit_row_selection();
             grid.scroll_to_row(row);
             if grid.needs_fetch && !grid.window.fetch_in_flight {
                 grid.window.fetch_in_flight = true;
@@ -2457,7 +2461,7 @@ impl App {
 
     fn scroll_grid_up(&mut self, n: usize) {
         let maybe_fetch = if let Some(ref mut grid) = self.grid {
-            grid.clear_row_selection();
+            grid.commit_row_selection();
             grid.scroll_up(n);
             if grid.needs_fetch && !grid.window.fetch_in_flight {
                 grid.window.fetch_in_flight = true;
@@ -2678,17 +2682,20 @@ impl App {
 
     fn handle_edit_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
+        if key.code == KeyCode::Enter
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(self.popup, Some(PopupKind::InsertRow(_)))
+        {
+            let _ = self.tx.send(Message::CommitInsertRow);
+            return;
+        }
         if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
             match self.popup {
                 Some(PopupKind::ValuePicker(_))
                 | Some(PopupKind::DatePicker(_))
                 | Some(PopupKind::DatetimePicker(_))
-                | Some(PopupKind::InsertRow(_))
                 | Some(PopupKind::FkPicker(_)) => {
-                    let _ = self.tx.send(match self.popup {
-                        Some(PopupKind::InsertRow(_)) => Message::CommitInsertRow,
-                        _ => Message::CommitEdit,
-                    });
+                    let _ = self.tx.send(Message::CommitEdit);
                     return;
                 }
                 _ => {}
@@ -3304,8 +3311,12 @@ impl App {
                 let _ = self.tx.send(Message::SetFocusedCellNull);
             }
             (KeyCode::Esc, _) => {
-                self.focus = FocusPane::Sidebar;
-                self.dirty = true;
+                if let Some(ref mut grid) = self.grid {
+                    if grid.has_row_selection() {
+                        grid.clear_row_selection();
+                        self.dirty = true;
+                    }
+                }
             }
             (KeyCode::Backspace, _) if !self.jump_stack.is_empty() => {
                 let _ = self.tx.send(Message::JumpBack);
@@ -4001,7 +4012,7 @@ fn next_active_tab_after_close(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
     use crossterm::event::{KeyCode, KeyModifiers};
     use r2d2_sqlite::SqliteConnectionManager;
@@ -4403,6 +4414,20 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[test]
+    fn alt_enter_in_insert_row_sends_commit_insert_row() {
+        let (mut app, mut rx) = make_constrained_insert_app();
+        app.update(Message::InsertRow);
+        drain_messages(&mut app, &mut rx);
+
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::ALT,
+        )));
+
+        assert_eq!(try_recv_variant(&mut rx), "CommitInsertRow");
+    }
+
     // ---------- grid navigation shortcuts ----------
 
     #[test]
@@ -4444,7 +4469,7 @@ mod tests {
         assert_eq!(grid.focused_row, 1);
         assert_eq!(
             grid.row_selection,
-            crate::grid::RowSelection::Range { anchor: 0, head: 1 }
+            crate::grid::RowSelection::Rows(BTreeSet::from([0]))
         );
     }
 
@@ -4465,7 +4490,25 @@ mod tests {
         assert_eq!(grid.focused_row, 2);
         assert_eq!(
             grid.row_selection,
-            crate::grid::RowSelection::Range { anchor: 3, head: 2 }
+            crate::grid::RowSelection::Rows(BTreeSet::from([3]))
+        );
+    }
+
+    #[test]
+    fn move_down_preserves_existing_selection() {
+        let (mut app, _rx) = make_test_app();
+        let mut grid = make_grid();
+        grid.row_selection = crate::grid::RowSelection::Rows(BTreeSet::from([1, 3]));
+        grid.window.fetch_in_flight = true;
+        app.grid = Some(grid);
+
+        app.update(Message::MoveDown);
+
+        let grid = app.grid.as_ref().expect("grid");
+        assert_eq!(grid.focused_row, 1);
+        assert_eq!(
+            grid.row_selection,
+            crate::grid::RowSelection::Rows(BTreeSet::from([1, 3]))
         );
     }
 
@@ -4726,15 +4769,21 @@ mod tests {
     }
 
     #[test]
-    fn esc_in_grid_sets_focus_to_sidebar() {
+    fn esc_in_grid_clears_selection() {
         let (mut app, _rx) = make_test_app();
-        app.grid = Some(make_grid());
+        let mut grid = make_grid();
+        grid.select_only_row(2);
+        app.grid = Some(grid);
         app.focus = FocusPane::Grid;
+
         app.update(Message::Key(crossterm::event::KeyEvent::new(
             KeyCode::Esc,
             KeyModifiers::NONE,
         )));
-        assert!(matches!(app.focus, FocusPane::Sidebar));
+
+        let grid = app.grid.as_ref().expect("grid");
+        assert_eq!(grid.row_selection, crate::grid::RowSelection::None);
+        assert!(matches!(app.focus, FocusPane::Grid));
     }
 
     #[test]
@@ -4810,7 +4859,7 @@ mod tests {
         ));
         assert!(matches!(
             app.toast.toasts.back(),
-            Some(toast) if toast.message == "Ctrl-Enter commits" && toast.kind == ToastKind::Info
+            Some(toast) if toast.message == "Alt-Enter commits" && toast.kind == ToastKind::Info
         ));
     }
 
@@ -4859,7 +4908,7 @@ mod tests {
     fn delete_row_confirms_selected_row_range() {
         let (mut app, _rx) = make_test_app();
         let mut grid = make_grid();
-        grid.row_selection = crate::grid::RowSelection::Range { anchor: 1, head: 3 };
+        grid.row_selection = crate::grid::RowSelection::Rows(BTreeSet::from([1, 3, 5]));
         app.grid = Some(grid);
 
         app.update(Message::DeleteRow);
@@ -4867,10 +4916,9 @@ mod tests {
         assert!(matches!(
             app.pending_confirm.as_ref().map(|confirm| &confirm.kind),
             Some(ConfirmKind::DeleteSelectedRows {
-                start_offset: 1,
-                end_offset: 3,
+                row_offsets,
                 ..
-            })
+            }) if row_offsets == &vec![1, 3, 5]
         ));
     }
 
@@ -5341,6 +5389,38 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert!(app.grid_scrollbar_drag.is_none());
+    }
+
+    #[test]
+    fn ctrl_click_on_row_gutter_toggles_rows_without_clearing_selection() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.grid_inner_area = Some(ratatui::layout::Rect {
+            x: 12,
+            y: 8,
+            width: 56,
+            height: 16,
+        });
+
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 12,
+            row: 11,
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 12,
+            row: 13,
+            modifiers: KeyModifiers::CONTROL,
+        }));
+
+        let grid = app.grid.as_ref().expect("grid");
+        assert_eq!(grid.focused_row, 2);
+        assert_eq!(
+            grid.row_selection,
+            crate::grid::RowSelection::Rows(BTreeSet::from([0, 2]))
+        );
     }
 
     #[test]
