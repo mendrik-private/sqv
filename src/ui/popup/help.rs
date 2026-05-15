@@ -221,7 +221,7 @@ fn help_text(symbols: &Symbols) -> String {
                     "Ctrl-H / ?",
                     "Help (this)",
                     "Y",
-                    "Copy row JSON to clipboard",
+                    "Copy selected row(s) as JSON",
                 ),
                 help_row("", "", "Toggle sidebar", "Show/hide schema panel"),
                 help_row("", "", "Toggle read-only", "Safe inspection mode"),
@@ -408,7 +408,9 @@ mod tests {
             .expect("quit line");
         let help_line = help
             .lines()
-            .find(|line| line.contains("Help (this)") && line.contains("Copy row JSON"))
+            .find(|line| {
+                line.contains("Ctrl-H / ?") && line.contains("Copy selected row(s) as JSON")
+            })
             .expect("help line");
 
         let left_desc_start = |line: &str, needle: &str| {
