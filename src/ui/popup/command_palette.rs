@@ -35,7 +35,7 @@ impl PaletteCommand {
             PaletteCommand::ExportJson => "Export JSON",
             PaletteCommand::ExportSql => "Export SQL",
             PaletteCommand::CopyCell => "Copy cell",
-            PaletteCommand::CopyRowJson => "Copy row as JSON",
+            PaletteCommand::CopyRowJson => "Copy row(s) as JSON",
             PaletteCommand::ReloadSchema => "Reload schema",
             PaletteCommand::ToggleSidebar => "Toggle sidebar",
             PaletteCommand::ToggleReadonly => "Toggle read-only",

@@ -278,6 +278,12 @@ pub fn render_sidebar(
         .bg(theme.bg_raised)
         .add_modifier(Modifier::BOLD);
 
+    clear_area(
+        frame.buffer_mut(),
+        list_area,
+        Style::default().bg(theme.bg_soft),
+    );
+
     let items = build_sidebar_items(schema, state, theme, symbols, header_style, name_style);
     let highlight_symbol = format!("{} ", symbols.selection);
     let list = build_sidebar_list(items, theme, accent_style, &highlight_symbol);
@@ -379,6 +385,17 @@ fn build_sidebar_list<'a>(
         .style(Style::default().bg(theme.bg_soft))
         .highlight_style(accent_style)
         .highlight_symbol(highlight_symbol)
+}
+
+fn clear_area(buf: &mut Buffer, area: Rect, style: Style) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let blank = " ".repeat(area.width as usize);
+    for y in area.y..area.y + area.height {
+        buf.set_string(area.x, y, &blank, style);
+    }
 }
 
 fn render_scrollbar(
@@ -491,5 +508,29 @@ mod tests {
             buf[(area.right() - 1, area.bottom() - 1)].style().bg,
             Some(theme.bg_soft)
         );
+    }
+
+    #[test]
+    fn clear_area_replaces_stale_symbols() {
+        let theme = Theme::default();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 3,
+        };
+        let mut buf = Buffer::empty(area);
+        for y in area.y..area.bottom() {
+            buf.set_string(area.x, y, "stale!", Style::default());
+        }
+
+        clear_area(&mut buf, area, Style::default().bg(theme.bg_soft));
+
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                assert_eq!(buf[(x, y)].symbol(), " ");
+                assert_eq!(buf[(x, y)].style().bg, Some(theme.bg_soft));
+            }
+        }
     }
 }

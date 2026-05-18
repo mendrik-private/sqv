@@ -409,7 +409,7 @@ mod tests {
         let theme = crate::theme::Theme::default();
         assert_eq!(
             terminal_background_osc(&theme),
-            Some("\u{1b}]11;#1d1b1a\u{7}".to_string())
+            Some("\u{1b}]11;#23211f\u{7}".to_string())
         );
     }
 }

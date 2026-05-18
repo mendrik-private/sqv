@@ -2137,29 +2137,100 @@ impl App {
     }
 
     fn copy_row_as_json(&mut self) {
-        let json = self.grid.as_ref().and_then(|g| {
-            let abs_row = g.focused_row as i64;
-            let row = g.window.get_row(abs_row)?;
-            let fields: Vec<String> = g
-                .columns
-                .iter()
-                .zip(row)
-                .map(|(col, val)| {
-                    let v_json = match val {
-                        SqlValue::Null => "null".to_string(),
-                        SqlValue::Integer(n) => n.to_string(),
-                        SqlValue::Real(f) => f.to_string(),
-                        SqlValue::Text(s) => format!("\"{}\"", s.replace('"', "\\\"")),
-                        SqlValue::Blob(_) => "null".to_string(),
-                    };
-                    format!("\"{}\": {}", col.name.replace('"', "\\\""), v_json)
-                })
-                .collect();
-            Some(format!("{{{}}}", fields.join(", ")))
-        });
-        if let Some(text) = json {
-            self.copy_to_clipboard(&text, "Copied row JSON to clipboard");
+        match self.row_json_text() {
+            Ok(Some((text, copied_selected_rows))) => {
+                let success_message = if copied_selected_rows {
+                    "Copied selected rows JSON to clipboard"
+                } else {
+                    "Copied row JSON to clipboard"
+                };
+                self.copy_to_clipboard(&text, success_message);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.toast.push(err.to_string(), ToastKind::Error);
+            }
         }
+    }
+
+    fn row_json_text(&self) -> anyhow::Result<Option<(String, bool)>> {
+        let Some(grid) = self.grid.as_ref() else {
+            return Ok(None);
+        };
+
+        let sort = grid.sort.as_ref().and_then(|s| {
+            grid.columns
+                .get(s.col_idx)
+                .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
+        });
+        let (where_clause, where_params) = filter_to_sql(&grid.filter);
+        let conn = self.pool.get()?;
+
+        let selected_offsets = grid.selected_rows();
+        let copying_selection = grid.has_row_selection();
+        let rows = if matches!(&grid.row_selection, RowSelection::All) {
+            db::fetch_rows(
+                &conn,
+                db::RowFetch {
+                    table: &grid.table_name,
+                    columns: &grid.columns,
+                    offset: 0,
+                    limit: grid.window.total_rows.max(0),
+                    order_by: sort.as_ref().map(|(col, asc)| (col.as_str(), *asc)),
+                    where_clause: &where_clause,
+                    where_params: &where_params,
+                },
+            )?
+        } else if copying_selection {
+            let mut rows = Vec::with_capacity(selected_offsets.len());
+            for offset in selected_offsets {
+                let mut fetched = db::fetch_rows(
+                    &conn,
+                    db::RowFetch {
+                        table: &grid.table_name,
+                        columns: &grid.columns,
+                        offset: offset as i64,
+                        limit: 1,
+                        order_by: sort.as_ref().map(|(col, asc)| (col.as_str(), *asc)),
+                        where_clause: &where_clause,
+                        where_params: &where_params,
+                    },
+                )?;
+                if let Some(row) = fetched.pop() {
+                    rows.push(row);
+                }
+            }
+            rows
+        } else {
+            db::fetch_rows(
+                &conn,
+                db::RowFetch {
+                    table: &grid.table_name,
+                    columns: &grid.columns,
+                    offset: grid.focused_row as i64,
+                    limit: 1,
+                    order_by: sort.as_ref().map(|(col, asc)| (col.as_str(), *asc)),
+                    where_clause: &where_clause,
+                    where_params: &where_params,
+                },
+            )?
+        };
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let json = if copying_selection {
+            let json_rows = rows
+                .iter()
+                .map(|row| row_to_json_value(&grid.columns, row))
+                .collect::<Vec<_>>();
+            serde_json::to_string(&json_rows)?
+        } else {
+            serde_json::to_string(&row_to_json_value(&grid.columns, &rows[0]))?
+        };
+
+        Ok(Some((json, copying_selection)))
     }
 
     fn copy_to_clipboard(&mut self, text: &str, success_message: &str) {
@@ -3975,6 +4046,26 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+fn sql_value_to_json_value(value: &SqlValue) -> serde_json::Value {
+    match value {
+        SqlValue::Null => serde_json::Value::Null,
+        SqlValue::Integer(n) => serde_json::Value::Number((*n).into()),
+        SqlValue::Real(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        SqlValue::Text(text) => serde_json::Value::String(text.clone()),
+        SqlValue::Blob(_) => serde_json::Value::Null,
+    }
+}
+
+fn row_to_json_value(columns: &[Column], row: &[SqlValue]) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(columns.len());
+    for (column, value) in columns.iter().zip(row.iter()) {
+        map.insert(column.name.clone(), sql_value_to_json_value(value));
+    }
+    serde_json::Value::Object(map)
+}
+
 fn should_use_value_picker(values: &[String]) -> bool {
     !values.is_empty() && values.len() <= VALUE_PICKER_DISTINCT_LIMIT
 }
@@ -4116,6 +4207,23 @@ mod tests {
                 ],
             )
             .expect("seed user row");
+        }
+    }
+
+    fn seed_grid_rows(app: &App, count: usize) {
+        let conn = app.pool.get().expect("test conn");
+        for index in 0..count {
+            let id = index as i64;
+            conn.execute(
+                "INSERT INTO users (id, name, age, email) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    id,
+                    format!("user-{id}"),
+                    20 + (id % 40),
+                    format!("user{id}@example.com")
+                ],
+            )
+            .expect("seed grid row");
         }
     }
 
@@ -4966,6 +5074,53 @@ mod tests {
             KeyModifiers::SHIFT,
         )));
         assert_eq!(try_recv_variant(&mut rx), "CopyRowJson");
+    }
+
+    #[test]
+    fn row_json_text_returns_single_object_without_selection() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = Some(make_grid());
+        seed_grid_rows(&app, 50);
+
+        let (json_text, copied_selected_rows) =
+            app.row_json_text().expect("row json").expect("json text");
+        let json: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
+
+        assert!(!copied_selected_rows);
+        assert_eq!(json["id"], serde_json::json!(0));
+        assert_eq!(json["name"], serde_json::json!("user-0"));
+    }
+
+    #[test]
+    fn row_json_text_returns_selected_rows_as_array() {
+        let (mut app, _rx) = make_test_app();
+        let mut grid = make_grid();
+        grid.row_selection = crate::grid::RowSelection::Rows(BTreeSet::from([1, 3]));
+        app.grid = Some(grid);
+        seed_grid_rows(&app, 50);
+
+        let (json_text, copied_selected_rows) =
+            app.row_json_text().expect("row json").expect("json text");
+        let json: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
+
+        assert!(copied_selected_rows);
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {
+                    "id": 1,
+                    "name": "user-1",
+                    "age": 21,
+                    "email": "user1@example.com"
+                },
+                {
+                    "id": 3,
+                    "name": "user-3",
+                    "age": 23,
+                    "email": "user3@example.com"
+                }
+            ])
+        );
     }
 
     #[test]

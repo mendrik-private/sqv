@@ -655,6 +655,10 @@ fn cell_val_style(
     }
 }
 
+fn show_cell_focus(state: &GridState, insert_row: Option<&InsertRowState>) -> bool {
+    insert_row.is_some() || !state.has_row_selection()
+}
+
 // ── sub-render functions ─────────────────────────────────────────────────────
 
 fn compute_visible_cols(state: &GridState, data_width: u16) -> Vec<(usize, u16)> {
@@ -939,6 +943,10 @@ fn render_focused_border(
     theme: &Theme,
     symbols: &Symbols,
 ) {
+    if !show_cell_focus(state, insert_row) {
+        return;
+    }
+
     if let Some(insert_row) = insert_row {
         let focused_col = insert_row.selected;
         let focused_row_in_view =
@@ -1161,6 +1169,7 @@ fn render_existing_row(
     let is_focused = abs_row == state.focused_row as i64;
     let is_selected = state.is_row_selected(abs_row);
     let row_bg = row_background(state, theme, abs_row, is_focused);
+    let show_cell_focus = !state.has_row_selection();
 
     buf.set_string(
         area.x,
@@ -1193,7 +1202,7 @@ fn render_existing_row(
             let actual_w = cell_w.min(area.x + area.width - col_x);
             let inner_w = (actual_w as usize).saturating_sub(2);
 
-            let is_focused_cell = is_focused && col_idx == state.focused_col;
+            let is_focused_cell = show_cell_focus && is_focused && col_idx == state.focused_col;
             if actual_w > 0 {
                 buf.set_string(
                     col_x,
@@ -1638,10 +1647,11 @@ mod tests {
 
     use super::{
         compute_visible_cols, enum_value_color, scrollbar_drag_start, scrollbar_drag_target_row,
-        GridInit, GridState, RowSelection,
+        show_cell_focus, GridInit, GridState, RowSelection,
     };
     use crate::db::{schema::Column, types::SqlValue};
     use crate::theme::Theme;
+    use crate::ui::popup::InsertRowState;
     use ratatui::layout::Rect;
 
     fn make_col(name: &str, col_type: &str, is_pk: bool) -> Column {
@@ -1863,6 +1873,43 @@ mod tests {
         grid.toggle_row_selected(1);
 
         assert_eq!(grid.selected_rows(), vec![4]);
+    }
+
+    #[test]
+    fn row_selection_hides_cell_focus() {
+        let columns = vec![make_col("name", "TEXT", false)];
+        let mut grid = GridState::new(GridInit {
+            table_name: "customers".to_string(),
+            columns,
+            fk_cols: vec![false],
+            enumerated_values: vec![Vec::new()],
+            rows: vec![vec![SqlValue::Text("Alice".to_string())]; 10],
+            width_sample_rows: vec![],
+            total_rows: 10,
+            area_width: 40,
+        });
+        grid.select_only_row(2);
+
+        assert!(!show_cell_focus(&grid, None));
+    }
+
+    #[test]
+    fn insert_row_keeps_cell_focus_even_with_row_selection() {
+        let columns = vec![make_col("name", "TEXT", false)];
+        let mut grid = GridState::new(GridInit {
+            table_name: "customers".to_string(),
+            columns: columns.clone(),
+            fk_cols: vec![false],
+            enumerated_values: vec![Vec::new()],
+            rows: vec![vec![SqlValue::Text("Alice".to_string())]; 10],
+            width_sample_rows: vec![],
+            total_rows: 10,
+            area_width: 40,
+        });
+        grid.select_only_row(2);
+        let insert_row = InsertRowState::new("customers".to_string(), columns, 3);
+
+        assert!(show_cell_focus(&grid, Some(&insert_row)));
     }
 
     #[test]

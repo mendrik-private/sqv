@@ -27,9 +27,9 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            bg: Color::Rgb(0x1d, 0x1b, 0x1a),
-            bg_soft: Color::Rgb(0x24, 0x21, 0x1f),
-            bg_raised: Color::Rgb(0x2a, 0x26, 0x24),
+            bg: Color::Rgb(0x23, 0x21, 0x1f),
+            bg_soft: Color::Rgb(0x26, 0x23, 0x21),
+            bg_raised: Color::Rgb(0x29, 0x26, 0x24),
             line: Color::Rgb(0x3a, 0x33, 0x2f),
             line_soft: Color::Rgb(0x2f, 0x2a, 0x27),
             fg: Color::Rgb(0xe8, 0xdf, 0xd3),

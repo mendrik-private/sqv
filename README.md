@@ -135,7 +135,7 @@ nerd_font = true
 
 [theme]
 accent = "#d99a5e"
-bg = "#1d1b1a"
+bg = "#23211f"
 
 [symbols]
 table_icon = "󰓫"
@@ -174,6 +174,6 @@ GitHub Actions provides:
 To cut a release:
 
 ```bash
-git tag v0.2.3
-git push origin v0.2.3
+git tag v0.2.4
+git push origin v0.2.4
 ```
