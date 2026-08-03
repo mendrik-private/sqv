@@ -216,7 +216,7 @@ fn help_text(symbols: &Symbols) -> String {
             left_header: "Misc".to_string(),
             right_header: String::new(),
             rows: vec![
-                help_row("Ctrl-Q", "Quit", "y", "Copy cell to clipboard"),
+                help_row("Ctrl-Q", "Quit", "Ctrl-C / y", "Copy cell to clipboard"),
                 help_row(
                     "Ctrl-H / ?",
                     "Help (this)",
@@ -448,6 +448,7 @@ mod tests {
         assert!(help.contains("Select rows left behind"));
         assert!(help.contains("Delete / d"));
         assert!(help.contains("Ctrl-A"));
+        assert!(help.contains("Ctrl-C / y"));
         assert!(help.contains("Ctrl-W"));
         assert!(help.contains("Ctrl-click gutter"));
     }

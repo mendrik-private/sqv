@@ -174,6 +174,6 @@ GitHub Actions provides:
 To cut a release:
 
 ```bash
-git tag v0.2.4
-git push origin v0.2.4
+git tag v0.2.5
+git push origin v0.2.5
 ```

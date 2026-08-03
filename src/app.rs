@@ -3413,6 +3413,9 @@ impl App {
             (KeyCode::Char('d'), KeyModifiers::NONE) => {
                 let _ = self.tx.send(Message::DeleteRow);
             }
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                let _ = self.tx.send(Message::CopyCell);
+            }
             (KeyCode::Char('y'), KeyModifiers::NONE) => {
                 let _ = self.tx.send(Message::CopyCell);
             }
@@ -5060,6 +5063,18 @@ mod tests {
         app.update(Message::Key(crossterm::event::KeyEvent::new(
             KeyCode::Char('y'),
             KeyModifiers::NONE,
+        )));
+        assert_eq!(try_recv_variant(&mut rx), "CopyCell");
+    }
+
+    #[test]
+    fn ctrl_c_in_grid_sends_copy_cell() {
+        let (mut app, mut rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.focus = FocusPane::Grid;
+        app.update(Message::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
         )));
         assert_eq!(try_recv_variant(&mut rx), "CopyCell");
     }
