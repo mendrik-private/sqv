@@ -271,7 +271,7 @@ impl TextEditorState {
             let bytes = self
                 .current
                 .as_bytes()
-                .chunks_exact(2)
+                .chunks(2)
                 .map(|pair| {
                     let pair = std::str::from_utf8(pair)?;
                     Ok(u8::from_str_radix(pair, 16)?)
