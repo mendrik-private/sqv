@@ -50,9 +50,9 @@ jobs:
 
       - name: Validate project
         run: |
-          cargo fmt --check
-          cargo clippy -- -D warnings
-          cargo test
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --all-targets
 
       - name: Build release artifacts
         run: bash scripts/build-release-artifacts.sh "${{ steps.version.outputs.version }}" dist

@@ -485,6 +485,8 @@ fn synth_column(header: String, rows: &[Vec<SqlValue>], col_idx: usize) -> Colum
         not_null: false,
         default_value: None,
         is_pk: col_idx == 0,
+        pk_position: if col_idx == 0 { 1 } else { 0 },
+        writable: false,
     }
 }
 

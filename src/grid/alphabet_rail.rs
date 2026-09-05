@@ -137,6 +137,8 @@ mod tests {
             not_null: false,
             default_value: None,
             is_pk: false,
+            pk_position: 0,
+            writable: true,
         }
     }
 

@@ -290,6 +290,17 @@ fn action_hint_text(app: &App) -> Option<String> {
     }
 }
 
+fn put(buf: &mut Buffer, mut x: u16, y: u16, right: u16, text: &str, style: Style) -> u16 {
+    for ch in text.chars() {
+        if x >= right {
+            break;
+        }
+        buf.set_string(x, y, ch.to_string(), style);
+        x += 1;
+    }
+    x
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -342,6 +353,8 @@ mod tests {
                 not_null: false,
                 default_value: None,
                 is_pk: true,
+                pk_position: 1,
+                writable: true,
             },
             Column {
                 cid: 1,
@@ -350,6 +363,8 @@ mod tests {
                 not_null: false,
                 default_value: None,
                 is_pk: false,
+                pk_position: 0,
+                writable: true,
             },
         ];
         GridState::new(GridInit {
@@ -452,15 +467,4 @@ mod tests {
         assert_eq!(style.fg, Some(Color::Black));
         assert_eq!(style.bg, Some(theme.accent));
     }
-}
-
-fn put(buf: &mut Buffer, mut x: u16, y: u16, right: u16, text: &str, style: Style) -> u16 {
-    for ch in text.chars() {
-        if x >= right {
-            break;
-        }
-        buf.set_string(x, y, ch.to_string(), style);
-        x += 1;
-    }
-    x
 }

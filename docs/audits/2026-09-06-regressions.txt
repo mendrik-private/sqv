@@ -1,0 +1,176 @@
+Audit of sqview at 0eab019 with pre-existing worktree edits.
+Command: python3 docs/audits/2026-09-06-reproduce.py
+Exit status: 101 (18 intended-contract assertions expose existing defects).
+Paths and line numbers below refer to the temporary source copy.
+
+running 18 tests
+test app::tests::audit_cached_cell_keeps_the_same_row_identity ... FAILED
+test app::tests::audit_column_changes_refresh_schema ... FAILED
+test app::tests::audit_delete_keeps_an_undo_payload ... FAILED
+test app::tests::audit_insert_submission_cannot_commit_twice ... FAILED
+test app::tests::audit_invalid_numeric_edit_preserves_the_database_value ... FAILED
+test app::tests::audit_readonly_mode_blocks_undo_writes ... FAILED
+test app::tests::audit_sort_change_survives_an_old_window_response ... FAILED
+test app::tests::audit_test_message_drain_processes_every_event ... FAILED
+test audit_regressions::audit_composite_fk_keeps_target_column_pairing ... FAILED
+test audit_regressions::audit_csv_carriage_return_round_trips ... FAILED
+test audit_regressions::audit_existing_blob_picker_value_preserves_storage_type ... FAILED
+test audit_regressions::audit_filter_path_stays_inside_state_directory ... FAILED
+test audit_regressions::audit_filter_paths_distinguish_database_locations ... FAILED
+test audit_regressions::audit_json_column_names_round_trip ... FAILED
+test audit_regressions::audit_quoted_identifier_is_valid_schema ... FAILED
+test audit_regressions::audit_regex_filter_tolerates_null_cells ... FAILED
+test audit_regressions::audit_rowid_shadow_does_not_delete_two_rows ... FAILED
+test audit_regressions::audit_without_rowid_table_can_be_browsed ... FAILED
+
+failures:
+
+---- app::tests::audit_cached_cell_keeps_the_same_row_identity stdout ----
+
+thread 'app::tests::audit_cached_cell_keeps_the_same_row_identity' (3368234) panicked at src/app.rs:5923:9:
+cached user-0 was paired with a different live rowid: Some((1, Text("user-0")))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- app::tests::audit_column_changes_refresh_schema stdout ----
+
+thread 'app::tests::audit_column_changes_refresh_schema' (3368238) panicked at src/app.rs:5958:9:
+assertion `left == right` failed: same object names concealed an ALTER TABLE change
+  left: 4
+ right: 5
+
+---- app::tests::audit_delete_keeps_an_undo_payload stdout ----
+
+thread 'app::tests::audit_delete_keeps_an_undo_payload' (3368242) panicked at src/app.rs:5946:9:
+delete completion records an undo operation with no row data
+
+---- app::tests::audit_insert_submission_cannot_commit_twice stdout ----
+
+thread 'app::tests::audit_insert_submission_cannot_commit_twice' (3368246) panicked at src/app.rs:5986:9:
+same staged row submitted twice: Ok(Some(RowInserted { table: "users", rowid: 2 }))
+
+---- app::tests::audit_invalid_numeric_edit_preserves_the_database_value stdout ----
+
+thread 'app::tests::audit_invalid_numeric_edit_preserves_the_database_value' (3368252) panicked at src/app.rs:6005:9:
+assertion `left == right` failed: invalid input was committed as NULL
+  left: None
+ right: Some(30)
+
+---- app::tests::audit_readonly_mode_blocks_undo_writes stdout ----
+
+thread 'app::tests::audit_readonly_mode_blocks_undo_writes' (3368257) panicked at src/app.rs:6023:9:
+undo deleted data while session read-only was enabled
+
+---- app::tests::audit_sort_change_survives_an_old_window_response stdout ----
+
+thread 'app::tests::audit_sort_change_survives_an_old_window_response' (3368262) panicked at src/app.rs:5937:9:
+stale result erased the pending fetch for the new sort
+
+---- app::tests::audit_test_message_drain_processes_every_event stdout ----
+
+thread 'app::tests::audit_test_message_drain_processes_every_event' (3368266) panicked at src/app.rs:5968:9:
+drain_messages discarded the second event
+
+---- audit_regressions::audit_composite_fk_keeps_target_column_pairing stdout ----
+
+thread 'audit_regressions::audit_composite_fk_keeps_target_column_pairing' (3368270) panicked at src/main.rs:528:9:
+assertion `left == right` failed
+  left: "a"
+ right: "b"
+
+---- audit_regressions::audit_csv_carriage_return_round_trips stdout ----
+
+thread 'audit_regressions::audit_csv_carriage_return_round_trips' (3368271) panicked at src/main.rs:495:9:
+assertion `left == right` failed: one SQLite row became multiple CSV records
+  left: 2
+ right: 1
+
+---- audit_regressions::audit_existing_blob_picker_value_preserves_storage_type stdout ----
+
+thread 'audit_regressions::audit_existing_blob_picker_value_preserves_storage_type' (3368272) panicked at src/main.rs:518:9:
+assertion `left == right` failed
+  left: Some(Text("<blob 1 bytes>"))
+ right: Some(Blob([171]))
+
+---- audit_regressions::audit_filter_path_stays_inside_state_directory stdout ----
+
+thread 'audit_regressions::audit_filter_path_stays_inside_state_directory' (3368273) panicked at src/main.rs:464:9:
+table name escaped state directory: "/tmp/escaped.toml"
+
+---- audit_regressions::audit_filter_paths_distinguish_database_locations stdout ----
+
+thread 'audit_regressions::audit_filter_paths_distinguish_database_locations' (3368274) panicked at src/main.rs:469:9:
+assertion `left != right` failed
+  left: Some("/tmp/sqview-audit-hz2aogn0/data/sqview/filters/data/t.toml")
+ right: Some("/tmp/sqview-audit-hz2aogn0/data/sqview/filters/data/t.toml")
+
+---- audit_regressions::audit_json_column_names_round_trip stdout ----
+
+thread 'audit_regressions::audit_json_column_names_round_trip' (3368275) panicked at src/main.rs:508:9:
+export contains invalid JSON: Err(Error("control character (\\u0000-\\u001F) found while parsing a string", line: 3, column: 0))
+
+---- audit_regressions::audit_quoted_identifier_is_valid_schema stdout ----
+
+thread 'audit_regressions::audit_quoted_identifier_is_valid_schema' (3368276) panicked at src/main.rs:432:9:
+valid quoted table name rejected: Err(near "b": syntax error in PRAGMA table_info("a"b") at offset 21
+
+Caused by:
+    Error code 1: SQL error or missing database)
+
+---- audit_regressions::audit_regex_filter_tolerates_null_cells stdout ----
+
+thread 'audit_regressions::audit_regex_filter_tolerates_null_cells' (3368277) panicked at src/main.rs:481:9:
+NULL broke the whole filter: Err(Invalid function parameter type Null at index 1
+
+Caused by:
+    Error code 1: SQL error or missing database)
+
+---- audit_regressions::audit_rowid_shadow_does_not_delete_two_rows stdout ----
+
+thread 'audit_regressions::audit_rowid_shadow_does_not_delete_two_rows' (3368281) panicked at src/main.rs:443:9:
+assertion `left == right` failed: deleting one selected row must preserve the other row
+  left: 0
+ right: 1
+
+---- audit_regressions::audit_without_rowid_table_can_be_browsed stdout ----
+
+thread 'audit_regressions::audit_without_rowid_table_can_be_browsed' (3368282) panicked at src/main.rs:457:9:
+valid WITHOUT ROWID table rejected: Err(no such column: rowid in SELECT "id" FROM "t" ORDER BY rowid ASC  LIMIT 50 OFFSET 0 at offset 30
+
+Caused by:
+    Error code 1: SQL error or missing database)
+
+
+failures:
+    app::tests::audit_cached_cell_keeps_the_same_row_identity
+    app::tests::audit_column_changes_refresh_schema
+    app::tests::audit_delete_keeps_an_undo_payload
+    app::tests::audit_insert_submission_cannot_commit_twice
+    app::tests::audit_invalid_numeric_edit_preserves_the_database_value
+    app::tests::audit_readonly_mode_blocks_undo_writes
+    app::tests::audit_sort_change_survives_an_old_window_response
+    app::tests::audit_test_message_drain_processes_every_event
+    audit_regressions::audit_composite_fk_keeps_target_column_pairing
+    audit_regressions::audit_csv_carriage_return_round_trips
+    audit_regressions::audit_existing_blob_picker_value_preserves_storage_type
+    audit_regressions::audit_filter_path_stays_inside_state_directory
+    audit_regressions::audit_filter_paths_distinguish_database_locations
+    audit_regressions::audit_json_column_names_round_trip
+    audit_regressions::audit_quoted_identifier_is_valid_schema
+    audit_regressions::audit_regex_filter_tolerates_null_cells
+    audit_regressions::audit_rowid_shadow_does_not_delete_two_rows
+    audit_regressions::audit_without_rowid_table_can_be_browsed
+
+test result: FAILED. 0 passed; 18 failed; 0 ignored; 0 measured; 197 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--bin sqview`
+
+Post-fix verification for v0.2.6
+Command: python3 docs/audits/2026-09-06-reproduce.py
+Exit status: 0
+Result: 222 passed; 0 failed
+
+The original injected assertions were migrated to permanent unit and integration-style
+tests covering rowid shadowing, cached request identity, WITHOUT ROWID browsing,
+composite foreign keys, generated columns, filter validation and storage, CSV/JSON
+serialization, BLOB/numeric editing, undo payloads, external schema changes, and the
+test message dispatcher.

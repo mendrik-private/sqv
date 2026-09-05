@@ -123,6 +123,8 @@ mod tests {
             not_null: false,
             default_value: None,
             is_pk,
+            pk_position: i64::from(is_pk),
+            writable: true,
         }
     }
 
@@ -186,7 +188,7 @@ mod tests {
         ];
         let rows = vec![vec![
             SqlValue::Integer(42),
-            SqlValue::Real(3.14),
+            SqlValue::Real(3.125),
             SqlValue::Integer(99),
         ]];
         let result = compute_col_widths(&cols, &rows, 200, &HashMap::new(), &[]);

@@ -455,6 +455,7 @@ mod tests {
                 columns: vec![],
                 foreign_keys: vec![],
                 indexes: vec![],
+                row_identity: None,
             }],
             views: vec![ViewMeta {
                 name: "active_users".to_string(),

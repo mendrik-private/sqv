@@ -228,17 +228,37 @@ fn create_file_watcher(
 
     use notify::{EventKind, RecursiveMode, Watcher};
 
+    let database = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let parent = database
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("database path has no parent directory"))?
+        .to_path_buf();
+    let database_name = database
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("database path has no filename"))?
+        .to_string_lossy()
+        .into_owned();
+    let watched_names = [
+        database_name.clone(),
+        format!("{database_name}-wal"),
+        format!("{database_name}-shm"),
+    ];
+
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
             if matches!(
                 event.kind,
                 EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-            ) {
+            ) && event.paths.iter().any(|path| {
+                path.file_name().is_some_and(|name| {
+                    watched_names.iter().any(|watched| name == watched.as_str())
+                })
+            }) {
                 let _ = tx.send(Message::FileChanged);
             }
         }
     })?;
-    watcher.watch(std::path::Path::new(path), RecursiveMode::NonRecursive)?;
+    watcher.watch(&parent, RecursiveMode::NonRecursive)?;
     Ok(Some(watcher))
 }
 

@@ -97,6 +97,7 @@ sqview paths
 |-----|--------|
 | `Enter` | Open the focused cell picker/editor |
 | `Alt-Enter` | Insert a newline in the direct text editor |
+| `Mouse wheel` / scrollbar drag | Scroll long direct-editor text |
 | `e` | Open the focused cell in the direct editor |
 | `n` | Set the focused cell to `NULL` when allowed |
 | `Esc` | Clear selection or close popup |
@@ -174,6 +175,6 @@ GitHub Actions provides:
 To cut a release:
 
 ```bash
-git tag v0.2.5
-git push origin v0.2.5
+git tag -a v0.2.6 -m 'v0.2.6'
+git push origin v0.2.6
 ```

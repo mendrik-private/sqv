@@ -1,4 +1,5 @@
 use super::rule::{FilterOp, FilterSet, FilterValue};
+use crate::db::query::quote_identifier;
 use crate::db::types::SqlValue;
 use rusqlite::types::Value as RusqliteValue;
 
@@ -14,7 +15,7 @@ fn sql_val(v: &SqlValue) -> RusqliteValue {
 
 /// Returns (WHERE clause without "WHERE", params vec).
 /// The WHERE clause uses ?1, ?2, ... positional params.
-pub fn filter_to_sql(filter: &FilterSet) -> (String, Vec<RusqliteValue>) {
+pub fn filter_to_sql(filter: &FilterSet) -> anyhow::Result<(String, Vec<RusqliteValue>)> {
     let mut parts: Vec<String> = Vec::new();
     let mut params: Vec<RusqliteValue> = Vec::new();
     let mut param_idx = 1usize;
@@ -27,137 +28,106 @@ pub fn filter_to_sql(filter: &FilterSet) -> (String, Vec<RusqliteValue>) {
 
         let col_parts: Vec<String> = enabled_rules
             .iter()
-            .map(|rule| {
-                let col = format!("\"{}\"", col_name);
+            .map(|rule| -> anyhow::Result<String> {
+                let col = quote_identifier(col_name);
                 match &rule.op {
                     FilterOp::Eq => {
-                        params.push(sql_val(if let FilterValue::Literal(v) = &rule.value {
-                            v
-                        } else {
-                            &SqlValue::Null
-                        }));
+                        params.push(sql_val(expect_literal(&rule.value, &rule.op)?));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} = {}", col, p)
+                        Ok(format!("{} = {}", col, p))
                     }
                     FilterOp::Ne => {
-                        params.push(sql_val(if let FilterValue::Literal(v) = &rule.value {
-                            v
-                        } else {
-                            &SqlValue::Null
-                        }));
+                        params.push(sql_val(expect_literal(&rule.value, &rule.op)?));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} != {}", col, p)
+                        Ok(format!("{} != {}", col, p))
                     }
                     FilterOp::Lt => {
-                        params.push(sql_val(if let FilterValue::Literal(v) = &rule.value {
-                            v
-                        } else {
-                            &SqlValue::Null
-                        }));
+                        params.push(sql_val(expect_literal(&rule.value, &rule.op)?));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} < {}", col, p)
+                        Ok(format!("{} < {}", col, p))
                     }
                     FilterOp::Le => {
-                        params.push(sql_val(if let FilterValue::Literal(v) = &rule.value {
-                            v
-                        } else {
-                            &SqlValue::Null
-                        }));
+                        params.push(sql_val(expect_literal(&rule.value, &rule.op)?));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} <= {}", col, p)
+                        Ok(format!("{} <= {}", col, p))
                     }
                     FilterOp::Gt => {
-                        params.push(sql_val(if let FilterValue::Literal(v) = &rule.value {
-                            v
-                        } else {
-                            &SqlValue::Null
-                        }));
+                        params.push(sql_val(expect_literal(&rule.value, &rule.op)?));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} > {}", col, p)
+                        Ok(format!("{} > {}", col, p))
                     }
                     FilterOp::Ge => {
-                        params.push(sql_val(if let FilterValue::Literal(v) = &rule.value {
-                            v
-                        } else {
-                            &SqlValue::Null
-                        }));
+                        params.push(sql_val(expect_literal(&rule.value, &rule.op)?));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} >= {}", col, p)
+                        Ok(format!("{} >= {}", col, p))
                     }
                     FilterOp::Contains => {
-                        let pattern = if let FilterValue::Pattern(s) = &rule.value {
-                            format!("%{}%", s)
-                        } else {
-                            "%".to_string()
-                        };
+                        let pattern = format!(
+                            "%{}%",
+                            escape_like_literal(expect_pattern(&rule.value, &rule.op)?)
+                        );
                         params.push(RusqliteValue::Text(pattern));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} LIKE {}", col, p)
+                        Ok(format!("{} LIKE {} ESCAPE '\\'", col, p))
                     }
                     FilterOp::NotContains => {
-                        let pattern = if let FilterValue::Pattern(s) = &rule.value {
-                            format!("%{}%", s)
-                        } else {
-                            "%".to_string()
-                        };
+                        let pattern = format!(
+                            "%{}%",
+                            escape_like_literal(expect_pattern(&rule.value, &rule.op)?)
+                        );
                         params.push(RusqliteValue::Text(pattern));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} NOT LIKE {}", col, p)
+                        Ok(format!("{} NOT LIKE {} ESCAPE '\\'", col, p))
                     }
                     FilterOp::StartsWith => {
-                        let pattern = if let FilterValue::Pattern(s) = &rule.value {
-                            format!("{}%", s)
-                        } else {
-                            "%".to_string()
-                        };
+                        let pattern = format!(
+                            "{}%",
+                            escape_like_literal(expect_pattern(&rule.value, &rule.op)?)
+                        );
                         params.push(RusqliteValue::Text(pattern));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} LIKE {}", col, p)
+                        Ok(format!("{} LIKE {} ESCAPE '\\'", col, p))
                     }
                     FilterOp::EndsWith => {
-                        let pattern = if let FilterValue::Pattern(s) = &rule.value {
-                            format!("%{}", s)
-                        } else {
-                            "%".to_string()
-                        };
+                        let pattern = format!(
+                            "%{}",
+                            escape_like_literal(expect_pattern(&rule.value, &rule.op)?)
+                        );
                         params.push(RusqliteValue::Text(pattern));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} LIKE {}", col, p)
+                        Ok(format!("{} LIKE {} ESCAPE '\\'", col, p))
                     }
                     FilterOp::Like => {
-                        let pattern = if let FilterValue::Pattern(s) = &rule.value {
-                            s.clone()
-                        } else {
-                            "%".to_string()
-                        };
+                        let pattern = expect_pattern(&rule.value, &rule.op)?.to_string();
                         params.push(RusqliteValue::Text(pattern));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("{} LIKE {}", col, p)
+                        Ok(format!("{} LIKE {}", col, p))
                     }
                     FilterOp::Regex => {
-                        let pattern = if let FilterValue::Regex(s) = &rule.value {
-                            s.clone()
-                        } else {
-                            String::new()
+                        let FilterValue::Regex(pattern) = &rule.value else {
+                            anyhow::bail!("regex filter requires a regular expression");
                         };
-                        params.push(RusqliteValue::Text(pattern));
+                        regex::Regex::new(pattern).map_err(|error| {
+                            anyhow::anyhow!("invalid regular expression: {error}")
+                        })?;
+                        params.push(RusqliteValue::Text(pattern.clone()));
                         let p = format!("?{}", param_idx);
                         param_idx += 1;
-                        format!("regexp({}, {})", p, col)
+                        Ok(format!("regexp({}, {})", p, col))
                     }
-                    FilterOp::IsNull => format!("{} IS NULL", col),
-                    FilterOp::IsNotNull => format!("{} IS NOT NULL", col),
+                    FilterOp::IsNull => Ok(format!("{} IS NULL", col)),
+                    FilterOp::IsNotNull => Ok(format!("{} IS NOT NULL", col)),
                     FilterOp::Between => {
                         if let FilterValue::Range(lo, hi) = &rule.value {
                             params.push(sql_val(lo));
@@ -166,9 +136,9 @@ pub fn filter_to_sql(filter: &FilterSet) -> (String, Vec<RusqliteValue>) {
                             params.push(sql_val(hi));
                             let p2 = format!("?{}", param_idx);
                             param_idx += 1;
-                            format!("{} BETWEEN {} AND {}", col, p1, p2)
+                            Ok(format!("{} BETWEEN {} AND {}", col, p1, p2))
                         } else {
-                            "1=1".to_string()
+                            anyhow::bail!("between filter requires a lower and upper value")
                         }
                     }
                     FilterOp::In => {
@@ -182,39 +152,47 @@ pub fn filter_to_sql(filter: &FilterSet) -> (String, Vec<RusqliteValue>) {
                                     p
                                 })
                                 .collect();
-                            format!("{} IN ({})", col, placeholders.join(", "))
+                            if placeholders.is_empty() {
+                                anyhow::bail!("in filter requires at least one value");
+                            }
+                            Ok(format!("{} IN ({})", col, placeholders.join(", ")))
                         } else {
-                            "1=1".to_string()
+                            anyhow::bail!("in filter requires a list of values")
                         }
                     }
-                    FilterOp::Today => format!("date({}) = date('now')", col),
-                    FilterOp::ThisWeek => {
-                        format!("date({}) >= date('now', 'weekday 0', '-6 days')", col)
-                    }
-                    FilterOp::ThisMonth => {
-                        format!("strftime('%Y-%m', {}) = strftime('%Y-%m', 'now')", col)
-                    }
+                    FilterOp::Today => Ok(format!("date({}) = date('now')", col)),
+                    FilterOp::ThisWeek => Ok(format!(
+                        "date({}) >= date('now', 'weekday 0', '-6 days')",
+                        col
+                    )),
+                    FilterOp::ThisMonth => Ok(format!(
+                        "strftime('%Y-%m', {}) = strftime('%Y-%m', 'now')",
+                        col
+                    )),
                     FilterOp::ThisYear => {
-                        format!("strftime('%Y', {}) = strftime('%Y', 'now')", col)
+                        Ok(format!("strftime('%Y', {}) = strftime('%Y', 'now')", col))
                     }
                     FilterOp::LastNDays => {
                         let n = if let FilterValue::N(n) = &rule.value {
                             *n
                         } else {
-                            7
+                            anyhow::bail!("last-N-days filter requires a day count")
                         };
-                        format!("date({}) >= date('now', '-{} days')", col, n)
+                        if n < 0 {
+                            anyhow::bail!("last-N-days filter cannot be negative");
+                        }
+                        Ok(format!("date({}) >= date('now', '-{} days')", col, n))
                     }
                     FilterOp::Formula => {
                         if let FilterValue::Formula(formula) = &rule.value {
                             sanitize_formula(formula, col_name)
                         } else {
-                            "1=1".to_string()
+                            anyhow::bail!("formula filter requires a formula")
                         }
                     }
                 }
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         if col_parts.len() == 1 {
             parts.push(col_parts.into_iter().next().unwrap_or_default());
@@ -224,11 +202,36 @@ pub fn filter_to_sql(filter: &FilterSet) -> (String, Vec<RusqliteValue>) {
     }
 
     let where_clause = parts.join(" AND ");
-    (where_clause, params)
+    Ok((where_clause, params))
 }
 
-fn sanitize_formula(formula: &str, col_name: &str) -> String {
-    let quoted_col = format!("\"{}\"", col_name);
+fn expect_literal<'a>(value: &'a FilterValue, op: &FilterOp) -> anyhow::Result<&'a SqlValue> {
+    match value {
+        FilterValue::Literal(value) => Ok(value),
+        _ => anyhow::bail!("{op:?} filter requires a literal value"),
+    }
+}
+
+fn expect_pattern<'a>(value: &'a FilterValue, op: &FilterOp) -> anyhow::Result<&'a str> {
+    match value {
+        FilterValue::Pattern(value) => Ok(value),
+        _ => anyhow::bail!("{op:?} filter requires a text pattern"),
+    }
+}
+
+fn escape_like_literal(pattern: &str) -> String {
+    let mut escaped = String::with_capacity(pattern.len());
+    for ch in pattern.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn sanitize_formula(formula: &str, col_name: &str) -> anyhow::Result<String> {
+    let quoted_col = quote_identifier(col_name);
     let mut result = String::new();
     let mut i = 0;
     let bytes = formula.as_bytes();
@@ -261,11 +264,14 @@ fn sanitize_formula(formula: &str, col_name: &str) -> String {
             | '\t' => {
                 result.push(c);
             }
-            _ => return "1=1".to_string(),
+            _ => anyhow::bail!("formula contains an unsupported character"),
         }
         i += 1;
     }
-    result
+    if result.trim().is_empty() {
+        anyhow::bail!("formula cannot be empty");
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -297,7 +303,7 @@ mod tests {
             FilterOp::Eq,
             FilterValue::Literal(SqlValue::Integer(42)),
         );
-        let (clause, params) = filter_to_sql(&fs);
+        let (clause, params) = filter_to_sql(&fs).expect("valid filter");
         assert!(clause.contains("\"id\" = ?1"), "got: {}", clause);
         assert_eq!(params.len(), 1);
         assert_eq!(params[0], RusqliteValue::Integer(42));
@@ -310,7 +316,7 @@ mod tests {
             FilterOp::Contains,
             FilterValue::Pattern("foo".to_string()),
         );
-        let (clause, params) = filter_to_sql(&fs);
+        let (clause, params) = filter_to_sql(&fs).expect("valid filter");
         assert!(clause.contains("LIKE"), "got: {}", clause);
         match params.first() {
             Some(RusqliteValue::Text(p)) => assert_eq!(p, "%foo%"),
@@ -325,7 +331,7 @@ mod tests {
             FilterOp::Between,
             FilterValue::Range(SqlValue::Integer(18), SqlValue::Integer(65)),
         );
-        let (clause, params) = filter_to_sql(&fs);
+        let (clause, params) = filter_to_sql(&fs).expect("valid filter");
         assert!(clause.contains("BETWEEN"), "got: {}", clause);
         assert_eq!(params.len(), 2);
     }
@@ -352,7 +358,7 @@ mod tests {
                 ],
             },
         );
-        let (clause, _) = filter_to_sql(&fs);
+        let (clause, _) = filter_to_sql(&fs).expect("valid filter");
         assert!(clause.contains(" OR "), "got: {}", clause);
     }
 
@@ -381,7 +387,7 @@ mod tests {
                 }],
             },
         );
-        let (clause, _) = filter_to_sql(&fs);
+        let (clause, _) = filter_to_sql(&fs).expect("valid filter");
         assert!(
             clause.contains("\"age\"") && clause.contains("\"name\""),
             "got: {}",
@@ -396,7 +402,7 @@ mod tests {
             FilterOp::IsNull,
             FilterValue::Literal(SqlValue::Null),
         );
-        let (clause, params) = filter_to_sql(&fs_null);
+        let (clause, params) = filter_to_sql(&fs_null).expect("valid filter");
         assert!(clause.contains("IS NULL"), "got: {}", clause);
         assert_eq!(params.len(), 0);
 
@@ -405,7 +411,7 @@ mod tests {
             FilterOp::IsNotNull,
             FilterValue::Literal(SqlValue::Null),
         );
-        let (clause2, _) = filter_to_sql(&fs_notnull);
+        let (clause2, _) = filter_to_sql(&fs_notnull).expect("valid filter");
         assert!(clause2.contains("IS NOT NULL"), "got: {}", clause2);
     }
 
@@ -423,7 +429,7 @@ mod tests {
                 }],
             },
         );
-        let (clause, params) = filter_to_sql(&fs);
+        let (clause, params) = filter_to_sql(&fs).expect("valid filter");
         assert!(clause.is_empty(), "got: {}", clause);
         assert_eq!(params.len(), 0);
     }
@@ -431,7 +437,7 @@ mod tests {
     #[test]
     fn test_empty_filter_set() {
         let fs = FilterSet::default();
-        let (clause, params) = filter_to_sql(&fs);
+        let (clause, params) = filter_to_sql(&fs).expect("valid filter");
         assert!(clause.is_empty());
         assert!(params.is_empty());
     }
@@ -443,11 +449,85 @@ mod tests {
             FilterOp::StartsWith,
             FilterValue::Pattern("foo".to_string()),
         );
-        let (clause, params) = filter_to_sql(&fs);
+        let (clause, params) = filter_to_sql(&fs).expect("valid filter");
         assert!(clause.contains("LIKE"), "got: {}", clause);
         match params.first() {
             Some(RusqliteValue::Text(p)) => assert_eq!(p, "foo%"),
             _ => panic!("expected Text param"),
         }
+    }
+
+    #[test]
+    fn literal_text_operators_escape_like_wildcards_and_escape_character() {
+        let cases = [
+            (
+                FilterOp::Contains,
+                "%50\\%\\_\\\\off%",
+                "\"name\" LIKE ?1 ESCAPE '\\'",
+            ),
+            (
+                FilterOp::NotContains,
+                "%50\\%\\_\\\\off%",
+                "\"name\" NOT LIKE ?1 ESCAPE '\\'",
+            ),
+            (
+                FilterOp::StartsWith,
+                "50\\%\\_\\\\off%",
+                "\"name\" LIKE ?1 ESCAPE '\\'",
+            ),
+            (
+                FilterOp::EndsWith,
+                "%50\\%\\_\\\\off",
+                "\"name\" LIKE ?1 ESCAPE '\\'",
+            ),
+        ];
+
+        for (op, expected_pattern, expected_clause) in cases {
+            let filter = make_set("name", op, FilterValue::Pattern("50%_\\off".to_string()));
+            let (clause, params) = filter_to_sql(&filter).expect("valid literal text filter");
+
+            assert_eq!(clause, expected_clause);
+            assert_eq!(
+                params,
+                vec![RusqliteValue::Text(expected_pattern.to_string())]
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_like_preserves_wildcard_pattern() {
+        let pattern = "50%_\\off";
+        let filter = make_set(
+            "name",
+            FilterOp::Like,
+            FilterValue::Pattern(pattern.to_string()),
+        );
+        let (clause, params) = filter_to_sql(&filter).expect("valid LIKE filter");
+
+        assert_eq!(clause, "\"name\" LIKE ?1");
+        assert_eq!(params, vec![RusqliteValue::Text(pattern.to_string())]);
+    }
+
+    #[test]
+    fn rejects_rule_value_mismatches() {
+        let filter = make_set(
+            "name",
+            FilterOp::Eq,
+            FilterValue::Pattern("unexpected".to_string()),
+        );
+        assert!(filter_to_sql(&filter).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_regex_and_formula() {
+        let regex = make_set("name", FilterOp::Regex, FilterValue::Regex("[".to_string()));
+        assert!(filter_to_sql(&regex).is_err());
+
+        let formula = make_set(
+            "amount",
+            FilterOp::Formula,
+            FilterValue::Formula("col; DROP TABLE items".to_string()),
+        );
+        assert!(filter_to_sql(&formula).is_err());
     }
 }

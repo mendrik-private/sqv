@@ -1,4 +1,9 @@
-use std::path::Path;
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use rusqlite::Connection;
 
@@ -16,7 +21,7 @@ pub fn export_csv(
     sort: &Option<SortSpec>,
     path: &Path,
 ) -> anyhow::Result<u64> {
-    let (where_clause, where_params) = filter_to_sql(filter);
+    let (where_clause, where_params) = filter_to_sql(filter)?;
     let order = sort.as_ref().and_then(|s| {
         columns
             .get(s.col_idx)
@@ -24,40 +29,20 @@ pub fn export_csv(
     });
     let order_ref = order.as_ref().map(|(s, b)| (s.as_str(), *b));
 
-    let rows = crate::db::fetch_rows(
-        conn,
-        crate::db::RowFetch {
-            table,
-            columns,
-            offset: 0,
-            limit: i64::MAX,
-            order_by: order_ref,
-            where_clause: &where_clause,
-            where_params: &where_params,
-        },
-    )?;
-
-    let mut out = std::fs::File::create(path)?;
-    use std::io::Write;
-
-    let headers: Vec<String> = columns.iter().map(|c| csv_escape(&c.name)).collect();
-    writeln!(out, "{}", headers.join(","))?;
-
-    let mut count = 0u64;
-    for row in &rows {
-        let cells: Vec<String> = row.iter().map(|v| csv_escape(&val_to_str(v))).collect();
-        writeln!(out, "{}", cells.join(","))?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
+    atomic_export(path, |file| {
+        let mut writer = csv::Writer::from_writer(file);
+        writer.write_record(columns.iter().map(|column| column.name.as_str()))?;
+        let count = crate::db::visit_rows(
+            conn,
+            row_fetch(table, columns, order_ref, &where_clause, &where_params),
+            |row| {
+                writer.write_record(row.iter().map(val_to_str))?;
+                Ok(())
+            },
+        )?;
+        writer.flush()?;
+        Ok(count)
+    })
 }
 
 pub fn export_json(
@@ -68,7 +53,7 @@ pub fn export_json(
     sort: &Option<SortSpec>,
     path: &Path,
 ) -> anyhow::Result<u64> {
-    let (where_clause, where_params) = filter_to_sql(filter);
+    let (where_clause, where_params) = filter_to_sql(filter)?;
     let order = sort.as_ref().and_then(|s| {
         columns
             .get(s.col_idx)
@@ -76,40 +61,31 @@ pub fn export_json(
     });
     let order_ref = order.as_ref().map(|(s, b)| (s.as_str(), *b));
 
-    let rows = crate::db::fetch_rows(
-        conn,
-        crate::db::RowFetch {
-            table,
-            columns,
-            offset: 0,
-            limit: i64::MAX,
-            order_by: order_ref,
-            where_clause: &where_clause,
-            where_params: &where_params,
-        },
-    )?;
-
-    let mut out = std::fs::File::create(path)?;
-    use std::io::Write;
-    writeln!(out, "[")?;
-    let count = rows.len() as u64;
-    for (i, row) in rows.iter().enumerate() {
-        let pairs: Vec<String> = columns
-            .iter()
-            .zip(row)
-            .map(|(col, val)| {
-                format!(
-                    "  \"{}\": {}",
-                    col.name.replace('"', "\\\""),
-                    val_to_json(val)
-                )
-            })
-            .collect();
-        let sep = if i + 1 < rows.len() { "," } else { "" };
-        writeln!(out, "{{{}}}{}", pairs.join(", "), sep)?;
-    }
-    writeln!(out, "]")?;
-    Ok(count)
+    atomic_export(path, |file| {
+        let mut out = BufWriter::new(file);
+        out.write_all(b"[")?;
+        let mut first = true;
+        let count = crate::db::visit_rows(
+            conn,
+            row_fetch(table, columns, order_ref, &where_clause, &where_params),
+            |row| {
+                if !first {
+                    out.write_all(b",")?;
+                }
+                first = false;
+                let object = columns
+                    .iter()
+                    .zip(row)
+                    .map(|(column, value)| (column.name.clone(), val_to_json(value)))
+                    .collect::<serde_json::Map<_, _>>();
+                serde_json::to_writer(&mut out, &object)?;
+                Ok(())
+            },
+        )?;
+        out.write_all(b"]\n")?;
+        out.flush()?;
+        Ok(count)
+    })
 }
 
 pub fn export_sql(
@@ -120,7 +96,7 @@ pub fn export_sql(
     sort: &Option<SortSpec>,
     path: &Path,
 ) -> anyhow::Result<u64> {
-    let (where_clause, where_params) = filter_to_sql(filter);
+    let (where_clause, where_params) = filter_to_sql(filter)?;
     let order = sort.as_ref().and_then(|s| {
         columns
             .get(s.col_idx)
@@ -128,41 +104,81 @@ pub fn export_sql(
     });
     let order_ref = order.as_ref().map(|(s, b)| (s.as_str(), *b));
 
-    let rows = crate::db::fetch_rows(
-        conn,
-        crate::db::RowFetch {
-            table,
-            columns,
-            offset: 0,
-            limit: i64::MAX,
-            order_by: order_ref,
-            where_clause: &where_clause,
-            where_params: &where_params,
-        },
-    )?;
-
-    let mut out = std::fs::File::create(path)?;
-    use std::io::Write;
-
     let col_names: String = columns
         .iter()
-        .map(|c| format!("\"{}\"", c.name))
+        .map(|column| crate::db::query::quote_identifier(&column.name))
         .collect::<Vec<_>>()
         .join(", ");
-
-    let mut count = 0u64;
-    for row in &rows {
-        let vals: Vec<String> = row.iter().map(val_to_sql_literal).collect();
-        writeln!(
-            out,
-            "INSERT INTO \"{}\" ({}) VALUES ({});",
-            table,
-            col_names,
-            vals.join(", ")
+    let quoted_table = crate::db::query::quote_identifier(table);
+    atomic_export(path, |file| {
+        let mut out = BufWriter::new(file);
+        let count = crate::db::visit_rows(
+            conn,
+            row_fetch(table, columns, order_ref, &where_clause, &where_params),
+            |row| {
+                let values = row.iter().map(val_to_sql_literal).collect::<Vec<_>>();
+                writeln!(
+                    out,
+                    "INSERT INTO {} ({}) VALUES ({});",
+                    quoted_table,
+                    col_names,
+                    values.join(", ")
+                )?;
+                Ok(())
+            },
         )?;
-        count += 1;
+        out.flush()?;
+        Ok(count)
+    })
+}
+
+fn row_fetch<'a>(
+    table: &'a str,
+    columns: &'a [Column],
+    order_by: Option<(&'a str, bool)>,
+    where_clause: &'a str,
+    where_params: &'a [rusqlite::types::Value],
+) -> crate::db::RowFetch<'a> {
+    crate::db::RowFetch {
+        table,
+        columns,
+        offset: 0,
+        limit: i64::MAX,
+        order_by,
+        where_clause,
+        where_params,
     }
-    Ok(count)
+}
+
+static NEXT_EXPORT_ID: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_export(
+    path: &Path,
+    write: impl FnOnce(File) -> anyhow::Result<u64>,
+) -> anyhow::Result<u64> {
+    let temporary = temporary_export_path(path);
+    let result = File::create(&temporary)
+        .map_err(anyhow::Error::from)
+        .and_then(write);
+    match result {
+        Ok(count) => {
+            std::fs::rename(&temporary, path)?;
+            Ok(count)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+fn temporary_export_path(path: &Path) -> PathBuf {
+    let id = NEXT_EXPORT_ID.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{file_name}.{}-{id}.tmp", std::process::id()))
 }
 
 fn val_to_str(v: &SqlValue) -> String {
@@ -175,13 +191,15 @@ fn val_to_str(v: &SqlValue) -> String {
     }
 }
 
-fn val_to_json(v: &SqlValue) -> String {
+fn val_to_json(v: &SqlValue) -> serde_json::Value {
     match v {
-        SqlValue::Null => "null".to_string(),
-        SqlValue::Integer(n) => n.to_string(),
-        SqlValue::Real(f) => f.to_string(),
-        SqlValue::Text(s) => serde_json::Value::String(s.clone()).to_string(),
-        SqlValue::Blob(_) => "null".to_string(),
+        SqlValue::Null => serde_json::Value::Null,
+        SqlValue::Integer(n) => (*n).into(),
+        SqlValue::Real(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        SqlValue::Text(s) => serde_json::Value::String(s.clone()),
+        SqlValue::Blob(_) => serde_json::Value::Null,
     }
 }
 
@@ -225,6 +243,8 @@ mod tests {
             not_null: false,
             default_value: None,
             is_pk: false,
+            pk_position: 0,
+            writable: true,
         }
     }
 

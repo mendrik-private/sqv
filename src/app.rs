@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use ratatui::layout::Rect;
 use rusqlite::OptionalExtension;
@@ -40,6 +43,7 @@ pub enum FocusPane {
     Grid,
 }
 
+#[derive(Debug, Clone)]
 pub struct JumpFrame {
     pub table: String,
     pub rowid: i64,
@@ -74,19 +78,9 @@ pub struct UndoFrame {
 
 #[derive(Debug, Clone)]
 pub enum ConfirmKind {
-    DeleteRow {
-        table: String,
-        rowid: i64,
-    },
-    DeleteSelectedRows {
-        table: String,
-        row_offsets: Vec<i64>,
-        sort: Option<(String, bool)>,
-        filter: crate::filter::FilterSet,
-    },
-    ClearTable {
-        table: String,
-    },
+    DeleteRow { table: String, rowid: i64 },
+    DeleteSelectedRows { table: String, rowids: Vec<i64> },
+    ClearTable { table: String },
 }
 
 pub struct PendingConfirm {
@@ -102,6 +96,7 @@ struct GridScrollbarDrag {
 
 type GridFetchResult = (
     Vec<Vec<SqlValue>>,
+    Vec<Option<i64>>,
     i64,
     Vec<Vec<String>>,
     Vec<Vec<SqlValue>>,
@@ -117,6 +112,7 @@ struct GridDataReadyPayload {
     enumerated_values: Vec<Vec<String>>,
     width_sample_rows: Vec<Vec<SqlValue>>,
     rows: Vec<Vec<SqlValue>>,
+    rowids: Vec<Option<i64>>,
     total_rows: i64,
 }
 
@@ -157,9 +153,13 @@ pub struct App {
     grid_scrollbar_drag: Option<GridScrollbarDrag>,
     pool: Arc<DbPool>,
     tx: UnboundedSender<Message>,
-    pub last_own_write_at: Option<std::time::Instant>,
     pub file_check_in_flight: bool,
     pub pending_external_refresh: bool,
+    file_change_pending: bool,
+    grid_request_serial: Arc<AtomicU64>,
+    navigation_request_serial: u64,
+    write_in_flight: bool,
+    popup_request_serial: u64,
 }
 
 #[allow(dead_code)]
@@ -176,19 +176,28 @@ pub enum Message {
     NextTab,
     PrevTab,
     GridDataReady {
+        request_id: u64,
         table: String,
         columns: Vec<Column>,
         fk_cols: Vec<bool>,
         enumerated_values: Vec<Vec<String>>,
         width_sample_rows: Vec<Vec<SqlValue>>,
         rows: Vec<Vec<SqlValue>>,
+        rowids: Vec<Option<i64>>,
         total_rows: i64,
     },
     WindowReady {
+        request_id: u64,
         table: String,
         offset: i64,
         rows: Vec<Vec<SqlValue>>,
+        rowids: Vec<Option<i64>>,
         total_rows: i64,
+    },
+    GridReadFailed {
+        request_id: u64,
+        table: String,
+        error: String,
     },
     ScrollDown(usize),
     ScrollUp(usize),
@@ -215,15 +224,32 @@ pub enum Message {
         original: SqlValue,
     },
     EditFailed(String),
-    DistinctCountReady {
-        col: String,
-        count: i64,
+    DistinctValuesReady {
+        request_id: u64,
+        table: String,
+        rowid: i64,
+        col: Column,
+        original: SqlValue,
         values: Vec<String>,
+    },
+    DistinctValuesFailed {
+        request_id: u64,
+        table: String,
+        rowid: i64,
+        col: Column,
+        original: SqlValue,
+        error: String,
     },
     JumpToFk,
     FkRowsReady {
+        request_id: u64,
         target_table: String,
         rows: Vec<Vec<SqlValue>>,
+    },
+    FkRowsFailed {
+        request_id: u64,
+        target_table: String,
+        error: String,
     },
     JumpBack,
     JumpToTargetRow {
@@ -234,8 +260,19 @@ pub enum Message {
     CycleSort,
     JumpToLetter(char),
     JumpToSortedOffset {
+        request_id: u64,
         table: String,
         offset: i64,
+    },
+    FkJumpReady {
+        request_id: u64,
+        frame: JumpFrame,
+        table: String,
+        rowid: i64,
+    },
+    NavigationFailed {
+        request_id: u64,
+        error: String,
     },
     OpenFilterPopup,
     ApplyFilter,
@@ -252,10 +289,19 @@ pub enum Message {
     RowDeleted {
         table: String,
         rowid: i64,
+        cols: Vec<(String, SqlValue)>,
     },
     RowsDeleted {
         table: String,
         count: usize,
+    },
+    UndoCompleted {
+        table: String,
+        message: String,
+    },
+    UndoFailed {
+        frame: UndoFrame,
+        error: String,
     },
     OpenCommandPalette,
     OpenHelp,
@@ -265,14 +311,28 @@ pub enum Message {
         path: String,
         count: u64,
     },
+    ExportFailed(String),
     ReloadSchema,
     SchemaReady(Schema),
+    SchemaLoadFailed {
+        external: bool,
+        error: String,
+    },
     CopyCell,
     CopyRowJson,
     FileChanged,
     ExternalRefresh(Schema),
     OpenFind,
-    FindReady(Vec<Vec<SqlValue>>),
+    FindReady {
+        request_id: u64,
+        table: String,
+        rows: Vec<Vec<SqlValue>>,
+    },
+    FindFailed {
+        request_id: u64,
+        table: String,
+        error: String,
+    },
     CommitFind,
 }
 
@@ -320,9 +380,13 @@ impl App {
             grid_scrollbar_drag: None,
             pool,
             tx,
-            last_own_write_at: None,
             file_check_in_flight: false,
             pending_external_refresh: false,
+            file_change_pending: false,
+            grid_request_serial: Arc::new(AtomicU64::new(0)),
+            navigation_request_serial: 0,
+            write_in_flight: false,
+            popup_request_serial: 0,
         }
     }
 
@@ -386,20 +450,26 @@ impl App {
             Message::NextTab => self.next_tab(),
             Message::PrevTab => self.prev_tab(),
             Message::GridDataReady {
+                request_id,
                 table,
                 columns,
                 fk_cols,
                 enumerated_values,
                 width_sample_rows,
                 rows,
+                rowids,
                 total_rows,
             } => {
+                if request_id != self.grid_request_serial.load(Ordering::Acquire) {
+                    return;
+                }
                 self.on_grid_data_ready(GridDataReadyPayload {
                     columns,
                     fk_cols,
                     enumerated_values,
                     width_sample_rows,
                     rows,
+                    rowids,
                     table: table.clone(),
                     total_rows,
                 });
@@ -411,18 +481,24 @@ impl App {
                 }
             }
             Message::WindowReady {
+                request_id,
                 table,
                 offset,
                 rows,
+                rowids,
                 total_rows,
             } => {
+                if request_id != self.grid_request_serial.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(ref mut grid) = self.grid {
                     if grid.table_name == table {
+                        let fetch_was_queued = grid.needs_fetch;
                         grid.window.offset = offset;
                         grid.window.rows = rows;
+                        grid.window.rowids = rowids;
                         grid.window.total_rows = total_rows;
                         grid.window.fetch_in_flight = false;
-                        grid.needs_fetch = false;
                         if total_rows > 0 {
                             let max_row = (total_rows - 1) as usize;
                             if grid.focused_row > max_row {
@@ -436,9 +512,25 @@ impl App {
                         if grid.viewport_start > max_start {
                             grid.viewport_start = max_start;
                         }
+                        grid.needs_fetch =
+                            fetch_was_queued && grid.window.needs_prefetch(grid.focused_row as i64);
                     }
                 }
                 self.dirty = true;
+            }
+            Message::GridReadFailed {
+                request_id,
+                table,
+                error,
+            } => {
+                if request_id == self.grid_request_serial.load(Ordering::Acquire) {
+                    if let Some(grid) = self.grid.as_mut().filter(|grid| grid.table_name == table) {
+                        grid.window.fetch_in_flight = false;
+                        grid.needs_fetch = false;
+                    }
+                    self.toast.push(error, ToastKind::Error);
+                    self.dirty = true;
+                }
             }
             Message::ScrollDown(n) => {
                 self.scroll_grid_down(n);
@@ -585,6 +677,7 @@ impl App {
                     self.toast.push("Read-only database", ToastKind::Error);
                     return;
                 }
+                self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
                 if let Some(FocusedCellContext {
                     col,
                     table_name,
@@ -625,6 +718,8 @@ impl App {
                             );
                             self.popup = Some(PopupKind::FkPicker(picker_state));
                             self.mode = AppMode::Edit;
+                            self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
+                            let request_id = self.popup_request_serial;
 
                             let pool = Arc::clone(&self.pool);
                             let tx = self.tx.clone();
@@ -638,12 +733,13 @@ impl App {
                                         let conn = pool.get()?;
                                         let col_list = std::iter::once(&to_col)
                                             .chain(disp_cols.iter())
-                                            .map(|c| format!("\"{}\"", c))
+                                            .map(|c| db::query::quote_identifier(c))
                                             .collect::<Vec<_>>()
                                             .join(", ");
                                         let sql = format!(
-                                            "SELECT {} FROM \"{}\" LIMIT 200",
-                                            col_list, to_table_c
+                                            "SELECT {} FROM {} LIMIT 200",
+                                            col_list,
+                                            db::query::quote_identifier(&to_table_c)
                                         );
                                         let mut stmt = conn.prepare(&sql)?;
                                         let col_count = 1 + disp_cols.len();
@@ -680,11 +776,28 @@ impl App {
                                     },
                                 )
                                 .await;
-                                if let Ok(Ok(rows)) = result {
-                                    let _ = tx.send(Message::FkRowsReady {
-                                        target_table: to_table,
-                                        rows,
-                                    });
+                                match result {
+                                    Ok(Ok(rows)) => {
+                                        let _ = tx.send(Message::FkRowsReady {
+                                            request_id,
+                                            target_table: to_table,
+                                            rows,
+                                        });
+                                    }
+                                    Ok(Err(error)) => {
+                                        let _ = tx.send(Message::FkRowsFailed {
+                                            request_id,
+                                            target_table: to_table,
+                                            error: error.to_string(),
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = tx.send(Message::FkRowsFailed {
+                                            request_id,
+                                            target_table: to_table,
+                                            error: error.to_string(),
+                                        });
+                                    }
                                 }
                             });
 
@@ -722,54 +835,75 @@ impl App {
                             col.name,
                             original,
                         )));
+                    } else if matches!(&original, SqlValue::Blob(_))
+                        || matches!(affinity(&col.col_type), ColAffinity::Blob)
+                    {
+                        self.open_text_editor(
+                            table_name,
+                            actual_rowid,
+                            col.name,
+                            col.col_type,
+                            original,
+                        );
                     } else {
-                        let distinct_values = match self.pool.get() {
-                            Ok(conn) => match db::load_distinct_values(
-                                &conn,
-                                &table_name,
-                                &col.name,
-                                VALUE_PICKER_DISTINCT_LIMIT + 1,
-                            ) {
-                                Ok(values) => Some(values),
-                                Err(err) => {
-                                    self.toast.push(
-                                        format!("Distinct lookup failed: {}", err),
-                                        ToastKind::Error,
-                                    );
-                                    None
+                        self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
+                        let request_id = self.popup_request_serial;
+                        let pool = Arc::clone(&self.pool);
+                        let tx = self.tx.clone();
+                        let response_table = table_name.clone();
+                        let response_col = col.clone();
+                        let response_original = original.clone();
+                        tokio::task::spawn(async move {
+                            let query_table = table_name.clone();
+                            let query_column = col.name.clone();
+                            let result = tokio::task::spawn_blocking(
+                                move || -> anyhow::Result<Vec<String>> {
+                                    let conn = pool.get()?;
+                                    db::load_distinct_values(
+                                        &conn,
+                                        &query_table,
+                                        &query_column,
+                                        VALUE_PICKER_DISTINCT_LIMIT + 1,
+                                    )
+                                },
+                            )
+                            .await;
+                            match result {
+                                Ok(Ok(values)) => {
+                                    let _ = tx.send(Message::DistinctValuesReady {
+                                        request_id,
+                                        table: response_table,
+                                        rowid: actual_rowid,
+                                        col: response_col,
+                                        original: response_original,
+                                        values,
+                                    });
                                 }
-                            },
-                            Err(err) => {
-                                self.toast.push(
-                                    format!("DB connection failed: {}", err),
-                                    ToastKind::Error,
-                                );
-                                None
+                                Ok(Err(error)) => {
+                                    let _ = tx.send(Message::DistinctValuesFailed {
+                                        request_id,
+                                        table: response_table,
+                                        rowid: actual_rowid,
+                                        col: response_col,
+                                        original: response_original,
+                                        error: error.to_string(),
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(Message::DistinctValuesFailed {
+                                        request_id,
+                                        table: response_table,
+                                        rowid: actual_rowid,
+                                        col: response_col,
+                                        original: response_original,
+                                        error: error.to_string(),
+                                    });
+                                }
                             }
-                        };
-
-                        if let Some(values) =
-                            distinct_values.filter(|values| should_use_value_picker(values))
-                        {
-                            self.popup = Some(PopupKind::ValuePicker(
-                                crate::ui::popup::ValuePickerState::new(
-                                    table_name,
-                                    actual_rowid,
-                                    col.name.clone(),
-                                    col.col_type.clone(),
-                                    values,
-                                    original,
-                                ),
-                            ));
-                        } else {
-                            self.open_text_editor(
-                                table_name,
-                                actual_rowid,
-                                col.name,
-                                col.col_type,
-                                original,
-                            );
-                        }
+                        });
+                        self.toast.push("Loading distinct values", ToastKind::Info);
+                        self.dirty = true;
+                        return;
                     }
                     self.mode = AppMode::Edit;
                 }
@@ -822,35 +956,32 @@ impl App {
                 self.dirty = true;
             }
             Message::ClosePopup => {
-                self.popup = None;
-                self.mode = AppMode::Browse;
-                if let Some(ref mut grid) = self.grid {
-                    Self::clamp_grid_viewport(grid);
-                }
-                if self.pending_external_refresh {
-                    self.pending_external_refresh = false;
-                    if let Some(ref mut grid) = self.grid {
-                        if !grid.window.fetch_in_flight {
-                            grid.needs_fetch = true;
-                        }
-                    }
-                }
+                self.finish_popup();
                 self.dirty = true;
             }
             Message::CommitEdit => {
                 if self.readonly {
                     self.toast.push("Read-only database", ToastKind::Error);
-                    self.popup = None;
-                    self.mode = AppMode::Browse;
+                    self.finish_popup();
                     self.dirty = true;
                     return;
+                }
+                if let Some(PopupKind::TextEditor(state)) = self.popup.as_ref() {
+                    if !state.valid {
+                        self.toast.push(
+                            format!("Invalid value for {}", state.col_type),
+                            ToastKind::Error,
+                        );
+                        self.dirty = true;
+                        return;
+                    }
                 }
                 let write_info = self.popup.as_ref().and_then(|p| match p {
                     PopupKind::TextEditor(s) => Some((
                         s.table.clone(),
                         s.col_name.clone(),
                         s.rowid,
-                        s.as_sql_value(),
+                        s.as_sql_value().ok()?,
                         s.original.clone(),
                     )),
                     PopupKind::ValuePicker(s) => s.selected_sql_value().map(|v| {
@@ -905,32 +1036,28 @@ impl App {
                 col,
                 original,
             } => {
+                self.write_in_flight = false;
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
                     grid.window.rows.clear();
-                    if !grid.window.fetch_in_flight {
-                        grid.window.fetch_in_flight = true;
-                        let (off, lim) = grid.window.fetch_params(grid.focused_row as i64);
-                        let sort = grid.sort.as_ref().and_then(|s| {
-                            grid.columns
-                                .get(s.col_idx)
-                                .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
-                        });
-                        Some((
-                            grid.table_name.clone(),
-                            grid.columns.clone(),
-                            sort,
-                            off,
-                            lim,
-                        ))
-                    } else {
-                        grid.needs_fetch = true;
-                        None
-                    }
+                    grid.window.fetch_in_flight = true;
+                    grid.needs_fetch = false;
+                    let (off, lim) = grid.window.fetch_params(grid.focused_row as i64);
+                    let sort = grid.sort.as_ref().and_then(|s| {
+                        grid.columns
+                            .get(s.col_idx)
+                            .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
+                    });
+                    Some((
+                        grid.table_name.clone(),
+                        grid.columns.clone(),
+                        sort,
+                        off,
+                        lim,
+                    ))
                 } else {
                     None
                 };
-                self.popup = None;
-                self.mode = AppMode::Browse;
+                let schema_refreshed = self.finish_popup();
                 self.undo_stack.push(UndoFrame {
                     op: UndoOp::Update,
                     table,
@@ -940,23 +1067,114 @@ impl App {
                 if self.undo_stack.len() > 100 {
                     self.undo_stack.remove(0);
                 }
-                self.last_own_write_at = Some(std::time::Instant::now());
-                if let Some((table, cols, sort, off, lim)) = maybe_fetch {
-                    self.spawn_window_fetch(&table, &cols, sort, off, lim);
+                if !schema_refreshed {
+                    if let Some((table, cols, sort, off, lim)) = maybe_fetch {
+                        self.spawn_window_fetch(&table, &cols, sort, off, lim);
+                    }
                 }
                 self.toast.push("Cell updated", ToastKind::Success);
                 self.dirty = true;
             }
             Message::EditFailed(err) => {
+                self.write_in_flight = false;
                 self.toast.push(format!("Error: {}", err), ToastKind::Error);
                 self.dirty = true;
             }
-            Message::DistinctCountReady { .. } => {}
-            Message::FkRowsReady { target_table, rows } => {
+            Message::DistinctValuesReady {
+                request_id,
+                table,
+                rowid,
+                col,
+                original,
+                values,
+            } => {
+                if request_id != self.popup_request_serial {
+                    return;
+                }
+                let still_active = self.grid.as_ref().is_some_and(|grid| {
+                    grid.table_name == table
+                        && grid.window.get_rowid(grid.focused_row as i64) == Some(rowid)
+                        && grid
+                            .columns
+                            .get(grid.focused_col)
+                            .is_some_and(|column| column.name == col.name)
+                });
+                if still_active && should_use_value_picker(&values) {
+                    self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
+                    self.popup = Some(PopupKind::ValuePicker(
+                        crate::ui::popup::ValuePickerState::new(
+                            table,
+                            rowid,
+                            col.name,
+                            col.col_type,
+                            values,
+                            original,
+                        ),
+                    ));
+                    self.mode = AppMode::Edit;
+                } else if still_active {
+                    self.open_text_editor(table, rowid, col.name, col.col_type, original);
+                    self.mode = AppMode::Edit;
+                }
+                self.dirty = true;
+            }
+            Message::DistinctValuesFailed {
+                request_id,
+                table,
+                rowid,
+                col,
+                original,
+                error,
+            } => {
+                if request_id != self.popup_request_serial {
+                    return;
+                }
+                if self.grid.as_ref().is_some_and(|grid| {
+                    grid.table_name == table
+                        && grid.window.get_rowid(grid.focused_row as i64) == Some(rowid)
+                        && grid
+                            .columns
+                            .get(grid.focused_col)
+                            .is_some_and(|column| column.name == col.name)
+                }) {
+                    self.toast
+                        .push(format!("Distinct lookup failed: {error}"), ToastKind::Error);
+                    self.open_text_editor(table, rowid, col.name, col.col_type, original);
+                    self.mode = AppMode::Edit;
+                }
+                self.dirty = true;
+            }
+            Message::FkRowsReady {
+                request_id,
+                target_table,
+                rows,
+            } => {
+                if request_id != self.popup_request_serial {
+                    return;
+                }
                 if let Some(PopupKind::FkPicker(ref mut state)) = self.popup {
                     if state.target_table == target_table {
                         state.rows = rows;
                         state.loading = false;
+                    }
+                }
+                self.dirty = true;
+            }
+            Message::FkRowsFailed {
+                request_id,
+                target_table,
+                error,
+            } => {
+                if request_id != self.popup_request_serial {
+                    return;
+                }
+                if let Some(PopupKind::FkPicker(state)) = &mut self.popup {
+                    if state.target_table == target_table {
+                        state.loading = false;
+                        self.toast.push(
+                            format!("Foreign-key lookup failed: {error}"),
+                            ToastKind::Error,
+                        );
                     }
                 }
                 self.dirty = true;
@@ -973,49 +1191,32 @@ impl App {
                         .foreign_keys
                         .iter()
                         .find(|fk| fk.from_col == col.name)?;
-                    let abs_row = g.focused_row as i64;
-                    let cell_val = g.window.get_row(abs_row)?.get(col_idx)?.clone();
-                    let sort = g.sort.as_ref().and_then(|s| {
-                        g.columns
-                            .get(s.col_idx)
-                            .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
-                    });
+                    let source_rowid = g.window.get_rowid(g.focused_row as i64)?;
+                    let cell_val = g
+                        .window
+                        .get_row(g.focused_row as i64)?
+                        .get(col_idx)?
+                        .clone();
                     Some((
                         g.table_name.clone(),
-                        abs_row,
                         col_idx,
-                        sort,
-                        g.filter.clone(),
                         fk.to_table.clone(),
                         fk.to_col.clone(),
                         cell_val,
+                        source_rowid,
                     ))
                 });
 
-                if let Some((
-                    from_table,
-                    abs_row,
-                    from_col,
-                    from_sort,
-                    from_filter,
-                    to_table,
-                    to_col,
-                    cell_val,
-                )) = jump_info
+                if let Some((from_table, from_col, to_table, to_col, cell_val, source_rowid)) =
+                    jump_info
                 {
-                    let Some(source_rowid) =
-                        self.resolve_rowid_at_offset(&from_table, abs_row, from_sort, from_filter)
-                    else {
-                        self.dirty = true;
-                        return;
-                    };
                     let frame = JumpFrame {
                         table: from_table,
                         rowid: source_rowid,
                         col: from_col,
                     };
-                    self.jump_stack.push(frame);
-                    let _ = self.tx.send(Message::OpenTable(to_table.clone()));
+                    self.navigation_request_serial = self.navigation_request_serial.wrapping_add(1);
+                    let request_id = self.navigation_request_serial;
                     let pool = Arc::clone(&self.pool);
                     let tx = self.tx.clone();
                     tokio::task::spawn(async move {
@@ -1028,13 +1229,26 @@ impl App {
                                     SqlValue::Integer(n) => rusqlite::types::Value::Integer(*n),
                                     SqlValue::Text(s) => rusqlite::types::Value::Text(s.clone()),
                                     SqlValue::Real(f) => rusqlite::types::Value::Real(*f),
-                                    _ => rusqlite::types::Value::Null,
+                                    SqlValue::Blob(bytes) => {
+                                        rusqlite::types::Value::Blob(bytes.clone())
+                                    }
+                                    SqlValue::Null => rusqlite::types::Value::Null,
+                                };
+                                let columns = crate::db::load_columns(&conn, &to_table_c)?;
+                                let identity =
+                                    crate::db::load_row_identity(&conn, &to_table_c, &columns)?;
+                                let Some(crate::db::schema::RowIdentity::RowidAlias(alias)) =
+                                    identity
+                                else {
+                                    return Ok(None);
                                 };
                                 let rowid: Option<i64> = conn
                                     .query_row(
                                         &format!(
-                                            "SELECT rowid FROM \"{}\" WHERE \"{}\" = ?1 LIMIT 1",
-                                            to_table_c, to_col_c
+                                            "SELECT {} FROM {} WHERE {} = ?1 LIMIT 1",
+                                            db::query::quote_identifier(&alias),
+                                            db::query::quote_identifier(&to_table_c),
+                                            db::query::quote_identifier(&to_col_c)
                                         ),
                                         rusqlite::params![val],
                                         |row| row.get(0),
@@ -1043,19 +1257,69 @@ impl App {
                                 Ok(rowid)
                             })
                             .await;
-                        if let Ok(Ok(Some(rowid))) = result {
-                            let _ = tx.send(Message::JumpToTargetRow {
-                                table: to_table,
-                                rowid,
-                                col: None,
-                            });
+                        match result {
+                            Ok(Ok(Some(rowid))) => {
+                                let _ = tx.send(Message::FkJumpReady {
+                                    request_id,
+                                    frame,
+                                    table: to_table,
+                                    rowid,
+                                });
+                            }
+                            Ok(Ok(None)) => {
+                                let _ = tx.send(Message::NavigationFailed {
+                                    request_id,
+                                    error: "Referenced row was not found or has no navigable rowid"
+                                        .to_string(),
+                                });
+                            }
+                            Ok(Err(error)) => {
+                                let _ = tx.send(Message::NavigationFailed {
+                                    request_id,
+                                    error: error.to_string(),
+                                });
+                            }
+                            Err(error) => {
+                                let _ = tx.send(Message::NavigationFailed {
+                                    request_id,
+                                    error: error.to_string(),
+                                });
+                            }
                         }
                     });
                 }
                 self.dirty = true;
             }
-            Message::JumpToTargetRow { table, rowid, col } => self.jump_to_rowid(table, rowid, col),
+            Message::FkJumpReady {
+                request_id,
+                frame,
+                table,
+                rowid,
+            } => {
+                if request_id == self.navigation_request_serial {
+                    self.jump_stack.push(frame);
+                    self.pending_jump_target = Some(PendingJumpTarget {
+                        table: table.clone(),
+                        rowid,
+                        col: None,
+                    });
+                    self.open_table(table);
+                }
+                self.dirty = true;
+            }
+            Message::NavigationFailed { request_id, error } => {
+                if request_id == self.navigation_request_serial {
+                    self.toast
+                        .push(format!("Navigation failed: {error}"), ToastKind::Error);
+                    self.dirty = true;
+                }
+            }
+            Message::JumpToTargetRow { table, rowid, col } => {
+                self.navigation_request_serial = self.navigation_request_serial.wrapping_add(1);
+                self.jump_to_rowid(table, rowid, col)
+            }
             Message::CycleSort => {
+                self.navigation_request_serial = self.navigation_request_serial.wrapping_add(1);
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
                     let col_idx = grid.focused_col;
                     grid.sort = match &grid.sort {
@@ -1079,25 +1343,21 @@ impl App {
                     grid.focused_row = 0;
                     grid.window.rows.clear();
                     grid.window.offset = 0;
-                    if !grid.window.fetch_in_flight {
-                        grid.window.fetch_in_flight = true;
-                        let (off, lim) = grid.window.fetch_params(0);
-                        let sort = grid.sort.as_ref().and_then(|s| {
-                            grid.columns
-                                .get(s.col_idx)
-                                .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
-                        });
-                        Some((
-                            grid.table_name.clone(),
-                            grid.columns.clone(),
-                            sort,
-                            off,
-                            lim,
-                        ))
-                    } else {
-                        grid.needs_fetch = true;
-                        None
-                    }
+                    grid.window.fetch_in_flight = true;
+                    grid.needs_fetch = false;
+                    let (off, lim) = grid.window.fetch_params(0);
+                    let sort = grid.sort.as_ref().and_then(|s| {
+                        grid.columns
+                            .get(s.col_idx)
+                            .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
+                    });
+                    Some((
+                        grid.table_name.clone(),
+                        grid.columns.clone(),
+                        sort,
+                        off,
+                        lim,
+                    ))
                 } else {
                     None
                 };
@@ -1106,7 +1366,14 @@ impl App {
                 }
                 self.dirty = true;
             }
-            Message::JumpToSortedOffset { table, offset } => {
+            Message::JumpToSortedOffset {
+                request_id,
+                table,
+                offset,
+            } => {
+                if request_id != self.navigation_request_serial {
+                    return;
+                }
                 let maybe_fetch = if let Some(ref mut grid) = self.grid {
                     if grid.table_name == table {
                         grid.commit_row_selection();
@@ -1151,56 +1418,47 @@ impl App {
                             let table = grid.table_name.clone();
                             let col_name = col.name.clone();
                             let dir_asc = sort.direction == SortDir::Asc;
+                            let filter = grid.filter.clone();
                             let letter_uc = letter.to_uppercase().next().unwrap_or(letter);
                             let table_inner = table.clone();
+                            self.navigation_request_serial =
+                                self.navigation_request_serial.wrapping_add(1);
+                            let request_id = self.navigation_request_serial;
                             tokio::task::spawn(async move {
-                                let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
-                                    let conn = pool.get()?;
-                                    let offset: i64 = if dir_asc {
-                                        if letter == '#' {
-                                            conn.query_row(
-                                                &format!(
-                                                    "SELECT COUNT(*) FROM \"{}\" WHERE \"{}\" IS NULL",
-                                                    table_inner, col_name
-                                                ),
-                                                [],
-                                                |row| row.get(0),
-                                            )?
-                                        } else {
-                                            conn.query_row(
-                                                &format!(
-                                                    "SELECT COUNT(*) FROM \"{}\" WHERE \"{}\" IS NULL OR \"{}\" < ?1",
-                                                    table_inner, col_name, col_name
-                                                ),
-                                                rusqlite::params![letter_uc.to_string()],
-                                                |row| row.get(0),
-                                            )?
-                                        }
-                                    } else if letter == '#' {
-                                        conn.query_row(
-                                            &format!(
-                                                "SELECT COUNT(*) FROM \"{}\" WHERE \"{}\" IS NOT NULL AND \"{}\" NOT GLOB '[0-9]*'",
-                                                table_inner, col_name, col_name
-                                            ),
-                                            [],
-                                            |row| row.get(0),
-                                        )?
-                                    } else {
-                                        let pattern = format!("{}%", letter_uc);
-                                        conn.query_row(
-                                            &format!(
-                                                "SELECT COUNT(*) FROM \"{}\" WHERE \"{}\" > ?1 AND \"{}\" NOT LIKE ?2",
-                                                table_inner, col_name, col_name
-                                            ),
-                                            rusqlite::params![letter_uc.to_string(), pattern],
-                                            |row| row.get(0),
-                                        )?
-                                    };
-                                    Ok(offset)
-                                })
-                                .await;
-                                if let Ok(Ok(offset)) = result {
-                                    let _ = tx.send(Message::JumpToSortedOffset { table, offset });
+                                let result =
+                                    tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+                                        let conn = pool.get()?;
+                                        count_rows_before_letter(
+                                            &conn,
+                                            &table_inner,
+                                            &col_name,
+                                            dir_asc,
+                                            letter,
+                                            letter_uc,
+                                            &filter,
+                                        )
+                                    })
+                                    .await;
+                                match result {
+                                    Ok(Ok(offset)) => {
+                                        let _ = tx.send(Message::JumpToSortedOffset {
+                                            request_id,
+                                            table,
+                                            offset,
+                                        });
+                                    }
+                                    Ok(Err(error)) => {
+                                        let _ = tx.send(Message::NavigationFailed {
+                                            request_id,
+                                            error: error.to_string(),
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = tx.send(Message::NavigationFailed {
+                                            request_id,
+                                            error: error.to_string(),
+                                        });
+                                    }
                                 }
                             });
                         }
@@ -1220,6 +1478,7 @@ impl App {
                 self.dirty = true;
             }
             Message::OpenFilterPopup => {
+                self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
                 if let Some(ref grid) = self.grid {
                     let col_idx = grid.focused_col;
                     if let Some(col) = grid.columns.get(col_idx) {
@@ -1240,6 +1499,7 @@ impl App {
                 self.dirty = true;
             }
             Message::ApplyFilter => {
+                self.navigation_request_serial = self.navigation_request_serial.wrapping_add(1);
                 if let Some(PopupKind::FilterPopup(state)) = self.popup.take() {
                     if let Some(ref mut grid) = self.grid {
                         grid.filter
@@ -1260,14 +1520,18 @@ impl App {
                         grid.window.fetch_in_flight = true;
                         let filter = grid.filter.clone();
                         let db_path = self.db_path.clone();
-                        let _ = crate::filter::save_filter(&filter, &db_path, &table);
+                        if let Err(error) = crate::filter::save_filter(&filter, &db_path, &table) {
+                            self.toast
+                                .push(format!("Could not save filter: {error}"), ToastKind::Error);
+                        }
                         self.spawn_window_fetch_with_filter(&table, &cols, sort, off, lim, filter);
                     }
-                    self.mode = AppMode::Browse;
+                    self.finish_popup();
                 }
                 self.dirty = true;
             }
             Message::ClearFilters => {
+                self.navigation_request_serial = self.navigation_request_serial.wrapping_add(1);
                 if let Some(ref mut grid) = self.grid {
                     grid.filter = crate::filter::FilterSet::default();
                     grid.viewport_start = 0;
@@ -1285,7 +1549,13 @@ impl App {
                     grid.window.fetch_in_flight = true;
                     let db_path = self.db_path.clone();
                     let empty_filter = crate::filter::FilterSet::default();
-                    let _ = crate::filter::save_filter(&empty_filter, &db_path, &table);
+                    if let Err(error) = crate::filter::save_filter(&empty_filter, &db_path, &table)
+                    {
+                        self.toast.push(
+                            format!("Could not clear saved filter: {error}"),
+                            ToastKind::Error,
+                        );
+                    }
                     self.spawn_window_fetch_with_filter(
                         &table,
                         &cols,
@@ -1295,8 +1565,7 @@ impl App {
                         empty_filter,
                     );
                 }
-                self.popup = None;
-                self.mode = AppMode::Browse;
+                self.finish_popup();
                 self.dirty = true;
             }
             Message::InsertRow => {
@@ -1304,6 +1573,25 @@ impl App {
                     self.toast.push("Read-only database", ToastKind::Error);
                     return;
                 }
+                let insert_is_undoable = self.grid.as_ref().is_some_and(|grid| {
+                    self.schema
+                        .tables
+                        .iter()
+                        .find(|table| table.name == grid.table_name)
+                        .and_then(|table| table.row_identity.as_ref())
+                        .is_some_and(|identity| {
+                            matches!(identity, crate::db::schema::RowIdentity::RowidAlias(_))
+                        })
+                });
+                if !insert_is_undoable {
+                    self.toast.push(
+                        "This table has no rowid that can support insert undo",
+                        ToastKind::Error,
+                    );
+                    self.dirty = true;
+                    return;
+                }
+                self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
                 if let Some(ref mut grid) = self.grid {
                     let insert_position = if grid.window.total_rows <= 0 {
                         0
@@ -1331,6 +1619,12 @@ impl App {
                     self.toast.push("Read-only database", ToastKind::Error);
                     return;
                 }
+                if self.write_in_flight {
+                    self.toast
+                        .push("Insert is already running", ToastKind::Info);
+                    self.dirty = true;
+                    return;
+                }
                 let insert_spec = self.popup.as_ref().and_then(|popup| match popup {
                     PopupKind::InsertRow(state) => match state.build_insert_values() {
                         Ok(values) => Some((state.table.clone(), values)),
@@ -1342,6 +1636,7 @@ impl App {
                     _ => None,
                 });
                 if let Some((table, values)) = insert_spec {
+                    self.write_in_flight = true;
                     let pool = Arc::clone(&self.pool);
                     let tx = self.tx.clone();
                     let table_c = table.clone();
@@ -1368,9 +1663,8 @@ impl App {
                 self.dirty = true;
             }
             Message::RowInserted { table, rowid } => {
-                self.popup = None;
-                self.mode = AppMode::Browse;
-                self.last_own_write_at = Some(std::time::Instant::now());
+                self.write_in_flight = false;
+                self.grid_request_serial.fetch_add(1, Ordering::AcqRel);
                 if let Some(ref mut grid) = self.grid {
                     if grid.table_name == table {
                         self.undo_stack.push(UndoFrame {
@@ -1383,10 +1677,13 @@ impl App {
                             self.undo_stack.remove(0);
                         }
                         grid.window.rows.clear();
+                        grid.window.rowids.clear();
+                        grid.window.fetch_in_flight = false;
                         grid.window.total_rows += 1;
                         grid.needs_fetch = true;
                     }
                 }
+                self.finish_popup();
                 self.toast.push("Row inserted", ToastKind::Success);
                 self.dirty = true;
             }
@@ -1399,9 +1696,7 @@ impl App {
                     CurrentRow {
                         row_num: usize,
                         table: String,
-                        abs_row: i64,
-                        sort: Option<(String, bool)>,
-                        filter: crate::filter::FilterSet,
+                        rowid: i64,
                     },
                     SelectedRows {
                         table: String,
@@ -1441,9 +1736,7 @@ impl App {
                         RowSelection::None => Some(DeleteTarget::CurrentRow {
                             row_num: grid.focused_row + 1,
                             table,
-                            abs_row: grid.focused_row as i64,
-                            sort,
-                            filter: grid.filter.clone(),
+                            rowid: grid.window.get_rowid(grid.focused_row as i64)?,
                         }),
                     }
                 });
@@ -1453,16 +1746,8 @@ impl App {
                         DeleteTarget::CurrentRow {
                             row_num,
                             table,
-                            abs_row,
-                            sort,
-                            filter,
+                            rowid,
                         } => {
-                            let Some(rowid) =
-                                self.resolve_rowid_at_offset(&table, abs_row, sort, filter)
-                            else {
-                                self.dirty = true;
-                                return;
-                            };
                             let msg = format!("Delete row #{}? [y/n]", row_num);
                             self.pending_confirm = Some(PendingConfirm {
                                 message: msg,
@@ -1478,16 +1763,46 @@ impl App {
                             sort,
                             filter,
                         } => {
+                            let (where_clause, where_params) = match filter_to_sql(&filter) {
+                                Ok(predicate) => predicate,
+                                Err(error) => {
+                                    self.toast.push(error.to_string(), ToastKind::Error);
+                                    return;
+                                }
+                            };
+                            let conn = match self.pool.get() {
+                                Ok(conn) => conn,
+                                Err(error) => {
+                                    self.toast.push(error.to_string(), ToastKind::Error);
+                                    return;
+                                }
+                            };
+                            let rowids = match db::fetch_rowids_at_offsets(
+                                &conn,
+                                &table,
+                                &row_offsets,
+                                sort.as_ref().map(|(column, asc)| (column.as_str(), *asc)),
+                                &where_clause,
+                                &where_params,
+                            ) {
+                                Ok(rowids) if rowids.len() == count => rowids,
+                                Ok(_) => {
+                                    self.toast.push(
+                                        "Some selected rows no longer exist",
+                                        ToastKind::Error,
+                                    );
+                                    return;
+                                }
+                                Err(error) => {
+                                    self.toast.push(error.to_string(), ToastKind::Error);
+                                    return;
+                                }
+                            };
                             let noun = if count == 1 { "row" } else { "rows" };
                             let msg = format!("Delete {} selected {}? [y/n]", count, noun);
                             self.pending_confirm = Some(PendingConfirm {
                                 message: msg,
-                                kind: ConfirmKind::DeleteSelectedRows {
-                                    table,
-                                    row_offsets,
-                                    sort,
-                                    filter,
-                                },
+                                kind: ConfirmKind::DeleteSelectedRows { table, rowids },
                                 created: std::time::Instant::now(),
                                 timeout_secs: 5,
                             });
@@ -1516,7 +1831,14 @@ impl App {
                 self.dirty = true;
             }
             Message::ConfirmDelete => {
+                if self.write_in_flight {
+                    self.toast
+                        .push("A database write is already running", ToastKind::Info);
+                    self.dirty = true;
+                    return;
+                }
                 if let Some(confirm) = self.pending_confirm.take() {
+                    self.write_in_flight = true;
                     match confirm.kind {
                         ConfirmKind::DeleteRow { table, rowid } => {
                             let pool = Arc::clone(&self.pool);
@@ -1528,46 +1850,43 @@ impl App {
                                 .unwrap_or_default();
                             let table_c = table.clone();
                             tokio::task::spawn(async move {
-                                drop(columns);
                                 let tx_err = tx_ch.clone();
                                 let result =
                                     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                                         let conn = pool.get()?;
-                                        crate::db::write::delete_row(&conn, &table_c, rowid)?;
+                                        let cols = crate::db::write::delete_row_with_backup(
+                                            &conn, &table_c, &columns, rowid,
+                                        )?;
                                         let _ = tx_ch.send(Message::RowDeleted {
                                             table: table_c,
                                             rowid,
+                                            cols,
                                         });
                                         Ok(())
                                     })
                                     .await;
-                                if let Ok(Err(e)) = result {
-                                    let _ = tx_err.send(Message::EditFailed(e.to_string()));
+                                match result {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        let _ = tx_err.send(Message::EditFailed(error.to_string()));
+                                    }
+                                    Err(error) => {
+                                        let _ = tx_err.send(Message::EditFailed(error.to_string()));
+                                    }
                                 }
                             });
                         }
-                        ConfirmKind::DeleteSelectedRows {
-                            table,
-                            row_offsets,
-                            sort,
-                            filter,
-                        } => {
+                        ConfirmKind::DeleteSelectedRows { table, rowids } => {
                             let pool = Arc::clone(&self.pool);
                             let tx = self.tx.clone();
-                            let (where_clause, where_params) = filter_to_sql(&filter);
                             let table_c = table.clone();
                             tokio::task::spawn(async move {
                                 let tx_err = tx.clone();
                                 let result = tokio::task::spawn_blocking(
                                     move || -> anyhow::Result<usize> {
                                         let conn = pool.get()?;
-                                        crate::db::write::delete_rows_by_offsets(
-                                            &conn,
-                                            &table_c,
-                                            &row_offsets,
-                                            sort.as_ref().map(|(col, asc)| (col.as_str(), *asc)),
-                                            &where_clause,
-                                            &where_params,
+                                        crate::db::write::delete_rows_by_rowids(
+                                            &conn, &table_c, &rowids,
                                         )
                                     },
                                 )
@@ -1615,13 +1934,14 @@ impl App {
                 }
                 self.dirty = true;
             }
-            Message::RowDeleted { table, rowid } => {
-                self.last_own_write_at = Some(std::time::Instant::now());
+            Message::RowDeleted { table, rowid, cols } => {
+                self.write_in_flight = false;
+                self.grid_request_serial.fetch_add(1, Ordering::AcqRel);
                 self.undo_stack.push(UndoFrame {
                     op: UndoOp::Delete,
                     table: table.clone(),
                     rowid,
-                    cols: Vec::new(),
+                    cols,
                 });
                 if self.undo_stack.len() > 100 {
                     self.undo_stack.remove(0);
@@ -1630,6 +1950,8 @@ impl App {
                     if grid.table_name == table {
                         grid.clear_row_selection();
                         grid.window.rows.clear();
+                        grid.window.rowids.clear();
+                        grid.window.fetch_in_flight = false;
                         grid.window.total_rows = grid.window.total_rows.saturating_sub(1);
                         if grid.window.total_rows <= 0 {
                             grid.focused_row = 0;
@@ -1652,11 +1974,14 @@ impl App {
                 self.dirty = true;
             }
             Message::RowsDeleted { table, count } => {
-                self.last_own_write_at = Some(std::time::Instant::now());
+                self.write_in_flight = false;
+                self.grid_request_serial.fetch_add(1, Ordering::AcqRel);
                 if let Some(ref mut grid) = self.grid {
                     if grid.table_name == table {
                         grid.clear_row_selection();
                         grid.window.rows.clear();
+                        grid.window.rowids.clear();
+                        grid.window.fetch_in_flight = false;
                         grid.window.total_rows =
                             grid.window.total_rows.saturating_sub(count as i64);
                         if grid.window.total_rows <= 0 {
@@ -1689,120 +2014,110 @@ impl App {
                 self.dirty = true;
             }
             Message::UndoAction => {
-                if let Some(frame) = self.undo_stack.pop() {
-                    match frame.op {
-                        UndoOp::Update => {
-                            if self.readonly {
-                                self.toast.push("Read-only: cannot undo", ToastKind::Error);
-                                return;
-                            }
-                            let pool = Arc::clone(&self.pool);
-                            let tx = self.tx.clone();
-                            let table = frame.table.clone();
-                            let rowid = frame.rowid;
-                            let cols = frame.cols.clone();
-                            tokio::task::spawn(async move {
-                                let result =
-                                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                                        let conn = pool.get()?;
-                                        for (col_name, value) in &cols {
-                                            crate::db::write::commit_cell_edit(
-                                                &conn, &table, col_name, rowid, value,
-                                            )?;
-                                        }
-                                        Ok(())
-                                    })
-                                    .await;
-                                if let Ok(Err(e)) = result {
-                                    let _ = tx.send(Message::EditFailed(e.to_string()));
-                                }
-                            });
-                            let toast_msg = if frame.cols.len() == 1 {
-                                format!(
-                                    "Undo: reverted col \"{}\" on row {}",
-                                    frame.cols[0].0, frame.rowid
-                                )
-                            } else {
-                                format!(
-                                    "Undo: reverted {} cols on row {}",
-                                    frame.cols.len(),
-                                    frame.rowid
-                                )
-                            };
-                            self.toast.push(toast_msg, ToastKind::Info);
-                        }
-                        UndoOp::Insert => {
-                            let pool = Arc::clone(&self.pool);
-                            let tx = self.tx.clone();
-                            let table = frame.table.clone();
-                            let rowid = frame.rowid;
-                            tokio::task::spawn(async move {
-                                let result = tokio::task::spawn_blocking(move || {
-                                    let conn = pool.get()?;
-                                    crate::db::write::delete_row(&conn, &table, rowid)?;
-                                    Ok::<_, anyhow::Error>(())
-                                })
-                                .await;
-                                if let Ok(Err(e)) = result {
-                                    let _ = tx.send(Message::EditFailed(e.to_string()));
-                                }
-                            });
-                            self.toast.push(
-                                format!("Undo: deleted inserted row {}", frame.rowid),
-                                ToastKind::Info,
-                            );
-                        }
-                        UndoOp::Delete => {
-                            if frame.cols.is_empty() {
-                                self.toast.push(
-                                    "Undo: cannot restore deleted row (no backup)",
-                                    ToastKind::Error,
-                                );
-                                return;
-                            }
-                            let pool = Arc::clone(&self.pool);
-                            let tx = self.tx.clone();
-                            let table = frame.table.clone();
-                            let rowid = frame.rowid;
-                            let cols = frame.cols.clone();
-                            tokio::task::spawn(async move {
-                                let result =
-                                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                                        let conn = pool.get()?;
-                                        crate::db::write::reinsert_row(
-                                            &conn, &table, rowid, &cols,
-                                        )?;
-                                        Ok(())
-                                    })
-                                    .await;
-                                if let Ok(Err(e)) = result {
-                                    let _ = tx.send(Message::EditFailed(e.to_string()));
-                                }
-                            });
-                            self.toast.push(
-                                format!("Undo: restored deleted row {}", rowid),
-                                ToastKind::Info,
-                            );
-                        }
-                    }
-                    if let Some(ref mut grid) = self.grid {
-                        grid.window.rows.clear();
-                        grid.needs_fetch = true;
-                    }
-                    self.dirty = true;
-                } else {
+                if self.readonly {
+                    self.toast.push("Read-only: cannot undo", ToastKind::Error);
+                    return;
+                }
+                if self.write_in_flight {
+                    self.toast
+                        .push("A database write is already running", ToastKind::Info);
+                    return;
+                }
+                let Some(frame) = self.undo_stack.pop() else {
                     self.toast.push("Nothing to undo", ToastKind::Info);
                     self.dirty = true;
+                    return;
+                };
+                self.write_in_flight = true;
+                let pool = Arc::clone(&self.pool);
+                let tx = self.tx.clone();
+                let work = frame.clone();
+                tokio::task::spawn(async move {
+                    let failure_frame = frame.clone();
+                    let table = frame.table.clone();
+                    let message = match &frame.op {
+                        UndoOp::Update => format!("Undo: restored row {}", frame.rowid),
+                        UndoOp::Insert => format!("Undo: deleted inserted row {}", frame.rowid),
+                        UndoOp::Delete => format!("Undo: restored deleted row {}", frame.rowid),
+                    };
+                    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        let conn = pool.get()?;
+                        match work.op {
+                            UndoOp::Update => {
+                                for (column, value) in &work.cols {
+                                    crate::db::write::commit_cell_edit(
+                                        &conn,
+                                        &work.table,
+                                        column,
+                                        work.rowid,
+                                        value,
+                                    )?;
+                                }
+                            }
+                            UndoOp::Insert => {
+                                crate::db::write::delete_row(&conn, &work.table, work.rowid)?;
+                            }
+                            UndoOp::Delete => {
+                                crate::db::write::reinsert_row(
+                                    &conn,
+                                    &work.table,
+                                    work.rowid,
+                                    &work.cols,
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {
+                            let _ = tx.send(Message::UndoCompleted { table, message });
+                        }
+                        Ok(Err(error)) => {
+                            let _ = tx.send(Message::UndoFailed {
+                                frame: failure_frame,
+                                error: error.to_string(),
+                            });
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Message::UndoFailed {
+                                frame: failure_frame,
+                                error: error.to_string(),
+                            });
+                        }
+                    }
+                });
+                self.dirty = true;
+            }
+            Message::UndoCompleted { table, message } => {
+                self.write_in_flight = false;
+                self.grid_request_serial.fetch_add(1, Ordering::AcqRel);
+                if let Some(grid) = self.grid.as_mut().filter(|grid| grid.table_name == table) {
+                    grid.window.rows.clear();
+                    grid.window.rowids.clear();
+                    grid.window.fetch_in_flight = false;
+                    grid.needs_fetch = true;
                 }
+                self.toast.push(message, ToastKind::Info);
+                self.dirty = true;
+            }
+            Message::UndoFailed { frame, error } => {
+                self.write_in_flight = false;
+                self.undo_stack.push(frame);
+                self.toast
+                    .push(format!("Undo failed: {error}"), ToastKind::Error);
+                self.dirty = true;
             }
             Message::OpenCommandPalette => {
                 let table_names = self.schema.tables.iter().map(|t| t.name.clone()).collect();
                 let state = CommandPaletteState::new(table_names);
+                self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
                 self.popup = Some(PopupKind::CommandPalette(state));
                 self.mode = AppMode::Edit;
                 self.dirty = true;
             }
             Message::OpenHelp => {
+                self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
                 self.popup = Some(PopupKind::Help(HelpState::new()));
                 self.mode = AppMode::Edit;
                 self.dirty = true;
@@ -1822,6 +2137,11 @@ impl App {
                 );
                 self.dirty = true;
             }
+            Message::ExportFailed(error) => {
+                self.toast
+                    .push(format!("Export failed: {error}"), ToastKind::Error);
+                self.dirty = true;
+            }
             Message::ReloadSchema => {
                 let pool = Arc::clone(&self.pool);
                 let tx = self.tx.clone();
@@ -1831,16 +2151,43 @@ impl App {
                         crate::db::load_schema(&conn)
                     })
                     .await;
-                    if let Ok(Ok(schema)) = result {
-                        let _ = tx.send(Message::SchemaReady(schema));
+                    match result {
+                        Ok(Ok(schema)) => {
+                            let _ = tx.send(Message::SchemaReady(schema));
+                        }
+                        Ok(Err(error)) => {
+                            let _ = tx.send(Message::SchemaLoadFailed {
+                                external: false,
+                                error: error.to_string(),
+                            });
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Message::SchemaLoadFailed {
+                                external: false,
+                                error: error.to_string(),
+                            });
+                        }
                     }
                 });
                 self.dirty = true;
             }
             Message::SchemaReady(schema) => {
                 self.schema = schema;
+                self.refresh_active_grid_schema();
                 self.sidebar.tables_expanded = true;
                 self.toast.push("Schema reloaded", ToastKind::Success);
+                self.dirty = true;
+            }
+            Message::SchemaLoadFailed { external, error } => {
+                if external {
+                    self.file_check_in_flight = false;
+                    if self.file_change_pending {
+                        self.file_change_pending = false;
+                        let _ = self.tx.send(Message::FileChanged);
+                    }
+                }
+                self.toast
+                    .push(format!("Schema reload failed: {error}"), ToastKind::Error);
                 self.dirty = true;
             }
             Message::CopyCell => {
@@ -1865,15 +2212,8 @@ impl App {
                 self.dirty = true;
             }
             Message::FileChanged => {
-                // Ignore events caused by our own writes (500 ms debounce window).
-                if self
-                    .last_own_write_at
-                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(500))
-                {
-                    return;
-                }
-                // Deduplicate rapid bursts (e.g. WAL flush + main file write).
                 if self.file_check_in_flight {
+                    self.file_change_pending = true;
                     return;
                 }
                 self.file_check_in_flight = true;
@@ -1887,8 +2227,22 @@ impl App {
                         crate::db::load_schema(&conn)
                     })
                     .await;
-                    if let Ok(Ok(schema)) = result {
-                        let _ = tx.send(Message::ExternalRefresh(schema));
+                    match result {
+                        Ok(Ok(schema)) => {
+                            let _ = tx.send(Message::ExternalRefresh(schema));
+                        }
+                        Ok(Err(error)) => {
+                            let _ = tx.send(Message::SchemaLoadFailed {
+                                external: true,
+                                error: error.to_string(),
+                            });
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Message::SchemaLoadFailed {
+                                external: true,
+                                error: error.to_string(),
+                            });
+                        }
                     }
                 });
 
@@ -1896,47 +2250,37 @@ impl App {
                 if self.mode == AppMode::Edit {
                     self.pending_external_refresh = true;
                 } else if let Some(ref mut grid) = self.grid {
-                    if !grid.window.fetch_in_flight {
-                        grid.needs_fetch = true;
-                    }
+                    self.grid_request_serial.fetch_add(1, Ordering::AcqRel);
+                    grid.window.fetch_in_flight = false;
+                    grid.needs_fetch = true;
+                } else if let Some(table) = self
+                    .active_tab
+                    .and_then(|index| self.open_tabs.get(index))
+                    .map(|tab| tab.table_name.clone())
+                {
+                    self.request_table_view(&table);
                 }
                 self.dirty = true;
             }
             Message::ExternalRefresh(new_schema) => {
                 self.file_check_in_flight = false;
 
-                // Build sorted fingerprints: (name, "table"/"view"/"index").
-                let mut old_fp: Vec<(String, &str)> = self
-                    .schema
-                    .tables
-                    .iter()
-                    .map(|t| (t.name.clone(), "table"))
-                    .chain(self.schema.views.iter().map(|v| (v.name.clone(), "view")))
-                    .chain(
-                        self.schema
-                            .indexes
-                            .iter()
-                            .map(|i| (i.name.clone(), "index")),
-                    )
-                    .collect();
-                old_fp.sort_unstable();
-
-                let mut new_fp: Vec<(String, &str)> = new_schema
-                    .tables
-                    .iter()
-                    .map(|t| (t.name.clone(), "table"))
-                    .chain(new_schema.views.iter().map(|v| (v.name.clone(), "view")))
-                    .chain(new_schema.indexes.iter().map(|i| (i.name.clone(), "index")))
-                    .collect();
-                new_fp.sort_unstable();
-
-                if old_fp != new_fp {
+                if self.schema != new_schema {
                     self.schema = new_schema;
                     let total = self.sidebar.visible_count(&self.schema);
                     if self.sidebar.selected >= total {
                         self.sidebar.selected = total.saturating_sub(1);
                     }
                     self.toast.push("Schema changed", ToastKind::Info);
+                    if self.mode == AppMode::Edit {
+                        self.pending_external_refresh = true;
+                    } else {
+                        self.refresh_active_grid_schema();
+                    }
+                }
+                if self.file_change_pending {
+                    self.file_change_pending = false;
+                    let _ = self.tx.send(Message::FileChanged);
                 }
                 self.dirty = true;
             }
@@ -1956,14 +2300,17 @@ impl App {
                 self.popup = Some(PopupKind::Find(find_state));
                 self.mode = AppMode::Edit;
                 self.dirty = true;
+                self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
+                let request_id = self.popup_request_serial;
 
                 let pool = Arc::clone(&self.pool);
                 let tx = self.tx.clone();
+                let response_table = table_name.clone();
                 tokio::task::spawn(async move {
                     let result = tokio::task::spawn_blocking(
                         move || -> anyhow::Result<Vec<Vec<SqlValue>>> {
                             let conn = pool.get()?;
-                            let (where_clause, where_params) = filter_to_sql(&filter);
+                            let (where_clause, where_params) = filter_to_sql(&filter)?;
                             let order_by = sort.as_ref().map(|(s, b)| (s.as_str(), *b));
                             let rows = db::fetch_rows(
                                 &conn,
@@ -1981,17 +2328,63 @@ impl App {
                         },
                     )
                     .await;
-                    if let Ok(Ok(rows)) = result {
-                        let _ = tx.send(Message::FindReady(rows));
+                    match result {
+                        Ok(Ok(rows)) => {
+                            let _ = tx.send(Message::FindReady {
+                                request_id,
+                                table: response_table,
+                                rows,
+                            });
+                        }
+                        Ok(Err(error)) => {
+                            let _ = tx.send(Message::FindFailed {
+                                request_id,
+                                table: response_table,
+                                error: error.to_string(),
+                            });
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Message::FindFailed {
+                                request_id,
+                                table: response_table,
+                                error: error.to_string(),
+                            });
+                        }
                     }
                 });
             }
-            Message::FindReady(rows) => {
-                if let Some(PopupKind::Find(ref mut state)) = self.popup {
-                    state.rows = rows;
-                    state.loading = false;
-                    self.dirty = true;
+            Message::FindReady {
+                request_id,
+                table,
+                rows,
+            } => {
+                if request_id != self.popup_request_serial {
+                    return;
                 }
+                if let Some(PopupKind::Find(ref mut state)) = self.popup {
+                    if state.table_name == table {
+                        state.rows = rows;
+                        state.loading = false;
+                        self.dirty = true;
+                    }
+                }
+            }
+            Message::FindFailed {
+                request_id,
+                table,
+                error,
+            } => {
+                if request_id != self.popup_request_serial {
+                    return;
+                }
+                if let Some(PopupKind::Find(state)) = &mut self.popup {
+                    if state.table_name == table {
+                        state.loading = false;
+                        self.toast
+                            .push(format!("Find failed: {error}"), ToastKind::Error);
+                    }
+                }
+                self.dirty = true;
             }
             Message::CommitFind => {
                 let hit = if let Some(PopupKind::Find(ref state)) = self.popup {
@@ -2029,12 +2422,13 @@ impl App {
                         None
                     };
 
-                self.popup = None;
-                self.mode = AppMode::Browse;
+                let schema_refreshed = self.finish_popup();
                 self.dirty = true;
 
-                if let Some((table, cols, sort, off, lim)) = maybe_fetch {
-                    self.spawn_window_fetch(&table, &cols, sort, off, lim);
+                if !schema_refreshed {
+                    if let Some((table, cols, sort, off, lim)) = maybe_fetch {
+                        self.spawn_window_fetch(&table, &cols, sort, off, lim);
+                    }
                 }
             }
         }
@@ -2062,7 +2456,23 @@ impl App {
                     }
                     .to_string();
                     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    let export_path = format!("{}/sqview_export.{}", home, format);
+                    let safe_table = table
+                        .chars()
+                        .map(|character| {
+                            if character.is_ascii_alphanumeric()
+                                || character == '-'
+                                || character == '_'
+                            {
+                                character
+                            } else {
+                                '_'
+                            }
+                        })
+                        .collect::<String>();
+                    let export_id = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |duration| duration.as_nanos());
+                    let export_path = format!("{home}/sqview_{safe_table}_{export_id}.{format}");
                     let export_path_clone = export_path.clone();
                     tokio::task::spawn(async move {
                         let format_c = format.clone();
@@ -2089,8 +2499,13 @@ impl App {
                                 path: export_path_clone,
                                 count,
                             });
-                        } else if let Ok(Err(e)) = result {
-                            let _ = tx.send(Message::EditFailed(e.to_string()));
+                        } else {
+                            let error = match result {
+                                Ok(Err(error)) => error.to_string(),
+                                Err(error) => error.to_string(),
+                                Ok(Ok(_)) => unreachable!(),
+                            };
+                            let _ = tx.send(Message::ExportFailed(error));
                         }
                     });
                 }
@@ -2163,7 +2578,7 @@ impl App {
                 .get(s.col_idx)
                 .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
         });
-        let (where_clause, where_params) = filter_to_sql(&grid.filter);
+        let (where_clause, where_params) = filter_to_sql(&grid.filter)?;
         let conn = self.pool.get()?;
 
         let selected_offsets = grid.selected_rows();
@@ -2182,25 +2597,19 @@ impl App {
                 },
             )?
         } else if copying_selection {
-            let mut rows = Vec::with_capacity(selected_offsets.len());
-            for offset in selected_offsets {
-                let mut fetched = db::fetch_rows(
-                    &conn,
-                    db::RowFetch {
-                        table: &grid.table_name,
-                        columns: &grid.columns,
-                        offset: offset as i64,
-                        limit: 1,
-                        order_by: sort.as_ref().map(|(col, asc)| (col.as_str(), *asc)),
-                        where_clause: &where_clause,
-                        where_params: &where_params,
-                    },
-                )?;
-                if let Some(row) = fetched.pop() {
-                    rows.push(row);
-                }
-            }
-            rows
+            let offsets = selected_offsets
+                .into_iter()
+                .map(|offset| offset as i64)
+                .collect::<Vec<_>>();
+            db::fetch_rows_at_offsets(
+                &conn,
+                &grid.table_name,
+                &grid.columns,
+                &offsets,
+                sort.as_ref().map(|(col, asc)| (col.as_str(), *asc)),
+                &where_clause,
+                &where_params,
+            )?
         } else {
             db::fetch_rows(
                 &conn,
@@ -2247,6 +2656,11 @@ impl App {
 
         if matches!(self.popup, Some(PopupKind::FilterPopup(_))) {
             self.handle_filter_popup_mouse(mouse);
+            return;
+        }
+
+        if matches!(self.popup, Some(PopupKind::TextEditor(_))) {
+            self.handle_text_editor_mouse(mouse);
             return;
         }
 
@@ -2369,6 +2783,41 @@ impl App {
                     let _ = self.tx.send(Message::CycleSort);
                 }
             }
+        }
+    }
+
+    fn handle_text_editor_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(PopupKind::TextEditor(state)) = self.popup.as_mut() else {
+            return;
+        };
+        let x = mouse.column;
+        let y = mouse.row;
+        let changed = match mouse.kind {
+            MouseEventKind::ScrollDown if state.mouse_scroll_area_contains(x, y) => {
+                let previous = state.scroll_y;
+                state.scroll_down(3);
+                state.scroll_y != previous
+            }
+            MouseEventKind::ScrollUp if state.mouse_scroll_area_contains(x, y) => {
+                let previous = state.scroll_y;
+                state.scroll_up(3);
+                state.scroll_y != previous
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                state.end_scrollbar_drag();
+                state.begin_scrollbar_drag(x, y)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => state.drag_scrollbar(y),
+            MouseEventKind::Up(MouseButton::Left) => {
+                state.end_scrollbar_drag();
+                false
+            }
+            _ => false,
+        };
+        if changed {
+            self.dirty = true;
         }
     }
 
@@ -3079,8 +3528,7 @@ impl App {
             },
             Some(PopupKind::FilterPopup(state)) => match key.code {
                 KeyCode::Esc => {
-                    self.popup = None;
-                    self.mode = AppMode::Browse;
+                    self.finish_popup();
                     self.dirty = true;
                 }
                 KeyCode::Enter => {
@@ -3484,22 +3932,26 @@ impl App {
         let grid = self.grid.as_ref()?;
         let col_idx = grid.focused_col;
         let col = grid.columns.get(col_idx)?.clone();
+        if !col.writable {
+            self.toast
+                .push("Generated columns are read-only", ToastKind::Error);
+            return None;
+        }
         let table_name = grid.table_name.clone();
         let abs_row = grid.focused_row as i64;
         let cell_value = grid
             .window
             .get_row(abs_row)
             .and_then(|row| row.get(col_idx))
-            .cloned()
-            .unwrap_or(SqlValue::Null);
+            .cloned()?;
         let is_fk = grid.fk_cols.get(col_idx).copied().unwrap_or(false);
-        let sort = grid.sort.as_ref().and_then(|s| {
-            grid.columns
-                .get(s.col_idx)
-                .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
-        });
-        let filter = grid.filter.clone();
-        let rowid = self.resolve_rowid_at_offset(&table_name, abs_row, sort, filter)?;
+        let rowid = grid.window.get_rowid(abs_row).or_else(|| {
+            self.toast.push(
+                "Row is not loaded or cannot be edited safely",
+                ToastKind::Error,
+            );
+            None
+        })?;
 
         Some(FocusedCellContext {
             col,
@@ -3530,6 +3982,22 @@ impl App {
             .is_some_and(|value| *value != SqlValue::Null)
     }
 
+    fn finish_popup(&mut self) -> bool {
+        self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
+        self.popup = None;
+        self.mode = AppMode::Browse;
+        if let Some(grid) = self.grid.as_mut() {
+            Self::clamp_grid_viewport(grid);
+        }
+        if self.pending_external_refresh {
+            self.pending_external_refresh = false;
+            self.refresh_active_grid_schema();
+            true
+        } else {
+            false
+        }
+    }
+
     fn open_text_editor(
         &mut self,
         table: String,
@@ -3538,6 +4006,7 @@ impl App {
         col_type: String,
         original: SqlValue,
     ) {
+        self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
         self.popup = Some(PopupKind::TextEditor(TextEditorState::new(
             table,
             rowid,
@@ -3557,6 +4026,13 @@ impl App {
         value: SqlValue,
         original: SqlValue,
     ) {
+        if self.write_in_flight {
+            self.toast
+                .push("A database write is already running", ToastKind::Info);
+            self.dirty = true;
+            return;
+        }
+        self.write_in_flight = true;
         let pool = Arc::clone(&self.pool);
         let tx = self.tx.clone();
         let table_c = table.clone();
@@ -3615,6 +4091,8 @@ impl App {
     }
 
     fn request_table_view(&mut self, name: &str) {
+        self.navigation_request_serial = self.navigation_request_serial.wrapping_add(1);
+        self.grid_request_serial.fetch_add(1, Ordering::AcqRel);
         self.grid = None;
         let cols_and_fks = self
             .schema
@@ -3638,7 +4116,105 @@ impl App {
         }
     }
 
+    fn refresh_active_grid_schema(&mut self) {
+        self.navigation_request_serial = self.navigation_request_serial.wrapping_add(1);
+        let Some(current_grid) = self.grid.as_ref() else {
+            if let Some(table) = self
+                .active_tab
+                .and_then(|index| self.open_tabs.get(index))
+                .map(|tab| tab.table_name.clone())
+            {
+                self.request_table_view(&table);
+            }
+            return;
+        };
+        let table = current_grid.table_name.clone();
+        let Some(table_meta) = self.schema.tables.iter().find(|item| item.name == table) else {
+            self.grid_request_serial.fetch_add(1, Ordering::AcqRel);
+            self.grid = None;
+            self.toast.push(
+                format!("Table {table:?} no longer exists"),
+                ToastKind::Error,
+            );
+            return;
+        };
+
+        let previous_sort = current_grid.sort.as_ref().and_then(|sort| {
+            current_grid
+                .columns
+                .get(sort.col_idx)
+                .map(|column| (column.name.clone(), sort.direction.clone()))
+        });
+        let columns = table_meta.columns.clone();
+        let foreign_key_names = table_meta
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| foreign_key.from_col.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let foreign_key_columns = columns
+            .iter()
+            .map(|column| foreign_key_names.contains(column.name.as_str()))
+            .collect::<Vec<_>>();
+        let column_names = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut filter = current_grid.filter.clone();
+        filter
+            .columns
+            .retain(|column, _| column_names.contains(column.as_str()));
+        let sort = previous_sort.and_then(|(name, direction)| {
+            columns
+                .iter()
+                .position(|column| column.name == name)
+                .map(|col_idx| SortSpec { col_idx, direction })
+        });
+
+        let fetch = if let Some(grid) = self.grid.as_mut() {
+            grid.columns = columns;
+            grid.fk_cols = foreign_key_columns;
+            grid.enumerated_values = vec![Vec::new(); grid.columns.len()];
+            grid.width_sample_rows.clear();
+            grid.focused_col = grid.focused_col.min(grid.columns.len().saturating_sub(1));
+            grid.focused_row = 0;
+            grid.viewport_start = 0;
+            grid.h_scroll = 0;
+            grid.sort = sort;
+            grid.filter = filter;
+            grid.window.rows.clear();
+            grid.window.rowids.clear();
+            grid.window.offset = 0;
+            grid.window.total_rows = 0;
+            grid.window.fetch_in_flight = true;
+            grid.needs_fetch = false;
+            grid.recompute_col_widths(grid.avail_col_width);
+            let sort = grid.sort.as_ref().and_then(|sort| {
+                grid.columns.get(sort.col_idx).map(|column| {
+                    (
+                        column.name.clone(),
+                        sort.direction == crate::grid::SortDir::Asc,
+                    )
+                })
+            });
+            let (offset, limit) = grid.window.fetch_params(0);
+            Some((
+                grid.columns.clone(),
+                sort,
+                offset,
+                limit,
+                grid.filter.clone(),
+            ))
+        } else {
+            None
+        };
+
+        if let Some((columns, sort, offset, limit, filter)) = fetch {
+            self.spawn_window_fetch_with_filter(&table, &columns, sort, offset, limit, filter);
+        }
+    }
+
     fn spawn_grid_fetch(&self, table: String, columns: Vec<Column>, fk_cols: Vec<bool>) {
+        let request_id = self.grid_request_serial.fetch_add(1, Ordering::AcqRel) + 1;
         let tx = self.tx.clone();
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn(async move {
@@ -3647,7 +4223,7 @@ impl App {
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<GridFetchResult> {
                 let conn = pool.get()?;
                 let total = db::count_rows(&conn, &table_c, "", &[])?;
-                let rows = db::fetch_rows(
+                let fetched = db::fetch_rows_with_rowids(
                     &conn,
                     db::RowFetch {
                         table: &table_c,
@@ -3659,34 +4235,47 @@ impl App {
                         where_params: &[],
                     },
                 )?;
-                let enumerated_values = cols_c
-                    .iter()
-                    .map(|col| {
-                        db::load_distinct_values(
-                            &conn,
-                            &table_c,
-                            &col.name,
-                            ENUM_COLOR_DISTINCT_LIMIT,
-                        )
-                        .map(|values| normalize_enumerated_values(values, total))
-                        .unwrap_or_default()
-                    })
+                let enumerated_values = (0..cols_c.len())
+                    .map(|column| inferred_enumerated_values(&fetched.rows, column, total))
                     .collect();
-                let width_sample_rows = db::fetch_random_rows(&conn, &table_c, &cols_c, 50)
-                    .unwrap_or_else(|_| rows.iter().take(50).cloned().collect());
-                Ok((rows, total, enumerated_values, width_sample_rows))
-            })
-            .await;
-            if let Ok(Ok((rows, total_rows, enumerated_values, width_sample_rows))) = result {
-                let _ = tx.send(Message::GridDataReady {
-                    table,
-                    columns,
-                    fk_cols,
+                let width_sample_rows = fetched.rows.iter().take(50).cloned().collect();
+                Ok((
+                    fetched.rows,
+                    fetched.rowids,
+                    total,
                     enumerated_values,
                     width_sample_rows,
-                    rows,
-                    total_rows,
-                });
+                ))
+            })
+            .await;
+            match result {
+                Ok(Ok((rows, rowids, total_rows, enumerated_values, width_sample_rows))) => {
+                    let _ = tx.send(Message::GridDataReady {
+                        request_id,
+                        table,
+                        columns,
+                        fk_cols,
+                        enumerated_values,
+                        width_sample_rows,
+                        rows,
+                        rowids,
+                        total_rows,
+                    });
+                }
+                Ok(Err(error)) => {
+                    let _ = tx.send(Message::GridReadFailed {
+                        request_id,
+                        table,
+                        error: error.to_string(),
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(Message::GridReadFailed {
+                        request_id,
+                        table,
+                        error: error.to_string(),
+                    });
+                }
             }
         });
     }
@@ -3716,19 +4305,20 @@ impl App {
         limit: i64,
         filter: crate::filter::FilterSet,
     ) {
+        let request_id = self.grid_request_serial.fetch_add(1, Ordering::AcqRel) + 1;
         let pool = Arc::clone(&self.pool);
         let tx = self.tx.clone();
         let table = table.to_string();
         let columns = columns.to_vec();
         tokio::task::spawn(async move {
             let table_c = table.clone();
-            let result = tokio::task::spawn_blocking(
-                move || -> anyhow::Result<(Vec<Vec<SqlValue>>, i64)> {
+            let result =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<(db::FetchedRows, i64)> {
                     let conn = pool.get()?;
-                    let (where_clause, where_params) = filter_to_sql(&filter);
+                    let (where_clause, where_params) = filter_to_sql(&filter)?;
                     let total = db::count_rows(&conn, &table_c, &where_clause, &where_params)?;
                     let order_by = sort.as_ref().map(|(s, b)| (s.as_str(), *b));
-                    let rows = db::fetch_rows(
+                    let rows = db::fetch_rows_with_rowids(
                         &conn,
                         db::RowFetch {
                             table: &table_c,
@@ -3741,16 +4331,33 @@ impl App {
                         },
                     )?;
                     Ok((rows, total))
-                },
-            )
-            .await;
-            if let Ok(Ok((rows, total_rows))) = result {
-                let _ = tx.send(Message::WindowReady {
-                    table,
-                    offset,
-                    rows,
-                    total_rows,
-                });
+                })
+                .await;
+            match result {
+                Ok(Ok((rows, total_rows))) => {
+                    let _ = tx.send(Message::WindowReady {
+                        request_id,
+                        table,
+                        offset,
+                        rows: rows.rows,
+                        rowids: rows.rowids,
+                        total_rows,
+                    });
+                }
+                Ok(Err(error)) => {
+                    let _ = tx.send(Message::GridReadFailed {
+                        request_id,
+                        table,
+                        error: error.to_string(),
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(Message::GridReadFailed {
+                        request_id,
+                        table,
+                        error: error.to_string(),
+                    });
+                }
             }
         });
     }
@@ -3763,6 +4370,7 @@ impl App {
             enumerated_values,
             width_sample_rows,
             rows,
+            rowids,
             total_rows,
         } = payload;
         let is_active = self
@@ -3784,6 +4392,7 @@ impl App {
                 total_rows,
                 area_width: grid_width,
             });
+            grid.window.rowids = rowids;
             if let Ok(saved_filter) = crate::filter::load_filter(&self.db_path, &table) {
                 if !saved_filter.is_empty() {
                     grid.filter = saved_filter.clone();
@@ -3861,44 +4470,6 @@ impl App {
         self.dirty = true;
     }
 
-    fn resolve_rowid_at_offset(
-        &mut self,
-        table: &str,
-        offset: i64,
-        sort: Option<(String, bool)>,
-        filter: crate::filter::FilterSet,
-    ) -> Option<i64> {
-        let (where_clause, where_params) = filter_to_sql(&filter);
-        let conn = match self.pool.get() {
-            Ok(conn) => conn,
-            Err(err) => {
-                self.toast
-                    .push(format!("DB connection failed: {}", err), ToastKind::Error);
-                return None;
-            }
-        };
-        match db::fetch_rowid_at_offset(
-            &conn,
-            table,
-            offset,
-            sort.as_ref().map(|(col, asc)| (col.as_str(), *asc)),
-            &where_clause,
-            &where_params,
-        ) {
-            Ok(Some(rowid)) => Some(rowid),
-            Ok(None) => {
-                self.toast
-                    .push("Row not found in current view", ToastKind::Error);
-                None
-            }
-            Err(err) => {
-                self.toast
-                    .push(format!("Row lookup failed: {}", err), ToastKind::Error);
-                None
-            }
-        }
-    }
-
     fn count_table_rows(&mut self, table: &str) -> Option<i64> {
         let conn = match self.pool.get() {
             Ok(conn) => conn,
@@ -3925,7 +4496,13 @@ impl App {
         sort: Option<(String, bool)>,
         filter: crate::filter::FilterSet,
     ) -> Option<i64> {
-        let (where_clause, where_params) = filter_to_sql(&filter);
+        let (where_clause, where_params) = match filter_to_sql(&filter) {
+            Ok(predicate) => predicate,
+            Err(error) => {
+                self.toast.push(error.to_string(), ToastKind::Error);
+                return None;
+            }
+        };
         let conn = match self.pool.get() {
             Ok(conn) => conn,
             Err(err) => {
@@ -3957,6 +4534,7 @@ impl App {
     }
 
     fn apply_column_filter(&mut self, col_name: String, col_filter: crate::filter::ColumnFilter) {
+        self.navigation_request_serial = self.navigation_request_serial.wrapping_add(1);
         if let Some(ref mut grid) = self.grid {
             if col_filter.rules.iter().any(|rule| rule.enabled) {
                 grid.filter.columns.insert(col_name, col_filter);
@@ -3978,7 +4556,10 @@ impl App {
             grid.window.fetch_in_flight = true;
             let filter = grid.filter.clone();
             let db_path = self.db_path.clone();
-            let _ = crate::filter::save_filter(&filter, &db_path, &table);
+            if let Err(error) = crate::filter::save_filter(&filter, &db_path, &table) {
+                self.toast
+                    .push(format!("Could not save filter: {error}"), ToastKind::Error);
+            }
             self.spawn_window_fetch_with_filter(&table, &cols, sort, off, lim, filter);
         }
         self.dirty = true;
@@ -4024,6 +4605,49 @@ impl App {
         let current = self.active_tab.unwrap_or(0);
         self.activate_tab(current.checked_sub(1).unwrap_or(self.open_tabs.len() - 1));
     }
+}
+
+fn count_rows_before_letter(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    ascending: bool,
+    letter: char,
+    uppercase_letter: char,
+    filter: &crate::filter::FilterSet,
+) -> anyhow::Result<i64> {
+    let (filter_clause, mut params) = filter_to_sql(filter)?;
+    let column = db::query::quote_identifier(column);
+    let predicate = if ascending {
+        if letter == '#' {
+            format!("{column} IS NULL")
+        } else {
+            let value_parameter = params.len() + 1;
+            params.push(rusqlite::types::Value::Text(uppercase_letter.to_string()));
+            format!("({column} IS NULL OR {column} < ?{value_parameter})")
+        }
+    } else if letter == '#' {
+        format!("({column} IS NOT NULL AND {column} NOT GLOB '[0-9]*')")
+    } else {
+        let value_parameter = params.len() + 1;
+        params.push(rusqlite::types::Value::Text(uppercase_letter.to_string()));
+        let pattern_parameter = params.len() + 1;
+        params.push(rusqlite::types::Value::Text(format!("{uppercase_letter}%")));
+        format!("({column} > ?{value_parameter} AND {column} NOT LIKE ?{pattern_parameter})")
+    };
+    let where_clause = if filter_clause.is_empty() {
+        predicate
+    } else {
+        format!("({filter_clause}) AND {predicate}")
+    };
+    let query = format!(
+        "SELECT COUNT(*) FROM {} WHERE {where_clause}",
+        db::query::quote_identifier(table)
+    );
+    conn.query_row(&query, rusqlite::params_from_iter(params.iter()), |row| {
+        row.get(0)
+    })
+    .map_err(Into::into)
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -4085,6 +4709,29 @@ fn normalize_enumerated_values(values: Vec<String>, total_rows: i64) -> Vec<Stri
     }
 }
 
+fn inferred_enumerated_values(
+    rows: &[Vec<SqlValue>],
+    column: usize,
+    total_rows: i64,
+) -> Vec<String> {
+    let mut values = rows
+        .iter()
+        .filter_map(|row| row.get(column))
+        .filter_map(|value| match value {
+            SqlValue::Null | SqlValue::Blob(_) => None,
+            SqlValue::Integer(value) => Some(value.to_string()),
+            SqlValue::Real(value) => Some(value.to_string()),
+            SqlValue::Text(value) => Some(value.clone()),
+        })
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    if values.len() >= ENUM_COLOR_DISTINCT_LIMIT {
+        return Vec::new();
+    }
+    normalize_enumerated_values(values, total_rows)
+}
+
 fn next_active_tab_after_close(
     active_tab: Option<usize>,
     closed_idx: usize,
@@ -4108,8 +4755,9 @@ fn next_active_tab_after_close(
 mod tests {
     use std::{collections::BTreeSet, sync::Arc};
 
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use r2d2_sqlite::SqliteConnectionManager;
+    use ratatui::{backend::TestBackend, Terminal};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -4151,6 +4799,8 @@ mod tests {
             not_null: false,
             default_value: None,
             is_pk: cid == 0,
+            pk_position: if cid == 0 { 1 } else { 0 },
+            writable: true,
         }
     }
 
@@ -4171,7 +4821,7 @@ mod tests {
                 ]
             })
             .collect();
-        crate::grid::GridState::new(crate::grid::GridInit {
+        let mut grid = crate::grid::GridState::new(crate::grid::GridInit {
             table_name: "users".to_string(),
             columns,
             fk_cols: vec![false; 4],
@@ -4180,7 +4830,9 @@ mod tests {
             width_sample_rows: vec![Vec::new(); 4],
             total_rows: 50,
             area_width: 80,
-        })
+        });
+        grid.window.rowids = (1..=50).map(Some).collect();
+        grid
     }
 
     fn make_viewport_rows(app: &App) -> usize {
@@ -4297,17 +4949,23 @@ mod tests {
 
     /// Drain channel and process messages through app.update().
     fn drain_messages(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>) {
-        loop {
-            match rx.try_recv() {
-                Ok(msg) => {
-                    // avoid infinite recursion for actions that spawn more messages
-                    app.update(msg);
-                    if rx.try_recv().is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
+        while let Ok(message) = rx.try_recv() {
+            app.update(message);
+        }
+    }
+
+    fn render_test_app(app: &mut App) {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .expect("render app");
+    }
+
+    fn text_editor_scroll_y(app: &App) -> u16 {
+        match app.popup.as_ref() {
+            Some(PopupKind::TextEditor(state)) => state.scroll_y,
+            _ => panic!("expected text editor popup"),
         }
     }
 
@@ -5018,6 +5676,7 @@ mod tests {
     #[test]
     fn delete_row_confirms_selected_row_range() {
         let (mut app, _rx) = make_test_app();
+        seed_user_rows(&app, 6);
         let mut grid = make_grid();
         grid.row_selection = crate::grid::RowSelection::Rows(BTreeSet::from([1, 3, 5]));
         app.grid = Some(grid);
@@ -5027,9 +5686,9 @@ mod tests {
         assert!(matches!(
             app.pending_confirm.as_ref().map(|confirm| &confirm.kind),
             Some(ConfirmKind::DeleteSelectedRows {
-                row_offsets,
+                rowids,
                 ..
-            }) if row_offsets == &vec![1, 3, 5]
+            }) if rowids == &vec![2, 4, 6]
         ));
     }
 
@@ -5562,6 +6221,97 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_scrolls_text_editor_only_under_the_pointer() {
+        let (mut app, _rx) = make_test_app();
+        app.popup = Some(PopupKind::TextEditor(TextEditorState::new(
+            "users".to_string(),
+            1,
+            "name".to_string(),
+            "TEXT".to_string(),
+            SqlValue::Text("x".repeat(1_000)),
+            false,
+        )));
+        app.mode = AppMode::Edit;
+        render_test_app(&mut app);
+        let initial_scroll = text_editor_scroll_y(&app);
+        assert!(initial_scroll > 0);
+
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 40,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let scrolled = text_editor_scroll_y(&app);
+        assert!(scrolled < initial_scroll);
+
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 40,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(text_editor_scroll_y(&app), initial_scroll);
+
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(text_editor_scroll_y(&app), initial_scroll);
+    }
+
+    #[test]
+    fn mouse_drag_on_text_editor_scrollbar_scrolls_to_end() {
+        let (mut app, _rx) = make_test_app();
+        app.popup = Some(PopupKind::TextEditor(TextEditorState::new(
+            "users".to_string(),
+            1,
+            "name".to_string(),
+            "TEXT".to_string(),
+            SqlValue::Text("x".repeat(1_000)),
+            false,
+        )));
+        app.mode = AppMode::Edit;
+        render_test_app(&mut app);
+        let max_scroll = text_editor_scroll_y(&app);
+        if let Some(PopupKind::TextEditor(state)) = app.popup.as_mut() {
+            state.scroll_up(u16::MAX);
+        }
+        render_test_app(&mut app);
+        assert_eq!(text_editor_scroll_y(&app), 0);
+
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 62,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        }));
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 62,
+            row: 19,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(text_editor_scroll_y(&app), max_scroll);
+
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 62,
+            row: 19,
+            modifiers: KeyModifiers::NONE,
+        }));
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 62,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(text_editor_scroll_y(&app), max_scroll);
+    }
+
+    #[test]
     fn ctrl_click_on_row_gutter_toggles_rows_without_clearing_selection() {
         let (mut app, _rx) = make_test_app();
         app.grid = Some(make_grid());
@@ -5736,21 +6486,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn file_changed_within_own_write_debounce_is_ignored() {
+    #[tokio::test]
+    async fn file_changed_after_own_write_still_refreshes() {
         let (mut app, _rx) = make_test_app();
-        // Mark a very recent own write.
-        app.last_own_write_at = Some(std::time::Instant::now());
         app.update(Message::FileChanged);
-        // file_check_in_flight should NOT be set (handler returned early).
-        assert!(
-            !app.file_check_in_flight,
-            "in-flight must not be set when debounced"
-        );
+        assert!(app.file_check_in_flight);
     }
 
-    #[test]
-    fn close_popup_clears_pending_refresh_and_triggers_fetch() {
+    #[tokio::test]
+    async fn close_popup_clears_pending_refresh_and_triggers_fetch() {
         let (mut app, _rx) = make_test_app();
         app.grid = Some(make_grid());
         app.mode = AppMode::Edit;
@@ -5760,7 +6504,243 @@ mod tests {
         assert!(!app.pending_external_refresh, "flag must be cleared");
         assert_eq!(app.mode, AppMode::Browse);
         if let Some(ref grid) = app.grid {
-            assert!(grid.needs_fetch, "needs_fetch must be set after close");
+            assert!(
+                grid.window.fetch_in_flight,
+                "a refreshed grid fetch must start after close"
+            );
         }
+    }
+
+    #[test]
+    fn stale_window_response_is_ignored() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.grid_request_serial.store(2, Ordering::Release);
+        let original = app.grid.as_ref().expect("grid").window.rows[0].clone();
+
+        app.update(Message::WindowReady {
+            request_id: 1,
+            table: "users".to_string(),
+            offset: 0,
+            rows: vec![vec![SqlValue::Text("stale".to_string())]],
+            rowids: vec![Some(99)],
+            total_rows: 1,
+        });
+
+        assert_eq!(app.grid.as_ref().expect("grid").window.rows[0], original);
+    }
+
+    #[test]
+    fn in_flight_window_completion_preserves_a_queued_scroll_fetch() {
+        let (mut app, _rx) = make_test_app();
+        let mut grid = make_grid();
+        grid.window.fetch_in_flight = true;
+        app.grid = Some(grid);
+
+        app.update(Message::ScrollToRow(40));
+        assert!(app.grid.as_ref().expect("grid").needs_fetch);
+        app.update(Message::WindowReady {
+            request_id: 0,
+            table: "users".to_string(),
+            offset: 0,
+            rows: (0..20)
+                .map(|index| vec![SqlValue::Integer(index)])
+                .collect(),
+            rowids: (1..=20).map(Some).collect(),
+            total_rows: 100,
+        });
+
+        let grid = app.grid.as_ref().expect("grid");
+        assert!(grid.needs_fetch);
+        assert!(!grid.window.fetch_in_flight);
+    }
+
+    #[test]
+    fn stale_alphabet_navigation_is_ignored() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.navigation_request_serial = 2;
+
+        app.update(Message::JumpToSortedOffset {
+            request_id: 1,
+            table: "users".to_string(),
+            offset: 30,
+        });
+
+        assert_eq!(app.grid.as_ref().expect("grid").focused_row, 0);
+    }
+
+    #[test]
+    fn export_failure_does_not_release_the_write_gate() {
+        let (mut app, _rx) = make_test_app();
+        app.write_in_flight = true;
+
+        app.update(Message::ExportFailed("disk full".to_string()));
+
+        assert!(app.write_in_flight);
+    }
+
+    #[test]
+    fn opening_direct_editor_invalidates_pending_distinct_lookup() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.popup_request_serial = 1;
+        let column = app.grid.as_ref().expect("grid").columns[0].clone();
+
+        app.update(Message::OpenDirectEdit);
+        app.update(Message::DistinctValuesReady {
+            request_id: 1,
+            table: "users".to_string(),
+            rowid: 1,
+            col: column,
+            original: SqlValue::Integer(0),
+            values: vec!["stale".to_string()],
+        });
+
+        assert!(matches!(app.popup, Some(PopupKind::TextEditor(_))));
+    }
+
+    #[test]
+    fn alphabet_navigation_counts_only_rows_in_the_active_filter() {
+        let conn = rusqlite::Connection::open_in_memory().expect("database");
+        conn.execute_batch(
+            "CREATE TABLE items (name TEXT, category TEXT);
+             INSERT INTO items VALUES
+                ('Alpha', 'kept'),
+                ('Bravo', 'hidden'),
+                ('Charlie', 'kept'),
+                ('Delta', 'kept');",
+        )
+        .expect("seed rows");
+        let mut filter = crate::filter::FilterSet::default();
+        filter.columns.insert(
+            "category".to_string(),
+            crate::filter::ColumnFilter {
+                rules: vec![crate::filter::rule::FilterRule {
+                    op: crate::filter::FilterOp::Eq,
+                    value: crate::filter::FilterValue::Literal(SqlValue::Text("kept".to_string())),
+                    enabled: true,
+                    label: None,
+                }],
+            },
+        );
+
+        let offset = count_rows_before_letter(&conn, "items", "name", true, 'C', 'C', &filter)
+            .expect("count offset");
+
+        assert_eq!(offset, 1);
+    }
+
+    #[tokio::test]
+    async fn external_refresh_detects_column_changes() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = Some(make_grid());
+        let conn = app.pool.get().expect("connection");
+        conn.execute("ALTER TABLE users ADD COLUMN nickname TEXT", [])
+            .expect("alter table");
+        let changed = db::load_schema(&conn).expect("schema");
+        drop(conn);
+        app.update(Message::ExternalRefresh(changed));
+        assert!(app.schema.tables[0]
+            .columns
+            .iter()
+            .any(|column| column.name == "nickname"));
+        assert!(app
+            .grid
+            .as_ref()
+            .expect("active grid")
+            .columns
+            .iter()
+            .any(|column| column.name == "nickname"));
+    }
+
+    #[tokio::test]
+    async fn schema_refresh_restarts_a_pending_initial_grid_load() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = None;
+        app.open_tabs = vec![TableTab {
+            table_name: "users".to_string(),
+        }];
+        app.active_tab = Some(0);
+        app.grid_request_serial.store(1, Ordering::Release);
+        let conn = app.pool.get().expect("connection");
+        conn.execute("ALTER TABLE users ADD COLUMN nickname TEXT", [])
+            .expect("alter table");
+        let changed = db::load_schema(&conn).expect("schema");
+        drop(conn);
+
+        app.update(Message::ExternalRefresh(changed));
+        let current_request = app.grid_request_serial.load(Ordering::Acquire);
+        assert!(current_request > 1);
+        app.update(Message::GridDataReady {
+            request_id: 1,
+            table: "users".to_string(),
+            columns: make_grid().columns,
+            fk_cols: vec![false; 4],
+            enumerated_values: vec![Vec::new(); 4],
+            width_sample_rows: Vec::new(),
+            rows: Vec::new(),
+            rowids: Vec::new(),
+            total_rows: 0,
+        });
+        assert!(app.grid.is_none(), "stale initial response must be ignored");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_table_invalidates_its_pending_initial_grid_load() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = None;
+        app.open_tabs = vec![TableTab {
+            table_name: "users".to_string(),
+        }];
+        app.active_tab = Some(0);
+        app.grid_request_serial.store(1, Ordering::Release);
+        let conn = app.pool.get().expect("connection");
+        conn.execute("DROP TABLE users", []).expect("drop table");
+        let changed = db::load_schema(&conn).expect("schema");
+        drop(conn);
+
+        app.update(Message::ExternalRefresh(changed));
+        assert!(app.grid_request_serial.load(Ordering::Acquire) > 1);
+        app.update(Message::GridDataReady {
+            request_id: 1,
+            table: "users".to_string(),
+            columns: make_grid().columns,
+            fk_cols: vec![false; 4],
+            enumerated_values: vec![Vec::new(); 4],
+            width_sample_rows: Vec::new(),
+            rows: Vec::new(),
+            rowids: Vec::new(),
+            total_rows: 0,
+        });
+        assert!(app.grid.is_none(), "dropped table must not be restored");
+    }
+
+    #[tokio::test]
+    async fn write_completion_applies_a_pending_schema_refresh() {
+        let (mut app, _rx) = make_test_app();
+        app.grid = Some(make_grid());
+        app.popup = Some(PopupKind::Help(HelpState::new()));
+        app.mode = AppMode::Edit;
+        let conn = app.pool.get().expect("connection");
+        conn.execute("ALTER TABLE users ADD COLUMN nickname TEXT", [])
+            .expect("alter table");
+        app.schema = db::load_schema(&conn).expect("schema");
+        drop(conn);
+        app.pending_external_refresh = true;
+
+        app.update(Message::RowInserted {
+            table: "users".to_string(),
+            rowid: 99,
+        });
+
+        assert!(!app.pending_external_refresh);
+        assert!(app
+            .grid
+            .as_ref()
+            .expect("grid")
+            .columns
+            .iter()
+            .any(|column| column.name == "nickname"));
     }
 }

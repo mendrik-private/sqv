@@ -3,6 +3,7 @@ use crate::db::types::SqlValue;
 pub struct VirtualWindow {
     pub offset: i64,
     pub rows: Vec<Vec<SqlValue>>,
+    pub rowids: Vec<Option<i64>>,
     pub total_rows: i64,
     pub viewport_rows: usize,
     pub fetch_in_flight: bool,
@@ -14,11 +15,22 @@ impl VirtualWindow {
         Self {
             offset,
             rows,
+            rowids: Vec::new(),
             total_rows,
             viewport_rows: 20,
             fetch_in_flight: false,
             tick_count: 0,
         }
+    }
+
+    pub fn get_rowid(&self, abs_row: i64) -> Option<i64> {
+        if abs_row < self.offset || self.get_row(abs_row).is_none() {
+            return None;
+        }
+        self.rowids
+            .get((abs_row - self.offset) as usize)
+            .copied()
+            .flatten()
     }
 
     pub fn get_row(&self, abs_row: i64) -> Option<&Vec<SqlValue>> {

@@ -39,6 +39,7 @@ impl InsertRowState {
     pub fn new(table: String, columns: Vec<Column>, insert_position: usize) -> Self {
         let fields: Vec<InsertFieldState> = columns
             .into_iter()
+            .filter(|column| column.writable)
             .map(|col| InsertFieldState {
                 name: col.name,
                 col_type: col.col_type,
@@ -446,6 +447,8 @@ mod tests {
             not_null,
             default_value: default_value.map(str::to_string),
             is_pk: false,
+            pk_position: 0,
+            writable: true,
         }
     }
 

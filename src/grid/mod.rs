@@ -189,7 +189,7 @@ impl GridState {
     }
 
     fn check_needs_fetch(&mut self) {
-        if !self.window.fetch_in_flight && self.window.needs_prefetch(self.focused_row as i64) {
+        if self.window.needs_prefetch(self.focused_row as i64) {
             self.needs_fetch = true;
         }
     }
@@ -1662,6 +1662,8 @@ mod tests {
             not_null: false,
             default_value: None,
             is_pk,
+            pk_position: i64::from(is_pk),
+            writable: true,
         }
     }
 

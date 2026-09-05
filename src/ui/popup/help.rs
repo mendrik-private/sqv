@@ -160,6 +160,7 @@ fn help_text(symbols: &Symbols) -> String {
                 ),
                 help_row("Mouse wheel", "Scroll rows", "Ins / i", "Insert row below"),
                 help_row("Shift-wheel", "Scroll cols", "e", "Edit value directly"),
+                help_row("", "", "Wheel / drag bar", "Scroll text editor"),
                 help_row("Click gutter", "Select row", "n", "Set NULL"),
                 help_row(
                     "Ctrl-click gutter",
@@ -451,5 +452,6 @@ mod tests {
         assert!(help.contains("Ctrl-C / y"));
         assert!(help.contains("Ctrl-W"));
         assert!(help.contains("Ctrl-click gutter"));
+        assert!(help.contains("Wheel / drag bar"));
     }
 }
