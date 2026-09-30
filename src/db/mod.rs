@@ -8,20 +8,12 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, Row};
 
-use query::quote_identifier;
-use schema::{Column, ForeignKey, IndexMeta, RowIdentity, Schema, TableMeta, ViewMeta};
+use query::{quote_identifier, ViewQuery};
+use rusqlite::types::Value;
+use schema::{Column, ForeignKey, RowIdentity, Schema, TableMeta};
+use types::SqlValue;
 
 pub type DbPool = r2d2::Pool<SqliteConnectionManager>;
-
-pub struct RowFetch<'a> {
-    pub table: &'a str,
-    pub columns: &'a [Column],
-    pub offset: i64,
-    pub limit: i64,
-    pub order_by: Option<(&'a str, bool)>,
-    pub where_clause: &'a str,
-    pub where_params: &'a [rusqlite::types::Value],
-}
 
 fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function(
@@ -40,61 +32,41 @@ fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn open_pool(path: &str, readonly: bool) -> anyhow::Result<DbPool> {
+    fn init(conn: &mut Connection) -> rusqlite::Result<()> {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        register_functions(conn)
+    }
+
     let manager = if path == ":memory:" {
-        SqliteConnectionManager::memory().with_init(|conn| {
-            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-            register_functions(conn)?;
-            Ok(())
-        })
+        SqliteConnectionManager::memory()
     } else {
-        let flags = if readonly {
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        let access = if readonly {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
         } else {
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
         };
         SqliteConnectionManager::file(path)
-            .with_flags(flags)
-            .with_init(|conn| {
-                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-                register_functions(conn)?;
-                Ok(())
-            })
+            .with_flags(access | rusqlite::OpenFlags::SQLITE_OPEN_URI)
     };
-    Ok(r2d2::Pool::new(manager)?)
+    Ok(r2d2::Pool::new(manager.with_init(init))?)
 }
 
 pub fn load_schema(conn: &Connection) -> anyhow::Result<Schema> {
     let table_names = load_object_names(conn, "table")?;
-    let view_names_sql = load_views_with_sql(conn)?;
-
-    let mut tables = Vec::new();
+    let mut tables = Vec::with_capacity(table_names.len());
     for name in &table_names {
         let columns = load_columns(conn, name)?;
-        let foreign_keys = load_foreign_keys(conn, name)?;
-        let index_names = load_index_names_for_table(conn, name)?;
-        let row_identity = load_row_identity(conn, name, &columns)?;
         tables.push(TableMeta {
             name: name.clone(),
+            foreign_keys: load_foreign_keys(conn, name)?,
+            row_identity: load_row_identity(conn, name, &columns)?,
             columns,
-            foreign_keys,
-            indexes: index_names,
-            row_identity,
         });
     }
-
-    let views = view_names_sql
-        .into_iter()
-        .map(|(name, sql)| ViewMeta { name, sql })
-        .collect();
-
-    let indexes = load_all_indexes(conn, &table_names)?;
-
     Ok(Schema {
         tables,
-        views,
-        indexes,
+        views: load_object_names(conn, "view")?,
+        indexes: load_index_names(conn, &table_names)?,
     })
 }
 
@@ -107,21 +79,10 @@ fn load_object_names(conn: &Connection, obj_type: &str) -> anyhow::Result<Vec<St
         .context("loading object names")
 }
 
-fn load_views_with_sql(conn: &Connection) -> anyhow::Result<Vec<(String, Option<String>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, sql FROM sqlite_master WHERE type = 'view' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().context("loading views")
-}
-
 pub(crate) fn load_columns(conn: &Connection, table: &str) -> anyhow::Result<Vec<Column>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo({})", quote_identifier(table)))?;
     let rows = stmt.query_map([], |row| {
         Ok(Column {
-            cid: row.get::<_, i64>(0)?,
             name: row.get::<_, String>(1)?,
             col_type: row.get::<_, String>(2)?,
             not_null: row.get::<_, i64>(3)? != 0,
@@ -160,16 +121,21 @@ pub fn load_row_identity(
         }
     }
 
+    let primary_key = primary_key_columns(columns);
+    Ok((!primary_key.is_empty()).then_some(RowIdentity::PrimaryKey(primary_key)))
+}
+
+/// Primary-key column names in key order.
+fn primary_key_columns(columns: &[Column]) -> Vec<String> {
     let mut primary_key = columns
         .iter()
         .filter(|column| column.pk_position > 0)
         .collect::<Vec<_>>();
     primary_key.sort_by_key(|column| column.pk_position);
-    let primary_key = primary_key
+    primary_key
         .into_iter()
         .map(|column| column.name.clone())
-        .collect::<Vec<_>>();
-    Ok((!primary_key.is_empty()).then_some(RowIdentity::PrimaryKey(primary_key)))
+        .collect()
 }
 
 fn load_foreign_keys(conn: &Connection, table: &str) -> anyhow::Result<Vec<ForeignKey>> {
@@ -201,17 +167,9 @@ fn load_foreign_keys(conn: &Connection, table: &str) -> anyhow::Result<Vec<Forei
 }
 
 fn resolve_table_pk_col(conn: &Connection, table: &str, sequence: i64) -> anyhow::Result<String> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo({})", quote_identifier(table)))?;
-    let mut primary_key = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    primary_key.retain(|(_, position)| *position > 0);
-    primary_key.sort_by_key(|(_, position)| *position);
-    primary_key
-        .get(sequence as usize)
-        .map(|(name, _)| name.clone())
+    primary_key_columns(&load_columns(conn, table)?)
+        .into_iter()
+        .nth(sequence as usize)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no primary-key column {} found for table {:?}",
@@ -221,88 +179,45 @@ fn resolve_table_pk_col(conn: &Connection, table: &str, sequence: i64) -> anyhow
         })
 }
 
-fn load_index_names_for_table(conn: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
-    let mut stmt = conn.prepare(&format!("PRAGMA index_list({})", quote_identifier(table)))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    let names: Vec<String> = rows
-        .collect::<Result<Vec<_>, _>>()
-        .context("loading index names")?
-        .into_iter()
-        .filter(|n| !n.starts_with("sqlite_"))
-        .collect();
-    Ok(names)
-}
-
-fn load_all_indexes(conn: &Connection, tables: &[String]) -> anyhow::Result<Vec<IndexMeta>> {
+fn load_index_names(conn: &Connection, tables: &[String]) -> anyhow::Result<Vec<String>> {
     let mut indexes = Vec::new();
     for table in tables {
         let mut stmt = conn.prepare(&format!("PRAGMA index_list({})", quote_identifier(table)))?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(1)?, // name
-                row.get::<_, i64>(2)?,    // unique
-            ))
-        })?;
-        for row in rows {
-            let (name, unique) = row?;
+        let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for name in names {
+            let name = name.context("loading index names")?;
             if !name.starts_with("sqlite_") {
-                indexes.push(IndexMeta {
-                    name,
-                    table: table.clone(),
-                    unique: unique != 0,
-                });
+                indexes.push(name);
             }
         }
     }
     Ok(indexes)
 }
 
-pub fn count_rows(
+fn stable_identity(
     conn: &Connection,
     table: &str,
-    where_clause: &str,
-    where_params: &[rusqlite::types::Value],
-) -> anyhow::Result<i64> {
-    let where_part = build_where_part(where_clause);
-    let sql = format!(
-        "SELECT COUNT(*) FROM {}{}",
-        quote_identifier(table),
-        where_part
-    );
-    let count: i64 = conn.query_row(
-        &sql,
-        rusqlite::params_from_iter(where_params.iter()),
-        |row| row.get(0),
-    )?;
-    Ok(count)
+    columns: &[Column],
+) -> anyhow::Result<RowIdentity> {
+    load_row_identity(conn, table, columns)?
+        .ok_or_else(|| anyhow::anyhow!("table {:?} has no stable row identity", table))
 }
 
-fn build_order_terms(order_by: Option<(&str, bool)>, identity: &RowIdentity) -> String {
-    let identity_terms = match identity {
-        RowIdentity::RowidAlias(alias) => quote_identifier(alias),
-        RowIdentity::PrimaryKey(columns) => columns
-            .iter()
-            .map(|column| format!("{} ASC", quote_identifier(column)))
-            .collect::<Vec<_>>()
-            .join(", "),
-    };
-    match order_by {
-        Some((column, asc)) => format!(
-            "{} {}, {}",
-            quote_identifier(column),
-            if asc { "ASC" } else { "DESC" },
-            identity_terms
+fn mutable_rowid_alias(identity: &RowIdentity, table: &str) -> anyhow::Result<String> {
+    match identity {
+        RowIdentity::RowidAlias(alias) => Ok(alias.clone()),
+        RowIdentity::PrimaryKey(_) => anyhow::bail!(
+            "table {:?} does not expose a safe rowid for mutations",
+            table
         ),
-        None => identity_terms,
     }
 }
 
-fn build_where_part(where_clause: &str) -> String {
-    if where_clause.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", where_clause)
-    }
+/// The rowid alias through which rows of `table` may be mutated, rejecting tables
+/// whose rows are only identified by a primary key.
+pub(crate) fn mutation_rowid_alias(conn: &Connection, table: &str) -> anyhow::Result<String> {
+    let columns = load_columns(conn, table)?;
+    mutable_rowid_alias(&stable_identity(conn, table, &columns)?, table)
 }
 
 fn unused_column_alias(columns: &[Column], base: &str) -> String {
@@ -318,198 +233,187 @@ fn unused_column_alias(columns: &[Column], base: &str) -> String {
     candidate
 }
 
-fn decode_sql_value(value: rusqlite::types::ValueRef<'_>) -> types::SqlValue {
-    use rusqlite::types::ValueRef;
-    use types::SqlValue;
-
-    match value {
-        ValueRef::Null => SqlValue::Null,
-        ValueRef::Integer(n) => SqlValue::Integer(n),
-        ValueRef::Real(f) => SqlValue::Real(f),
-        ValueRef::Text(bytes) => SqlValue::Text(String::from_utf8_lossy(bytes).into_owned()),
-        ValueRef::Blob(bytes) => SqlValue::Blob(bytes.to_vec()),
-    }
+pub fn count_rows(conn: &Connection, view: &ViewQuery) -> anyhow::Result<i64> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM {}{}",
+        view.quoted_table(),
+        view.where_part()
+    );
+    let count = conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(view.where_params.iter()),
+        |row| row.get(0),
+    )?;
+    Ok(count)
 }
 
-fn decode_row_values(row: &Row<'_>, col_count: usize) -> rusqlite::Result<Vec<types::SqlValue>> {
-    (0..col_count)
-        .map(|index| row.get_ref(index).map(decode_sql_value))
+/// Offset of the first row whose sort value starts at `letter` in a text-sorted
+/// view; `'#'` addresses the leading NULL (ascending) or trailing non-digit
+/// (descending) block.
+pub fn count_rows_before_letter(
+    conn: &Connection,
+    view: &ViewQuery,
+    letter: char,
+) -> anyhow::Result<i64> {
+    let order = view
+        .order_by
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("letter navigation requires a sorted column"))?;
+    let column = quote_identifier(&order.column);
+    let upper = letter.to_uppercase().next().unwrap_or(letter);
+    let first = view.where_params.len() + 1;
+    let (predicate, extra) = match (order.ascending, letter == '#') {
+        (true, true) => (format!("{column} IS NULL"), Vec::new()),
+        (true, false) => (
+            format!("({column} IS NULL OR {column} < ?{first})"),
+            vec![Value::Text(upper.to_string())],
+        ),
+        (false, true) => (
+            format!("({column} IS NOT NULL AND {column} NOT GLOB '[0-9]*')"),
+            Vec::new(),
+        ),
+        (false, false) => (
+            format!("({column} > ?{first} AND {column} NOT LIKE ?{})", first + 1),
+            vec![
+                Value::Text(upper.to_string()),
+                Value::Text(format!("{upper}%")),
+            ],
+        ),
+    };
+    let where_clause = if view.where_clause.is_empty() {
+        predicate
+    } else {
+        format!("({}) AND {predicate}", view.where_clause)
+    };
+    let (params, _) = view.params_with(extra);
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE {where_clause}",
+        view.quoted_table()
+    );
+    let count = conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+        row.get(0)
+    })?;
+    Ok(count)
+}
+
+pub(crate) fn decode_row_values(
+    row: &Row<'_>,
+    col_count: usize,
+) -> rusqlite::Result<Vec<SqlValue>> {
+    decode_values_from(row, 0, col_count)
+}
+
+fn decode_values_from(
+    row: &Row<'_>,
+    start: usize,
+    count: usize,
+) -> rusqlite::Result<Vec<SqlValue>> {
+    (start..start + count)
+        .map(|index| row.get_ref(index).map(SqlValue::from))
         .collect()
 }
 
-pub fn fetch_rows(
+/// Streams one page of `view`, reading each row's physical rowid in the same
+/// statement as its values. WITHOUT ROWID tables yield `None` rowids, which
+/// disables row mutations in the UI.
+fn select_rows(
     conn: &Connection,
-    request: RowFetch<'_>,
-) -> anyhow::Result<Vec<Vec<types::SqlValue>>> {
-    if request.columns.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let identity = load_row_identity(conn, request.table, request.columns)?
-        .ok_or_else(|| anyhow::anyhow!("table {:?} has no stable row identity", request.table))?;
-    let col_names: Vec<String> = request
-        .columns
-        .iter()
-        .map(|column| quote_identifier(&column.name))
-        .collect();
-    let order_clause = format!(
-        " ORDER BY {}",
-        build_order_terms(request.order_by, &identity)
-    );
-    let where_part = build_where_part(request.where_clause);
-    let query = format!(
-        "SELECT {} FROM {}{}{} LIMIT {} OFFSET {}",
-        col_names.join(", "),
-        quote_identifier(request.table),
-        where_part,
-        order_clause,
-        request.limit,
-        request.offset
-    );
-
-    let mut stmt = conn.prepare(&query)?;
-    let col_count = request.columns.len();
-    let rows = stmt.query_map(
-        rusqlite::params_from_iter(request.where_params.iter()),
-        |row| decode_row_values(row, col_count),
-    )?;
-
-    rows.collect::<Result<Vec<_>, _>>().context("fetching rows")
-}
-
-pub fn visit_rows(
-    conn: &Connection,
-    request: RowFetch<'_>,
-    mut visitor: impl FnMut(&[types::SqlValue]) -> anyhow::Result<()>,
+    view: &ViewQuery,
+    columns: &[Column],
+    offset: i64,
+    limit: i64,
+    mut visit: impl FnMut(Option<i64>, Vec<SqlValue>) -> anyhow::Result<()>,
 ) -> anyhow::Result<u64> {
-    if request.columns.is_empty() {
+    if columns.is_empty() {
         return Ok(0);
     }
-    let identity = load_row_identity(conn, request.table, request.columns)?
-        .ok_or_else(|| anyhow::anyhow!("table {:?} has no stable row identity", request.table))?;
-    let columns = request
-        .columns
-        .iter()
-        .map(|column| quote_identifier(&column.name))
+    let identity = stable_identity(conn, &view.table, columns)?;
+    let rowid_alias = match &identity {
+        RowIdentity::RowidAlias(alias) => Some(alias.as_str()),
+        RowIdentity::PrimaryKey(_) => None,
+    };
+    let selections = rowid_alias
+        .into_iter()
+        .chain(columns.iter().map(|column| column.name.as_str()))
+        .map(quote_identifier)
         .collect::<Vec<_>>()
         .join(", ");
+    let (params, first) = view.params_with([Value::Integer(limit), Value::Integer(offset)]);
     let query = format!(
-        "SELECT {} FROM {}{} ORDER BY {} LIMIT ?{} OFFSET ?{}",
-        columns,
-        quote_identifier(request.table),
-        build_where_part(request.where_clause),
-        build_order_terms(request.order_by, &identity),
-        request.where_params.len() + 1,
-        request.where_params.len() + 2,
+        "SELECT {selections} FROM {}{} ORDER BY {} LIMIT ?{first} OFFSET ?{}",
+        view.quoted_table(),
+        view.where_part(),
+        view.order_terms(&identity),
+        first + 1,
     );
-    let mut params = request.where_params.to_vec();
-    params.push(rusqlite::types::Value::Integer(request.limit));
-    params.push(rusqlite::types::Value::Integer(request.offset));
+    let value_start = usize::from(rowid_alias.is_some());
     let mut stmt = conn.prepare(&query)?;
     let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
     let mut count = 0;
     while let Some(row) = rows.next()? {
-        let values = decode_row_values(row, request.columns.len())?;
-        visitor(&values)?;
+        let rowid = rowid_alias.map(|_| row.get(0)).transpose()?;
+        visit(rowid, decode_values_from(row, value_start, columns.len())?)?;
         count += 1;
     }
     Ok(count)
 }
 
+#[derive(Debug, Default)]
 pub struct FetchedRows {
-    pub rows: Vec<Vec<types::SqlValue>>,
+    pub rows: Vec<Vec<SqlValue>>,
     pub rowids: Vec<Option<i64>>,
 }
 
-/// Fetches display values and their physical rowids in the same SQLite snapshot.
-/// WITHOUT ROWID tables remain browsable and return `None` rowids, which disables
-/// row mutations in the UI.
-pub fn fetch_rows_with_rowids(
+pub fn fetch_rows(
     conn: &Connection,
-    request: RowFetch<'_>,
+    view: &ViewQuery,
+    columns: &[Column],
+    offset: i64,
+    limit: i64,
 ) -> anyhow::Result<FetchedRows> {
-    if request.columns.is_empty() {
-        return Ok(FetchedRows {
-            rows: Vec::new(),
-            rowids: Vec::new(),
-        });
-    }
-    let identity = load_row_identity(conn, request.table, request.columns)?
-        .ok_or_else(|| anyhow::anyhow!("table {:?} has no stable row identity", request.table))?;
-    let rowid_alias = match &identity {
-        RowIdentity::RowidAlias(alias) => Some(alias.as_str()),
-        RowIdentity::PrimaryKey(_) => None,
-    };
-    let mut selections =
-        Vec::with_capacity(request.columns.len() + usize::from(rowid_alias.is_some()));
-    if let Some(alias) = rowid_alias {
-        selections.push(quote_identifier(alias));
-    }
-    selections.extend(
-        request
-            .columns
-            .iter()
-            .map(|column| quote_identifier(&column.name)),
-    );
-    let query = format!(
-        "SELECT {} FROM {}{} ORDER BY {} LIMIT ?{} OFFSET ?{}",
-        selections.join(", "),
-        quote_identifier(request.table),
-        build_where_part(request.where_clause),
-        build_order_terms(request.order_by, &identity),
-        request.where_params.len() + 1,
-        request.where_params.len() + 2,
-    );
-    let mut params = request.where_params.to_vec();
-    params.push(rusqlite::types::Value::Integer(request.limit));
-    params.push(rusqlite::types::Value::Integer(request.offset));
-    let mut stmt = conn.prepare(&query)?;
-    let value_start = usize::from(rowid_alias.is_some());
-    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-        let rowid = if rowid_alias.is_some() {
-            Some(row.get(0)?)
-        } else {
-            None
-        };
-        let values = (0..request.columns.len())
-            .map(|index| row.get_ref(index + value_start).map(decode_sql_value))
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((rowid, values))
-    })?;
-    let fetched = rows
-        .collect::<Result<Vec<_>, _>>()
-        .context("fetching rows")?;
-    let (rowids, rows) = fetched.into_iter().unzip();
-    Ok(FetchedRows { rows, rowids })
+    let mut fetched = FetchedRows::default();
+    select_rows(conn, view, columns, offset, limit, |rowid, values| {
+        fetched.rowids.push(rowid);
+        fetched.rows.push(values);
+        Ok(())
+    })
+    .context("fetching rows")?;
+    Ok(fetched)
+}
+
+/// Visits every row of `view` without materializing the result set.
+pub fn visit_rows(
+    conn: &Connection,
+    view: &ViewQuery,
+    columns: &[Column],
+    mut visitor: impl FnMut(Vec<SqlValue>) -> anyhow::Result<()>,
+) -> anyhow::Result<u64> {
+    select_rows(conn, view, columns, 0, i64::MAX, |_, values| {
+        visitor(values)
+    })
 }
 
 pub fn fetch_offset_for_rowid(
     conn: &Connection,
-    table: &str,
+    view: &ViewQuery,
     rowid: i64,
-    order_by: Option<(&str, bool)>,
-    where_clause: &str,
-    where_params: &[rusqlite::types::Value],
 ) -> anyhow::Result<Option<i64>> {
-    let columns = load_columns(conn, table)?;
-    let identity = load_row_identity(conn, table, &columns)?
-        .ok_or_else(|| anyhow::anyhow!("table {:?} has no stable row identity", table))?;
+    let columns = load_columns(conn, &view.table)?;
+    let identity = stable_identity(conn, &view.table, &columns)?;
     let RowIdentity::RowidAlias(alias) = &identity else {
         return Ok(None);
     };
-    let order_terms = build_order_terms(order_by, &identity);
-    let where_part = build_where_part(where_clause);
-    let rowid_param = where_params.len() + 1;
+    let (params, rowid_param) = view.params_with([Value::Integer(rowid)]);
     let query = format!(
         "SELECT visible_offset FROM (
             SELECT {rowid}, ROW_NUMBER() OVER (ORDER BY {order_terms}) - 1 AS visible_offset
             FROM {table}{where_part}
         ) WHERE {rowid} = ?{rowid_param} LIMIT 1",
         rowid = quote_identifier(alias),
-        table = quote_identifier(table)
+        order_terms = view.order_terms(&identity),
+        table = view.quoted_table(),
+        where_part = view.where_part(),
     );
-    let mut params = where_params.to_vec();
-    params.push(rusqlite::types::Value::Integer(rowid));
     conn.query_row(&query, rusqlite::params_from_iter(params.iter()), |row| {
         row.get(0)
     })
@@ -517,52 +421,43 @@ pub fn fetch_offset_for_rowid(
     .context("fetching offset for rowid")
 }
 
-pub fn fetch_rowids_at_offsets(
-    conn: &Connection,
-    table: &str,
-    offsets: &[i64],
-    order_by: Option<(&str, bool)>,
-    where_clause: &str,
-    where_params: &[rusqlite::types::Value],
-) -> anyhow::Result<Vec<i64>> {
-    if offsets.is_empty() {
-        return Ok(Vec::new());
-    }
-    let columns = load_columns(conn, table)?;
-    let identity = load_row_identity(conn, table, &columns)?
-        .ok_or_else(|| anyhow::anyhow!("table {:?} has no stable row identity", table))?;
-    let RowIdentity::RowidAlias(alias) = &identity else {
-        anyhow::bail!(
-            "table {:?} does not expose a safe rowid for mutations",
-            table
-        );
-    };
-    let offset_list = offsets
+fn offset_list(offsets: &[i64]) -> Option<String> {
+    let list = offsets
         .iter()
-        .copied()
-        .filter(|offset| *offset >= 0)
+        .filter(|offset| **offset >= 0)
         .map(|offset| offset.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    if offset_list.is_empty() {
+    (!list.is_empty()).then_some(list)
+}
+
+pub fn fetch_rowids_at_offsets(
+    conn: &Connection,
+    view: &ViewQuery,
+    offsets: &[i64],
+) -> anyhow::Result<Vec<i64>> {
+    let Some(offset_list) = offset_list(offsets) else {
         return Ok(Vec::new());
-    }
-    let rowid = quote_identifier(alias);
+    };
+    let columns = load_columns(conn, &view.table)?;
+    let identity = stable_identity(conn, &view.table, &columns)?;
+    let rowid = quote_identifier(&mutable_rowid_alias(&identity, &view.table)?);
     let query = format!(
         "WITH visible AS (
             SELECT {rowid}, ROW_NUMBER() OVER (ORDER BY {order}) - 1 AS visible_offset
             FROM {table}{where_part}
          )
          SELECT {rowid} FROM visible WHERE visible_offset IN ({offset_list})",
-        order = build_order_terms(order_by, &identity),
-        table = quote_identifier(table),
-        where_part = build_where_part(where_clause),
+        order = view.order_terms(&identity),
+        table = view.quoted_table(),
+        where_part = view.where_part(),
     );
     let mut stmt = conn.prepare(&query)?;
     let rowids = stmt
-        .query_map(rusqlite::params_from_iter(where_params.iter()), |row| {
-            row.get(0)
-        })?
+        .query_map(
+            rusqlite::params_from_iter(view.where_params.iter()),
+            |row| row.get(0),
+        )?
         .collect::<Result<Vec<_>, _>>()
         .context("resolving selected row identities")?;
     Ok(rowids)
@@ -570,28 +465,14 @@ pub fn fetch_rowids_at_offsets(
 
 pub fn fetch_rows_at_offsets(
     conn: &Connection,
-    table: &str,
+    view: &ViewQuery,
     columns: &[Column],
     offsets: &[i64],
-    order_by: Option<(&str, bool)>,
-    where_clause: &str,
-    where_params: &[rusqlite::types::Value],
-) -> anyhow::Result<Vec<Vec<types::SqlValue>>> {
-    if columns.is_empty() || offsets.is_empty() {
+) -> anyhow::Result<Vec<Vec<SqlValue>>> {
+    let Some(offset_list) = offset_list(offsets).filter(|_| !columns.is_empty()) else {
         return Ok(Vec::new());
-    }
-    let identity = load_row_identity(conn, table, columns)?
-        .ok_or_else(|| anyhow::anyhow!("table {:?} has no stable row identity", table))?;
-    let offset_list = offsets
-        .iter()
-        .copied()
-        .filter(|offset| *offset >= 0)
-        .map(|offset| offset.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if offset_list.is_empty() {
-        return Ok(Vec::new());
-    }
+    };
+    let identity = stable_identity(conn, &view.table, columns)?;
     let inner_columns = columns
         .iter()
         .map(|column| quote_identifier(&column.name))
@@ -610,16 +491,41 @@ pub fn fetch_rows_at_offsets(
          )
          SELECT {outer_columns} FROM visible
          WHERE visible.{offset_alias} IN ({offset_list}) ORDER BY visible.{offset_alias}",
-        order = build_order_terms(order_by, &identity),
-        table = quote_identifier(table),
-        where_part = build_where_part(where_clause),
+        order = view.order_terms(&identity),
+        table = view.quoted_table(),
+        where_part = view.where_part(),
     );
     let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(where_params.iter()), |row| {
-        decode_row_values(row, columns.len())
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(view.where_params.iter()),
+        |row| decode_row_values(row, columns.len()),
+    )?;
     rows.collect::<Result<Vec<_>, _>>()
         .context("fetching selected rows")
+}
+
+/// Resolves the rowid of the first row whose `column` equals `value`, e.g. the
+/// target of a foreign-key reference. `None` when no such row exists or the
+/// table has no navigable rowid.
+pub fn find_rowid_by_value(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    value: &SqlValue,
+) -> anyhow::Result<Option<i64>> {
+    let columns = load_columns(conn, table)?;
+    let Some(RowIdentity::RowidAlias(alias)) = load_row_identity(conn, table, &columns)? else {
+        return Ok(None);
+    };
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {} = ?1 LIMIT 1",
+        quote_identifier(&alias),
+        quote_identifier(table),
+        quote_identifier(column)
+    );
+    conn.query_row(&sql, [value], |row| row.get(0))
+        .optional()
+        .context("resolving referenced row")
 }
 
 pub fn load_distinct_values(
@@ -628,8 +534,6 @@ pub fn load_distinct_values(
     column: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<String>> {
-    use rusqlite::types::ValueRef;
-
     let column = quote_identifier(column);
     let sql = format!(
         "SELECT DISTINCT {column} FROM {} WHERE {column} IS NOT NULL ORDER BY 1 LIMIT ?1",
@@ -637,14 +541,7 @@ pub fn load_distinct_values(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([limit as i64], |row| {
-        let value = match row.get_ref(0)? {
-            ValueRef::Null => String::new(),
-            ValueRef::Integer(n) => n.to_string(),
-            ValueRef::Real(f) => f.to_string(),
-            ValueRef::Text(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            ValueRef::Blob(bytes) => format!("<blob {} bytes>", bytes.len()),
-        };
-        Ok(value)
+        Ok(SqlValue::from(row.get_ref(0)?).to_text().into_owned())
     })?;
 
     rows.collect::<Result<Vec<_>, _>>()
@@ -655,9 +552,8 @@ pub fn load_distinct_values(
 mod tests {
     use super::*;
 
-    fn text_column(cid: i64, name: &str) -> Column {
+    fn text_column(name: &str) -> Column {
         Column {
-            cid,
             name: name.to_string(),
             col_type: "TEXT".to_string(),
             not_null: false,
@@ -665,6 +561,19 @@ mod tests {
             is_pk: false,
             pk_position: 0,
             writable: true,
+        }
+    }
+
+    /// `items` sorted by `created_at` descending, excluding name 'a'.
+    fn filtered_view() -> ViewQuery {
+        ViewQuery {
+            order_by: Some(query::OrderBy {
+                column: "created_at".to_string(),
+                ascending: false,
+            }),
+            where_clause: "\"name\" != ?1".to_string(),
+            where_params: vec![Value::Text("a".to_string())],
+            ..ViewQuery::table("items")
         }
     }
 
@@ -682,32 +591,21 @@ mod tests {
         )
         .expect("seed items");
 
-        let columns = vec![text_column(0, "name"), text_column(1, "created_at")];
-        let where_params = [rusqlite::types::Value::Text("a".to_string())];
-        let rows = fetch_rows(
-            &conn,
-            RowFetch {
-                table: "items",
-                columns: &columns,
-                offset: 0,
-                limit: 2,
-                order_by: Some(("created_at", false)),
-                where_clause: "\"name\" != ?1",
-                where_params: &where_params,
-            },
-        )
-        .expect("row fetch");
+        let columns = vec![text_column("name"), text_column("created_at")];
+        let rows = fetch_rows(&conn, &filtered_view(), &columns, 0, 2)
+            .expect("row fetch")
+            .rows;
 
         assert_eq!(
             rows,
             vec![
                 vec![
-                    types::SqlValue::Text("c".to_string()),
-                    types::SqlValue::Text("2024-01-03".to_string()),
+                    SqlValue::Text("c".to_string()),
+                    SqlValue::Text("2024-01-03".to_string()),
                 ],
                 vec![
-                    types::SqlValue::Text("b".to_string()),
-                    types::SqlValue::Text("2024-01-02".to_string()),
+                    SqlValue::Text("b".to_string()),
+                    SqlValue::Text("2024-01-02".to_string()),
                 ],
             ]
         );
@@ -727,15 +625,7 @@ mod tests {
         )
         .expect("seed items");
 
-        let offset = fetch_offset_for_rowid(
-            &conn,
-            "items",
-            22,
-            Some(("created_at", false)),
-            "\"name\" != ?1",
-            &[rusqlite::types::Value::Text("a".to_string())],
-        )
-        .expect("offset lookup");
+        let offset = fetch_offset_for_rowid(&conn, &filtered_view(), 22).expect("offset lookup");
 
         assert_eq!(offset, Some(1));
     }
@@ -754,23 +644,16 @@ mod tests {
         )
         .expect("seed items");
 
-        let columns = vec![text_column(0, "name")];
-        let fetched = fetch_rows_with_rowids(
-            &conn,
-            RowFetch {
-                table: "items",
-                columns: &columns,
-                offset: 0,
-                limit: 1,
-                order_by: Some(("name", true)),
-                where_clause: "",
-                where_params: &[],
-            },
-        )
-        .expect("row fetch");
-        let second_offset =
-            fetch_offset_for_rowid(&conn, "items", 20, Some(("name", true)), "", &[])
-                .expect("offset lookup");
+        let columns = vec![text_column("name")];
+        let view = ViewQuery {
+            order_by: Some(query::OrderBy {
+                column: "name".to_string(),
+                ascending: true,
+            }),
+            ..ViewQuery::table("items")
+        };
+        let fetched = fetch_rows(&conn, &view, &columns, 0, 1).expect("row fetch");
+        let second_offset = fetch_offset_for_rowid(&conn, &view, 20).expect("offset lookup");
 
         assert_eq!(fetched.rowids, vec![Some(10)]);
         assert_eq!(second_offset, Some(1));
@@ -786,20 +669,14 @@ mod tests {
         .expect("seed items");
         let columns = load_columns(&conn, "items").expect("load columns");
 
-        let rows = fetch_rows_at_offsets(&conn, "items", &columns, &[0, 2], None, "", &[])
+        let rows = fetch_rows_at_offsets(&conn, &ViewQuery::table("items"), &columns, &[0, 2])
             .expect("fetch selected rows");
 
         assert_eq!(
             rows,
             vec![
-                vec![
-                    types::SqlValue::Integer(99),
-                    types::SqlValue::Text("first".to_string()),
-                ],
-                vec![
-                    types::SqlValue::Integer(99),
-                    types::SqlValue::Text("third".to_string()),
-                ],
+                vec![SqlValue::Integer(99), SqlValue::Text("first".to_string()),],
+                vec![SqlValue::Integer(99), SqlValue::Text("third".to_string()),],
             ]
         );
     }
@@ -820,20 +697,10 @@ mod tests {
                 "code".to_string()
             ]))
         );
-        let rows = fetch_rows(
-            &conn,
-            RowFetch {
-                table: &table.name,
-                columns: &table.columns,
-                offset: 0,
-                limit: 10,
-                order_by: None,
-                where_clause: "",
-                where_params: &[],
-            },
-        )
-        .expect("fetch rows");
-        assert_eq!(rows[0][2], types::SqlValue::Text("first".to_string()));
+        let rows = fetch_rows(&conn, &ViewQuery::table(&table.name), &table.columns, 0, 10)
+            .expect("fetch rows")
+            .rows;
+        assert_eq!(rows[0][2], SqlValue::Text("first".to_string()));
     }
 
     #[test]
@@ -871,6 +738,33 @@ mod tests {
                 .expect("generated column")
                 .writable
         );
+    }
+
+    #[test]
+    fn letter_navigation_counts_only_rows_in_the_view() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE items (name TEXT, category TEXT);
+             INSERT INTO items VALUES
+                ('Alpha', 'kept'),
+                ('Bravo', 'hidden'),
+                ('Charlie', 'kept'),
+                ('Delta', 'kept');",
+        )
+        .expect("seed rows");
+        let view = ViewQuery {
+            order_by: Some(query::OrderBy {
+                column: "name".to_string(),
+                ascending: true,
+            }),
+            where_clause: "\"category\" = ?1".to_string(),
+            where_params: vec![Value::Text("kept".to_string())],
+            ..ViewQuery::table("items")
+        };
+
+        let offset = count_rows_before_letter(&conn, &view, 'c').expect("count offset");
+
+        assert_eq!(offset, 1);
     }
 
     #[test]

@@ -26,19 +26,14 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        Self::ensure_current_config_file()?;
-
-        if let Some(path) = crate::app_dirs::config_file() {
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read config file {}", path.display()))?;
-            let config: Self = toml::from_str(&content)
-                .with_context(|| format!("Failed to parse config file {}", path.display()))?;
-            config.resolve_theme()?;
-            config.resolve_symbols()?;
-            return Ok(config);
-        }
-
-        Ok(Self::default())
+        let path = Self::ensure_config_file()?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file {}", path.display()))?;
+        let config: Self = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file {}", path.display()))?;
+        config.resolve_theme()?;
+        config.resolve_symbols()?;
+        Ok(config)
     }
 
     pub fn resolve_theme(&self) -> anyhow::Result<Theme> {
@@ -126,23 +121,23 @@ impl Config {
                 "table_rule_cross_mid = {table_rule_cross_mid}\n",
                 "scrollbar_thumb = {scrollbar_thumb}\n",
             ),
-            bg = toml_string(&color_to_hex(theme.bg)),
-            bg_soft = toml_string(&color_to_hex(theme.bg_soft)),
-            bg_raised = toml_string(&color_to_hex(theme.bg_raised)),
-            line = toml_string(&color_to_hex(theme.line)),
-            line_soft = toml_string(&color_to_hex(theme.line_soft)),
-            fg = toml_string(&color_to_hex(theme.fg)),
-            fg_dim = toml_string(&color_to_hex(theme.fg_dim)),
-            fg_mute = toml_string(&color_to_hex(theme.fg_mute)),
-            fg_faint = toml_string(&color_to_hex(theme.fg_faint)),
-            accent = toml_string(&color_to_hex(theme.accent)),
-            red = toml_string(&color_to_hex(theme.red)),
-            yellow = toml_string(&color_to_hex(theme.yellow)),
-            green = toml_string(&color_to_hex(theme.green)),
-            teal = toml_string(&color_to_hex(theme.teal)),
-            blue = toml_string(&color_to_hex(theme.blue)),
-            purple = toml_string(&color_to_hex(theme.purple)),
-            pink = toml_string(&color_to_hex(theme.pink)),
+            bg = theme_color(theme.bg),
+            bg_soft = theme_color(theme.bg_soft),
+            bg_raised = theme_color(theme.bg_raised),
+            line = theme_color(theme.line),
+            line_soft = theme_color(theme.line_soft),
+            fg = theme_color(theme.fg),
+            fg_dim = theme_color(theme.fg_dim),
+            fg_mute = theme_color(theme.fg_mute),
+            fg_faint = theme_color(theme.fg_faint),
+            accent = theme_color(theme.accent),
+            red = theme_color(theme.red),
+            yellow = theme_color(theme.yellow),
+            green = theme_color(theme.green),
+            teal = theme_color(theme.teal),
+            blue = theme_color(theme.blue),
+            purple = theme_color(theme.purple),
+            pink = theme_color(theme.pink),
             arrow_up = toml_char(symbols.arrow_up),
             arrow_down = toml_char(symbols.arrow_down),
             arrow_left = toml_char(symbols.arrow_left),
@@ -201,11 +196,11 @@ impl Config {
         )
     }
 
-    fn ensure_current_config_file() -> anyhow::Result<()> {
-        let current =
-            crate::app_dirs::current_config_file().context("Config path is unavailable")?;
+    /// Returns the config path, writing the defaults there when it does not exist yet.
+    fn ensure_config_file() -> anyhow::Result<std::path::PathBuf> {
+        let current = crate::app_dirs::config_file().context("Config path is unavailable")?;
         if current.exists() {
-            return Ok(());
+            return Ok(current);
         }
 
         let parent = current
@@ -214,21 +209,10 @@ impl Config {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create config directory {}", parent.display()))?;
 
-        if let Some(legacy) = crate::app_dirs::legacy_config_file().filter(|path| path.exists()) {
-            std::fs::copy(&legacy, &current).with_context(|| {
-                format!(
-                    "Failed to copy legacy config {} to {}",
-                    legacy.display(),
-                    current.display()
-                )
-            })?;
-        } else {
-            std::fs::write(&current, Self::default_toml()).with_context(|| {
-                format!("Failed to create default config {}", current.display())
-            })?;
-        }
+        std::fs::write(&current, Self::default_toml())
+            .with_context(|| format!("Failed to create default config {}", current.display()))?;
 
-        Ok(())
+        Ok(current)
     }
 }
 
@@ -240,11 +224,8 @@ fn toml_char(value: char) -> String {
     toml_string(&value.to_string())
 }
 
-fn color_to_hex(color: ratatui::style::Color) -> String {
-    match color {
-        ratatui::style::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
-        _ => "#000000".to_string(),
-    }
+fn theme_color(color: ratatui::style::Color) -> String {
+    toml_string(&crate::theme::hex_color(color).unwrap_or_else(|| "#000000".to_string()))
 }
 
 #[cfg(test)]

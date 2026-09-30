@@ -3,16 +3,17 @@ use std::time::Instant;
 
 use ratatui::{
     layout::Rect,
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub enum ToastKind {
     Success,
     Error,
@@ -67,9 +68,6 @@ impl Default for ToastState {
 
 pub fn render_toasts(frame: &mut Frame, area: Rect, state: &ToastState, theme: &Theme) {
     for (i, toast) in state.toasts.iter().enumerate() {
-        let msg = format!("  {}  ", toast.message);
-        let w = (msg.len() as u16).min(60).min(area.width);
-        let x = area.x + area.width.saturating_sub(w);
         let y = area.y + i as u16;
         if y >= area.y + area.height {
             break;
@@ -79,34 +77,32 @@ pub fn render_toasts(frame: &mut Frame, area: Rect, state: &ToastState, theme: &
             ToastKind::Error => theme.red,
             ToastKind::Info => theme.fg_mute,
         };
-        let toast_area = Rect {
-            x,
-            y,
-            width: w,
-            height: 1,
-        };
-        let para = Paragraph::new(Line::from(Span::styled(
-            &msg,
-            Style::default().fg(theme.bg).bg(bg),
-        )));
-        frame.render_widget(para, toast_area);
+        render_banner(frame, area, y, &toast.message, bg, theme);
     }
 }
 
 pub fn render_confirm(frame: &mut Frame, area: Rect, message: &str, theme: &Theme) {
-    let msg = format!("  {}  ", message);
-    let w = (msg.len() as u16).min(60).min(area.width);
-    let x = area.x + area.width.saturating_sub(w);
     let y = area.y + area.height.saturating_sub(3);
-    let confirm_area = Rect {
-        x,
+    render_banner(frame, area, y, message, theme.yellow, theme);
+}
+
+/// A one-line message right-aligned in `area` at row `y`, at most 60 cells wide.
+fn render_banner(frame: &mut Frame, area: Rect, y: u16, message: &str, bg: Color, theme: &Theme) {
+    let text = format!("  {message}  ");
+    let width = (UnicodeWidthStr::width(text.as_str()) as u16)
+        .min(60)
+        .min(area.width);
+    let banner_area = Rect {
+        x: area.x + area.width.saturating_sub(width),
         y,
-        width: w,
+        width,
         height: 1,
     };
-    let para = Paragraph::new(Line::from(Span::styled(
-        &msg,
-        Style::default().fg(theme.bg).bg(theme.yellow),
-    )));
-    frame.render_widget(para, confirm_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(theme.bg).bg(bg),
+        ))),
+        banner_area,
+    );
 }

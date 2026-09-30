@@ -85,14 +85,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         } else {
             app.theme.line
         };
-        let filter_count = grid
-            .filter
-            .columns
-            .values()
-            .map(|cf| cf.rules.iter().filter(|r| r.enabled).count())
-            .sum::<usize>();
+        let filter_count = grid.filter.active_count();
         let meta = {
-            let mut parts = vec![format!("{} rows", fmt_count(grid.window.total_rows))];
+            let mut parts = vec![format!("{} rows", group_thousands(grid.window.total_rows))];
             if filter_count > 0 {
                 parts.push(format!("{} filters", filter_count));
             }
@@ -158,13 +153,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     if let Some(ref mut popup) = app.popup {
-        if matches!(popup, crate::ui::popup::PopupKind::InsertRow(_)) {
-            crate::ui::toast::render_toasts(frame, area, &app.toast, &app.theme);
-            if let Some(ref confirm) = app.pending_confirm {
-                crate::ui::toast::render_confirm(frame, area, &confirm.message, &app.theme);
-            }
-            return;
-        }
         crate::ui::popup::render_popup(frame, area, popup, &app.theme, &app.symbols);
     }
     crate::ui::toast::render_toasts(frame, area, &app.toast, &app.theme);
@@ -173,7 +161,45 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn fmt_count(n: i64) -> String {
+/// The longest prefix of `text` that fits in `max_width` terminal cells.
+pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
+    let mut used = 0usize;
+    text.chars()
+        .take_while(|ch| {
+            used += unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(1);
+            used <= max_width
+        })
+        .collect()
+}
+
+/// Like [`truncate_to_width`], ending in `ellipsis` when text was cut off.
+pub(crate) fn truncate_with_ellipsis(text: &str, max_width: usize, ellipsis: char) -> String {
+    if unicode_width::UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return truncate_to_width(text, max_width);
+    }
+    let mut out = truncate_to_width(text, max_width - 1);
+    out.push(ellipsis);
+    out
+}
+
+/// Writes `text` from `x` without passing `right`, returning where it ended.
+pub(crate) fn put(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    right: u16,
+    text: &str,
+    style: ratatui::style::Style,
+) -> u16 {
+    buf.set_stringn(x, y, text, right.saturating_sub(x) as usize, style)
+        .0
+}
+
+/// Groups digits in threes with narrow no-break spaces.
+pub(crate) fn group_thousands(n: i64) -> String {
     let s = n.abs().to_string();
     let chars: Vec<char> = s.chars().collect();
     let grouped = chars

@@ -1,10 +1,7 @@
-use std::collections::HashMap;
-
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Span,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -300,10 +297,8 @@ pub(crate) fn render_table_rule(
 pub(crate) fn formatted_search_result_value(value: &SqlValue) -> String {
     match value {
         SqlValue::Null => "null".to_string(),
-        SqlValue::Integer(n) => n.to_string(),
-        SqlValue::Real(f) => f.to_string(),
         SqlValue::Text(text) => format_search_result_text(text),
-        SqlValue::Blob(bytes) => format!("<blob {} bytes>", bytes.len()),
+        value => value.to_text().into_owned(),
     }
 }
 
@@ -347,7 +342,6 @@ fn compute_column_widths(
         &columns,
         &rendered_rows,
         available_width.min(u16::MAX as usize) as u16,
-        &HashMap::new(),
         &fk_cols,
     );
     distribute_extra_width_like_grid(columns, widths, available_width)
@@ -422,7 +416,9 @@ fn draw_truncated_text(
     styles: HighlightStyles,
 ) {
     let mut cursor = x;
-    for span in truncated_spans(value, matched_range, max_width, styles.base, styles.matched) {
+    let is_matched = |idx| matched_range.is_some_and(|(start, end)| idx >= start && idx < end);
+    for span in super::highlighted_spans(value, is_matched, max_width, styles.base, styles.matched)
+    {
         for ch in span.content.chars() {
             let ch_width = UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
             buf.set_string(cursor, y, ch.to_string(), span.style);
@@ -431,55 +427,8 @@ fn draw_truncated_text(
     }
 }
 
-fn truncated_spans<'a>(
-    value: &'a str,
-    matched_range: Option<(usize, usize)>,
-    max_width: usize,
-    base_style: Style,
-    matched_style: Style,
-) -> Vec<Span<'a>> {
-    if max_width == 0 {
-        return Vec::new();
-    }
-
-    let chars: Vec<(usize, char)> = value.chars().enumerate().collect();
-    let total_width: usize = chars
-        .iter()
-        .map(|(_, ch)| UnicodeWidthChar::width(*ch).unwrap_or(1))
-        .sum();
-    let needs_ellipsis = total_width > max_width;
-    let content_limit = if needs_ellipsis && max_width > 3 {
-        max_width - 3
-    } else {
-        max_width
-    };
-
-    let mut spans = Vec::new();
-    let mut used_width = 0usize;
-    for (idx, ch) in chars {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(1);
-        if used_width + ch_width > content_limit {
-            break;
-        }
-        let style = if matched_range.is_some_and(|(start, end)| idx >= start && idx < end) {
-            matched_style
-        } else {
-            base_style
-        };
-        spans.push(Span::styled(ch.to_string(), style));
-        used_width += ch_width;
-    }
-
-    if needs_ellipsis {
-        spans.push(Span::styled("...".to_string(), base_style));
-    }
-
-    spans
-}
-
 fn synth_column(header: String, rows: &[Vec<SqlValue>], col_idx: usize) -> Column {
     Column {
-        cid: col_idx as i64,
         name: header,
         col_type: inferred_column_type(rows, col_idx),
         not_null: false,

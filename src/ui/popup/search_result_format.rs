@@ -1,44 +1,21 @@
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
+use chrono::{Local, NaiveDate, NaiveDateTime};
+
+use super::date_picker::{parse_date, parse_datetime};
 
 pub(crate) fn format_search_result_text(value: &str) -> String {
     format_search_result_text_at(value, Local::now().naive_local())
 }
 
 fn format_search_result_text_at(value: &str, now: NaiveDateTime) -> String {
-    let trimmed = value.trim();
-
-    if let Some(dt) = parse_datetime_text(trimmed) {
+    if let Some(dt) = parse_datetime(value) {
         return format!("{} ({})", format_relative_datetime(dt, now), value);
     }
 
-    if let Some(date) = parse_date_text(trimmed) {
+    if let Some(date) = parse_date(value) {
         return format!("{} ({})", format_relative_date(date, now.date()), value);
     }
 
     value.to_string()
-}
-
-fn parse_date_text(text: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()
-}
-
-fn parse_datetime_text(text: &str) -> Option<NaiveDateTime> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(text) {
-        return Some(dt.naive_local());
-    }
-
-    for pattern in [
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-    ] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(text, pattern) {
-            return Some(dt);
-        }
-    }
-
-    None
 }
 
 fn format_relative_date(date: NaiveDate, today: NaiveDate) -> String {

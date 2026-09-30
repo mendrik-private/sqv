@@ -2,7 +2,7 @@ pub mod alphabet_rail;
 pub mod layout;
 pub mod virtual_scroll;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use ratatui::{
     buffer::Buffer,
@@ -14,12 +14,15 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     db::{
+        query::{OrderBy, ViewQuery},
         schema::Column,
-        types::{affinity, ColAffinity, SqlValue},
+        types::{affinity, temporal_kind, ColAffinity, SqlValue, TemporalKind},
     },
+    filter::predicate::filter_to_sql,
     symbols::Symbols,
     theme::Theme,
     ui::popup::InsertRowState,
+    ui::truncate_to_width,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,7 +41,19 @@ pub struct SortSpec {
 pub enum RowSelection {
     None,
     Rows(BTreeSet<usize>),
-    All,
+    /// Every row except the listed ones, so deselecting a few rows of a large
+    /// table stays proportional to the exceptions.
+    All {
+        except: BTreeSet<usize>,
+    },
+}
+
+impl RowSelection {
+    pub fn all() -> Self {
+        RowSelection::All {
+            except: BTreeSet::new(),
+        }
+    }
 }
 
 pub struct GridInit {
@@ -52,7 +67,6 @@ pub struct GridInit {
     pub area_width: u16,
 }
 
-#[allow(dead_code)]
 pub struct GridState {
     pub table_name: String,
     pub columns: Vec<Column>,
@@ -64,7 +78,6 @@ pub struct GridState {
     pub h_scroll: usize,
     pub fk_cols: Vec<bool>,
     pub enumerated_values: Vec<Vec<String>>,
-    pub manual_widths: HashMap<usize, u16>,
     pub needs_fetch: bool,
     pub viewport_start: i64,
     pub avail_col_width: u16,
@@ -75,6 +88,7 @@ pub struct GridState {
     row_selection_base: Option<BTreeSet<usize>>,
 }
 
+/// Header text, badge and divider rows above the data.
 const HEADER_ROWS: u16 = 3;
 const VIEWPORT_SCROLL_MARGIN_ROWS: usize = 5;
 
@@ -112,7 +126,6 @@ impl GridState {
             h_scroll: 0,
             fk_cols: fk_cols_safe,
             enumerated_values: enumerated_values_safe,
-            manual_widths: HashMap::new(),
             needs_fetch: false,
             viewport_start: 0,
             avail_col_width: area_width,
@@ -132,13 +145,8 @@ impl GridState {
         } else {
             &self.width_sample_rows
         };
-        self.col_widths = layout::compute_col_widths(
-            &self.columns,
-            sizing_rows,
-            avail_width,
-            &self.manual_widths,
-            &self.fk_cols,
-        );
+        self.col_widths =
+            layout::compute_col_widths(&self.columns, sizing_rows, avail_width, &self.fk_cols);
         self.avail_col_width = avail_width;
         self.adjust_h_scroll();
     }
@@ -234,27 +242,33 @@ impl GridState {
         }
     }
 
+    /// Selected rows that still exist; the table may have shrunk since selecting.
+    fn existing_selected_rows(
+        rows: &BTreeSet<usize>,
+        total_rows: usize,
+    ) -> impl Iterator<Item = usize> + '_ {
+        rows.range(..total_rows).copied()
+    }
+
     pub fn selected_rows(&self) -> Vec<usize> {
+        let total_rows = self.window.total_rows.max(0) as usize;
         match &self.row_selection {
             RowSelection::None => Vec::new(),
-            RowSelection::Rows(rows) => rows
-                .iter()
-                .copied()
-                .filter(|row| *row < self.window.total_rows.max(0) as usize)
+            RowSelection::Rows(rows) => Self::existing_selected_rows(rows, total_rows).collect(),
+            RowSelection::All { except } => (0..total_rows)
+                .filter(|row| !except.contains(row))
                 .collect(),
-            RowSelection::All => (0..self.window.total_rows.max(0) as usize).collect(),
         }
     }
 
     pub fn selected_row_count(&self) -> usize {
+        let total_rows = self.window.total_rows.max(0) as usize;
         match &self.row_selection {
             RowSelection::None => 0,
-            RowSelection::Rows(rows) => rows
-                .iter()
-                .copied()
-                .filter(|row| *row < self.window.total_rows.max(0) as usize)
-                .count(),
-            RowSelection::All => self.window.total_rows.max(0) as usize,
+            RowSelection::Rows(rows) => Self::existing_selected_rows(rows, total_rows).count(),
+            RowSelection::All { except } => {
+                total_rows - Self::existing_selected_rows(except, total_rows).count()
+            }
         }
     }
 
@@ -274,32 +288,26 @@ impl GridState {
             return;
         }
 
-        let mut rows = match &self.row_selection {
-            RowSelection::None => BTreeSet::new(),
-            RowSelection::Rows(rows) => rows.clone(),
-            RowSelection::All => {
-                let mut all_rows = BTreeSet::new();
-                all_rows.extend(0..total_rows);
-                all_rows
+        match &mut self.row_selection {
+            RowSelection::None => {
+                self.row_selection = RowSelection::Rows(BTreeSet::from([row]));
             }
-        };
-
-        if !rows.remove(&row) {
-            rows.insert(row);
+            RowSelection::Rows(rows) | RowSelection::All { except: rows } => {
+                if !rows.remove(&row) {
+                    rows.insert(row);
+                }
+            }
         }
-
-        self.row_selection = if rows.is_empty() {
-            RowSelection::None
-        } else {
-            RowSelection::Rows(rows)
-        };
+        if !self.has_row_selection() {
+            self.row_selection = RowSelection::None;
+        }
     }
 
     pub fn extend_row_selection_down(&mut self, n: usize) {
         if self.window.total_rows <= 0 {
             return;
         }
-        if matches!(&self.row_selection, RowSelection::All) {
+        if matches!(&self.row_selection, RowSelection::All { .. }) {
             self.scroll_down(n);
             return;
         }
@@ -312,7 +320,7 @@ impl GridState {
         if self.window.total_rows <= 0 {
             return;
         }
-        if matches!(&self.row_selection, RowSelection::All) {
+        if matches!(&self.row_selection, RowSelection::All { .. }) {
             self.scroll_up(n);
             return;
         }
@@ -323,14 +331,25 @@ impl GridState {
 
     pub fn select_all_rows(&mut self) {
         self.row_selection = if self.window.total_rows > 0 {
-            RowSelection::All
+            RowSelection::all()
         } else {
             RowSelection::None
         };
     }
 
+    /// Cheap enough for the renderer, which asks for every visible row: O(log n)
+    /// for explicit rows, O(exceptions) for an all-rows selection.
     pub fn has_row_selection(&self) -> bool {
-        self.selected_row_count() > 0
+        let total_rows = self.window.total_rows.max(0) as usize;
+        match &self.row_selection {
+            RowSelection::None => false,
+            RowSelection::Rows(rows) => Self::existing_selected_rows(rows, total_rows)
+                .next()
+                .is_some(),
+            RowSelection::All { except } => {
+                Self::existing_selected_rows(except, total_rows).count() < total_rows
+            }
+        }
     }
 
     pub fn is_row_selected(&self, abs_row: i64) -> bool {
@@ -341,7 +360,9 @@ impl GridState {
         match &self.row_selection {
             RowSelection::None => false,
             RowSelection::Rows(rows) => rows.contains(&abs_row),
-            RowSelection::All => abs_row < self.window.total_rows.max(0) as usize,
+            RowSelection::All { except } => {
+                abs_row < self.window.total_rows.max(0) as usize && !except.contains(&abs_row)
+            }
         }
     }
 
@@ -363,6 +384,66 @@ impl GridState {
         self.check_needs_fetch();
     }
 
+    pub fn order_by(&self) -> Option<OrderBy> {
+        let sort = self.sort.as_ref()?;
+        Some(OrderBy {
+            column: self.columns.get(sort.col_idx)?.name.clone(),
+            ascending: sort.direction == SortDir::Asc,
+        })
+    }
+
+    /// The table as currently sorted and filtered.
+    pub fn view_query(&self) -> anyhow::Result<ViewQuery> {
+        let (where_clause, where_params) = filter_to_sql(&self.filter)?;
+        Ok(ViewQuery {
+            table: self.table_name.clone(),
+            order_by: self.order_by(),
+            where_clause,
+            where_params,
+        })
+    }
+
+    pub fn is_text_sorted(&self) -> bool {
+        self.sort
+            .as_ref()
+            .and_then(|sort| self.columns.get(sort.col_idx))
+            .is_some_and(|col| matches!(affinity(&col.col_type), ColAffinity::Text))
+    }
+
+    /// Drops the cached window after a write so the next tick refetches it.
+    pub fn invalidate_window(&mut self) {
+        self.window.rows.clear();
+        self.window.rowids.clear();
+        self.window.fetch_in_flight = false;
+        self.needs_fetch = true;
+    }
+
+    /// Moves to the first row and drops the cached window, for when the sort or
+    /// filter changed and old offsets no longer mean anything.
+    pub fn reset_to_top(&mut self) {
+        self.viewport_start = 0;
+        self.focused_row = 0;
+        self.window.rows.clear();
+        self.window.rowids.clear();
+        self.window.offset = 0;
+    }
+
+    /// Re-establishes the focus and viewport invariants after `total_rows` changed.
+    pub fn clamp_to_total_rows(&mut self) {
+        let total_rows = self.window.total_rows;
+        self.focused_row = self.focused_row.min((total_rows - 1).max(0) as usize);
+        let max_start = (total_rows - self.window.viewport_rows as i64).max(0);
+        self.viewport_start = self.viewport_start.min(max_start);
+    }
+
+    /// Accounts for `count` rows deleted from this table.
+    pub fn rows_removed(&mut self, count: usize) {
+        self.clear_row_selection();
+        self.window.total_rows = self.window.total_rows.saturating_sub(count as i64).max(0);
+        self.clamp_to_total_rows();
+        self.invalidate_window();
+    }
+
     fn ensure_shift_selection_started(&mut self) {
         if self.row_selection_anchor.is_some() {
             return;
@@ -372,7 +453,7 @@ impl GridState {
         self.row_selection_base = Some(match &self.row_selection {
             RowSelection::None => BTreeSet::new(),
             RowSelection::Rows(rows) => rows.clone(),
-            RowSelection::All => BTreeSet::new(),
+            RowSelection::All { .. } => BTreeSet::new(),
         });
     }
 
@@ -444,34 +525,11 @@ fn digits(n: i64) -> usize {
     }
 }
 
-fn format_thousands(n: i64) -> String {
-    n.to_string()
-}
-
-fn truncate_to_display_width(s: &str, max_w: usize) -> String {
-    if max_w == 0 {
-        return String::new();
-    }
-    let mut result = String::new();
-    let mut cur_w = 0usize;
-    for c in s.chars() {
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
-        if cur_w + cw > max_w {
-            break;
-        }
-        result.push(c);
-        cur_w += cw;
-    }
-    result
-}
-
 fn col_badge(col: &Column) -> &'static str {
-    let upper = col.col_type.to_uppercase();
-    if upper.contains("DATETIME") || upper.contains("TIMESTAMP") {
-        return "DT ";
-    }
-    if upper.contains("DATE") {
-        return "DAT";
+    match temporal_kind(&col.col_type) {
+        Some(TemporalKind::Datetime) => return "DT ",
+        Some(TemporalKind::Date) => return "DAT",
+        None => {}
     }
     match affinity(&col.col_type) {
         ColAffinity::Integer => "INT",
@@ -483,8 +541,7 @@ fn col_badge(col: &Column) -> &'static str {
 }
 
 fn badge_color(col: &Column, theme: &Theme) -> Color {
-    let upper = col.col_type.to_uppercase();
-    if upper.contains("DATETIME") || upper.contains("TIMESTAMP") || upper.contains("DATE") {
+    if temporal_kind(&col.col_type).is_some() {
         return theme.pink;
     }
     match affinity(&col.col_type) {
@@ -576,11 +633,10 @@ fn format_cell_content(
     inner_w: usize,
     symbols: &Symbols,
 ) -> (String, CellAlign) {
-    let col_upper = col.col_type.to_uppercase();
     match val {
-        SqlValue::Null => (truncate_to_display_width("NULL", inner_w), CellAlign::Left),
+        SqlValue::Null => (truncate_to_width("NULL", inner_w), CellAlign::Left),
         SqlValue::Integer(n) => {
-            if col_upper.contains("BOOL") {
+            if is_boolean_column(col) {
                 let s = if *n != 0 {
                     symbols.bool_true
                 } else {
@@ -588,21 +644,29 @@ fn format_cell_content(
                 };
                 (s.to_string(), CellAlign::Center)
             } else {
-                (
-                    truncate_to_display_width(&format_thousands(*n), inner_w),
-                    CellAlign::Right,
-                )
+                (truncate_to_width(&n.to_string(), inner_w), CellAlign::Right)
             }
         }
-        SqlValue::Real(f) => (
-            truncate_to_display_width(&format!("{:.6}", f), inner_w),
+        SqlValue::Real(_) => (
+            truncate_to_width(&cell_text(val), inner_w),
             CellAlign::Right,
         ),
-        SqlValue::Text(t) => (truncate_to_display_width(t, inner_w), CellAlign::Left),
-        SqlValue::Blob(b) => (
-            truncate_to_display_width(&format!("<blob {} bytes>", b.len()), inner_w),
-            CellAlign::Left,
-        ),
+        SqlValue::Text(_) | SqlValue::Blob(_) => {
+            (truncate_to_width(&cell_text(val), inner_w), CellAlign::Left)
+        }
+    }
+}
+
+/// SQLite stores booleans as integers; the declared type is the only hint.
+fn is_boolean_column(col: &Column) -> bool {
+    col.col_type.to_uppercase().contains("BOOL")
+}
+
+/// Cell text before truncation; reals get a fixed precision so columns align.
+fn cell_text(val: &SqlValue) -> std::borrow::Cow<'_, str> {
+    match val {
+        SqlValue::Real(f) => format!("{:.6}", f).into(),
+        value => value.to_text(),
     }
 }
 
@@ -618,7 +682,6 @@ fn cell_val_style(
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD);
     }
-    let col_upper = col.col_type.to_uppercase();
     match val {
         SqlValue::Null => Style::default()
             .fg(theme.fg_faint)
@@ -627,7 +690,7 @@ fn cell_val_style(
             .fg(theme.purple)
             .add_modifier(Modifier::ITALIC),
         SqlValue::Integer(n) => {
-            if col_upper.contains("BOOL") {
+            if is_boolean_column(col) {
                 if *n != 0 {
                     Style::default().fg(theme.green)
                 } else {
@@ -639,10 +702,7 @@ fn cell_val_style(
         }
         SqlValue::Real(_) => Style::default().fg(theme.blue),
         SqlValue::Text(text) => {
-            if col_upper.contains("DATETIME")
-                || col_upper.contains("TIMESTAMP")
-                || col_upper.contains("DATE")
-            {
+            if temporal_kind(&col.col_type).is_some() {
                 Style::default().fg(theme.pink).add_modifier(Modifier::DIM)
             } else if !enum_values.is_empty() {
                 Style::default().fg(enum_value_color(text, enum_values, theme))
@@ -711,15 +771,29 @@ fn compute_visible_cols(state: &GridState, data_width: u16) -> Vec<(usize, u16)>
     visible_cols
 }
 
-fn render_header(
-    buf: &mut Buffer,
+/// Per-frame layout and styling shared by the grid's render passes.
+#[derive(Clone, Copy)]
+struct GridFrame<'a> {
     area: Rect,
     gutter_width: u16,
-    visible_cols: &[(usize, u16)],
-    state: &GridState,
-    theme: &Theme,
-    symbols: &Symbols,
-) {
+    gutter_digits: usize,
+    visible_cols: &'a [(usize, u16)],
+    state: &'a GridState,
+    insert_row: Option<&'a InsertRowState>,
+    theme: &'a Theme,
+    symbols: &'a Symbols,
+}
+
+fn render_header(buf: &mut Buffer, frame: &GridFrame) {
+    let GridFrame {
+        area,
+        gutter_width,
+        visible_cols,
+        state,
+        theme,
+        symbols,
+        ..
+    } = *frame;
     let header_y = area.y;
     let header_style = Style::default().bg(theme.bg_raised);
     for y in 0..HEADER_ROWS.min(area.height) {
@@ -781,7 +855,7 @@ fn render_header(
 
         let arrow_reserve = if sort_arrow.is_some() { 2usize } else { 0usize };
         let max_name_w = (actual_w as usize).saturating_sub(2 + arrow_reserve);
-        let name_truncated = truncate_to_display_width(&format!(" {}", col.name), max_name_w);
+        let name_truncated = truncate_to_width(&format!(" {}", col.name), max_name_w);
         buf.set_string(
             col_x,
             header_y,
@@ -810,8 +884,7 @@ fn render_header(
             (None, true) => format!("{} {}", badge.trim_end(), symbols.filter_marker),
             (None, false) => badge.trim_end().to_string(),
         };
-        let meta_truncated =
-            truncate_to_display_width(&format!(" {}", meta_text), actual_w as usize);
+        let meta_truncated = truncate_to_width(&format!(" {}", meta_text), actual_w as usize);
         if HEADER_ROWS > 1 && header_y + 1 < area.y + area.height {
             buf.set_string(
                 col_x,
@@ -878,18 +951,13 @@ fn render_header(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_data_rows(
-    buf: &mut Buffer,
-    area: Rect,
-    gutter_width: u16,
-    visible_cols: &[(usize, u16)],
-    state: &GridState,
-    insert_row: Option<&InsertRowState>,
-    theme: &Theme,
-    symbols: &Symbols,
-) {
-    let gutter_digits = digits(state.window.total_rows.max(1));
+fn render_data_rows(buf: &mut Buffer, frame: &GridFrame) {
+    let GridFrame {
+        area,
+        state,
+        insert_row,
+        ..
+    } = *frame;
     let viewport_rows = state.window.viewport_rows;
     let display_start = display_viewport_start(state, insert_row);
     let display_total_rows = total_display_rows(state, insert_row);
@@ -904,45 +972,27 @@ fn render_data_rows(
         }
 
         match display_row_kind(state, insert_row, display_abs_row) {
-            Some(VisibleGridRow::Data { real_abs }) => render_existing_row(
-                buf,
-                area,
-                gutter_width,
-                visible_cols,
-                state,
-                theme,
-                symbols,
-                gutter_digits,
-                row_y,
-                real_abs,
-            ),
-            Some(VisibleGridRow::Insert(insert_state)) => render_insert_row(
-                buf,
-                area,
-                gutter_width,
-                visible_cols,
-                theme,
-                symbols,
-                gutter_digits,
-                row_y,
-                insert_state,
-            ),
+            Some(VisibleGridRow::Data { real_abs }) => {
+                render_existing_row(buf, frame, row_y, real_abs)
+            }
+            Some(VisibleGridRow::Insert(insert_state)) => {
+                render_insert_row(buf, frame, row_y, insert_state)
+            }
             None => break,
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_focused_border(
-    buf: &mut Buffer,
-    area: Rect,
-    gutter_width: u16,
-    visible_cols: &[(usize, u16)],
-    state: &GridState,
-    insert_row: Option<&InsertRowState>,
-    theme: &Theme,
-    symbols: &Symbols,
-) {
+fn render_focused_border(buf: &mut Buffer, frame: &GridFrame) {
+    let GridFrame {
+        area,
+        gutter_width,
+        visible_cols,
+        state,
+        insert_row,
+        theme,
+        ..
+    } = *frame;
     if !show_cell_focus(state, insert_row) {
         return;
     }
@@ -965,9 +1015,7 @@ fn render_focused_border(
         }
         let cell_w = visible_cols[vis_pos].1;
         let focused_bg = insert_row_background(theme, true);
-        draw_cell_border(
-            buf, area, cell_x, cell_y, cell_w, focused_bg, theme, symbols,
-        );
+        draw_cell_border(buf, frame, cell_x, cell_y, cell_w, focused_bg);
         return;
     }
 
@@ -993,22 +1041,23 @@ fn render_focused_border(
     }
     let cell_w = visible_cols[vis_pos].1;
     let focused_bg = row_background(state, theme, state.focused_row as i64, true);
-    draw_cell_border(
-        buf, area, cell_x, cell_y, cell_w, focused_bg, theme, symbols,
-    );
+    draw_cell_border(buf, frame, cell_x, cell_y, cell_w, focused_bg);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw_cell_border(
     buf: &mut Buffer,
-    area: Rect,
+    frame: &GridFrame,
     cell_x: u16,
     cell_y: u16,
     cell_w: u16,
     cell_bg: Color,
-    theme: &Theme,
-    symbols: &Symbols,
 ) {
+    let GridFrame {
+        area,
+        theme,
+        symbols,
+        ..
+    } = *frame;
     if cell_y >= area.y + area.height || cell_x >= area.x + area.width || cell_w < 2 {
         return;
     }
@@ -1153,19 +1202,17 @@ fn display_row_kind<'a>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_existing_row(
-    buf: &mut Buffer,
-    area: Rect,
-    gutter_width: u16,
-    visible_cols: &[(usize, u16)],
-    state: &GridState,
-    theme: &Theme,
-    symbols: &Symbols,
-    gutter_digits: usize,
-    row_y: u16,
-    abs_row: i64,
-) {
+fn render_existing_row(buf: &mut Buffer, frame: &GridFrame, row_y: u16, abs_row: i64) {
+    let GridFrame {
+        area,
+        gutter_width,
+        gutter_digits,
+        visible_cols,
+        state,
+        theme,
+        symbols,
+        ..
+    } = *frame;
     let is_focused = abs_row == state.focused_row as i64;
     let is_selected = state.is_row_selected(abs_row);
     let row_bg = row_background(state, theme, abs_row, is_focused);
@@ -1242,18 +1289,16 @@ fn render_existing_row(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_insert_row(
-    buf: &mut Buffer,
-    area: Rect,
-    gutter_width: u16,
-    visible_cols: &[(usize, u16)],
-    theme: &Theme,
-    symbols: &Symbols,
-    gutter_digits: usize,
-    row_y: u16,
-    insert_row: &InsertRowState,
-) {
+fn render_insert_row(buf: &mut Buffer, frame: &GridFrame, row_y: u16, insert_row: &InsertRowState) {
+    let GridFrame {
+        area,
+        gutter_width,
+        gutter_digits,
+        visible_cols,
+        theme,
+        symbols,
+        ..
+    } = *frame;
     let row_bg = insert_row_background(theme, false);
     buf.set_string(
         area.x,
@@ -1293,10 +1338,8 @@ fn render_insert_row(
         }
 
         if let Some(field) = insert_row.fields.get(col_idx) {
-            let content = truncate_to_display_width(
-                &field.grid_display_value(selected, symbols.cursor),
-                inner_w,
-            );
+            let content =
+                truncate_to_width(&field.grid_display_value(selected, symbols.cursor), inner_w);
             let style = if selected {
                 Style::default()
                     .fg(if field.is_valid() {
@@ -1500,17 +1543,19 @@ pub fn render_grid(
 
     let buf = frame.buffer_mut();
     buf.set_style(area, Style::default().bg(theme.bg));
+    let grid_frame = GridFrame {
+        area,
+        gutter_width,
+        gutter_digits,
+        visible_cols: &visible_cols,
+        state,
+        insert_row,
+        theme,
+        symbols,
+    };
 
     if area.height >= HEADER_ROWS {
-        render_header(
-            buf,
-            area,
-            gutter_width,
-            &visible_cols,
-            state,
-            theme,
-            symbols,
-        );
+        render_header(buf, &grid_frame);
     }
 
     if state.window.total_rows == 0 && insert_row.is_none() && area.height > HEADER_ROWS {
@@ -1524,30 +1569,11 @@ pub fn render_grid(
     }
 
     if area.height > HEADER_ROWS {
-        render_data_rows(
-            buf,
-            area,
-            gutter_width,
-            &visible_cols,
-            state,
-            insert_row,
-            theme,
-            symbols,
-        );
-        render_focused_border(
-            buf,
-            area,
-            gutter_width,
-            &visible_cols,
-            state,
-            insert_row,
-            theme,
-            symbols,
-        );
+        render_data_rows(buf, &grid_frame);
+        render_focused_border(buf, &grid_frame);
         render_vertical_scrollbar(buf, area, state, theme, symbols);
         render_loading_indicator(buf, area, state, theme, symbols);
     }
-    let _ = buf;
     alphabet_rail::render_rail(frame, area, state, theme);
 }
 
@@ -1656,7 +1682,6 @@ mod tests {
 
     fn make_col(name: &str, col_type: &str, is_pk: bool) -> Column {
         Column {
-            cid: 0,
             name: name.to_string(),
             col_type: col_type.to_string(),
             not_null: false,
@@ -1933,5 +1958,35 @@ mod tests {
 
         assert_eq!(grid.row_selection, RowSelection::None);
         assert_eq!(grid.focused_row, 4);
+    }
+
+    #[test]
+    fn deselecting_from_select_all_records_only_the_exception() {
+        let mut grid = GridState::new(GridInit {
+            table_name: "customers".to_string(),
+            columns: vec![make_col("name", "TEXT", false)],
+            fk_cols: vec![false],
+            enumerated_values: vec![Vec::new()],
+            rows: Vec::new(),
+            width_sample_rows: vec![],
+            total_rows: 1_000_000,
+            area_width: 40,
+        });
+        grid.select_all_rows();
+
+        grid.toggle_row_selected(7);
+
+        assert_eq!(
+            grid.row_selection,
+            RowSelection::All {
+                except: BTreeSet::from([7])
+            }
+        );
+        assert!(!grid.is_row_selected(7));
+        assert!(grid.is_row_selected(8));
+        assert_eq!(grid.selected_row_count(), 999_999);
+
+        grid.toggle_row_selected(7);
+        assert_eq!(grid.row_selection, RowSelection::all());
     }
 }

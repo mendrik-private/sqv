@@ -1,30 +1,11 @@
 use ratatui::{
-    buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
     Frame,
 };
 
-use crate::{
-    app::{App, AppMode, FocusPane},
-    db::types::SqlValue,
-};
-
-fn fmt_number(n: i64) -> String {
-    let s = n.abs().to_string();
-    let chars: Vec<char> = s.chars().collect();
-    let grouped: String = chars
-        .rchunks(3)
-        .rev()
-        .map(|c| c.iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\u{202F}");
-    if n < 0 {
-        format!("-{}", grouped)
-    } else {
-        grouped
-    }
-}
+use super::group_thousands;
+use crate::app::{App, AppMode, FocusPane};
 
 pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
@@ -54,21 +35,15 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
             g.window
                 .get_row(abs_row)
                 .and_then(|row| row.get(col_idx))
-                .map(|val| match val {
-                    SqlValue::Null => "NULL".to_string(),
-                    SqlValue::Integer(n) => n.to_string(),
-                    SqlValue::Real(f) => format!("{}", f),
-                    SqlValue::Text(s) => s.chars().take(50).collect(),
-                    SqlValue::Blob(b) => format!("<blob {} bytes>", b.len()),
-                })
+                .map(|value| value.to_text().chars().take(50).collect())
         })
         .unwrap_or_default();
 
     let pos_str = if total_rows > 0 {
         format!(
             "r {}/{}{}col {}",
-            fmt_number(row_num),
-            fmt_number(total_rows),
+            group_thousands(row_num),
+            group_thousands(total_rows),
             app.symbols.inline_separator(),
             col_num
         )
@@ -78,17 +53,7 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
 
     let theme = &app.theme;
 
-    let filter_count = app
-        .grid
-        .as_ref()
-        .map(|g| {
-            g.filter
-                .columns
-                .values()
-                .map(|cf| cf.rules.iter().filter(|r| r.enabled).count())
-                .sum::<usize>()
-        })
-        .unwrap_or(0);
+    let filter_count = app.grid.as_ref().map_or(0, |g| g.filter.active_count());
 
     let sort_str = app
         .grid
@@ -144,7 +109,7 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         } else if selected == grid.window.total_rows.max(0) as usize {
             Some("sel all".to_string())
         } else {
-            Some(format!("sel {}", fmt_number(selected as i64)))
+            Some(format!("sel {}", group_thousands(selected as i64)))
         }
     }) {
         segments.push((
@@ -185,8 +150,9 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     let buf = frame.buffer_mut();
     buf.set_style(area, Style::default().bg(theme.bg_soft));
 
-    let preview = truncate_preview(&cell_preview, area.width as usize / 3, app.symbols.ellipsis);
-    let preview_width = preview.chars().count() as u16;
+    let preview =
+        super::truncate_with_ellipsis(&cell_preview, area.width as usize / 3, app.symbols.ellipsis);
+    let preview_width = unicode_width::UnicodeWidthStr::width(preview.as_str()) as u16;
     let (content_right, preview_x) = preview_layout(area, preview_width);
 
     let mut x = area.x;
@@ -194,9 +160,9 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         if x >= content_right {
             break;
         }
-        x = put(buf, x, area.y, content_right, text, *style);
+        x = super::put(buf, x, area.y, content_right, text, *style);
         if idx + 1 < segments.len() && x < content_right {
-            x = put(
+            x = super::put(
                 buf,
                 x,
                 area.y,
@@ -208,7 +174,7 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     if !preview.is_empty() && preview_x < area.x + area.width {
-        let _ = put(
+        let _ = super::put(
             buf,
             preview_x,
             area.y,
@@ -217,18 +183,6 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
             preview_style(theme),
         );
     }
-}
-
-fn truncate_preview(s: &str, max_chars: usize, ellipsis: char) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let mut out: String = s.chars().take(max_chars).collect();
-    if s.chars().count() > max_chars && max_chars > 1 {
-        out.pop();
-        out.push(ellipsis);
-    }
-    out
 }
 
 fn preview_layout(area: Rect, preview_width: u16) -> (u16, u16) {
@@ -283,22 +237,7 @@ fn action_hint_text(app: &App) -> Option<String> {
     hints.push("[ctrl-h] help".to_string());
     hints.push("[ctrl-q] quit".to_string());
 
-    if hints.is_empty() {
-        None
-    } else {
-        Some(hints.join("  "))
-    }
-}
-
-fn put(buf: &mut Buffer, mut x: u16, y: u16, right: u16, text: &str, style: Style) -> u16 {
-    for ch in text.chars() {
-        if x >= right {
-            break;
-        }
-        buf.set_string(x, y, ch.to_string(), style);
-        x += 1;
-    }
-    x
+    Some(hints.join("  "))
 }
 
 #[cfg(test)]
@@ -347,7 +286,6 @@ mod tests {
     fn make_grid() -> GridState {
         let columns = vec![
             Column {
-                cid: 0,
                 name: "id".to_string(),
                 col_type: "INTEGER".to_string(),
                 not_null: false,
@@ -357,7 +295,6 @@ mod tests {
                 writable: true,
             },
             Column {
-                cid: 1,
                 name: "name".to_string(),
                 col_type: "TEXT".to_string(),
                 not_null: false,

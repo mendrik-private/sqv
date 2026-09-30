@@ -1,6 +1,3 @@
-use std::cmp::Reverse;
-
-use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -8,13 +5,17 @@ use ratatui::{
     widgets::{block::BorderType, Block, Borders, Paragraph},
     Frame,
 };
-use unicode_width::UnicodeWidthChar;
 
-use crate::{db::types::SqlValue, symbols::Symbols, theme::Theme};
+use crate::{
+    db::types::{expects_number, parse_input, SqlValue},
+    symbols::Symbols,
+    theme::Theme,
+};
 
-use super::search_result_format::format_search_result_text;
+use super::{
+    fuzzy_filter, highlighted_spans, search_result_format::format_search_result_text, FuzzyMatch,
+};
 
-#[allow(dead_code)]
 pub struct ValuePickerState {
     pub table: String,
     pub rowid: i64,
@@ -26,15 +27,7 @@ pub struct ValuePickerState {
     pub original: SqlValue,
 }
 
-struct FilteredValue<'a> {
-    raw: &'a str,
-    display: String,
-    score: i64,
-    matched: Vec<usize>,
-}
-
 impl ValuePickerState {
-    #[allow(dead_code)]
     pub fn new(
         table: String,
         rowid: i64,
@@ -56,48 +49,17 @@ impl ValuePickerState {
     }
 
     pub fn selected_sql_value(&self) -> Option<SqlValue> {
-        let value = self.selected_value()?;
-        let upper = self.col_type.to_uppercase();
-        if upper.contains("INT") {
-            return value.parse::<i64>().ok().map(SqlValue::Integer);
-        }
-        if upper.contains("REAL") || upper.contains("FLOAT") || upper.contains("DOUBLE") {
-            return value.parse::<f64>().ok().map(SqlValue::Real);
-        }
-        Some(SqlValue::Text(value.to_string()))
+        parse_input(&self.col_type, self.selected_value()?).ok()
     }
 
-    fn filtered_values(&self) -> Vec<FilteredValue<'_>> {
-        if self.filter.is_empty() {
-            return self
-                .values
+    /// Values matching the filter as (raw value, display text, matched indices).
+    fn filtered_values(&self) -> Vec<FuzzyMatch<&str>> {
+        fuzzy_filter(
+            self.values
                 .iter()
-                .map(|value| FilteredValue {
-                    raw: value.as_str(),
-                    display: format_search_result_text(value),
-                    score: 0,
-                    matched: vec![],
-                })
-                .collect();
-        }
-        let matcher = SkimMatcherV2::default();
-        let mut results: Vec<FilteredValue<'_>> = self
-            .values
-            .iter()
-            .filter_map(|value| {
-                let display = format_search_result_text(value);
-                matcher
-                    .fuzzy_indices(&display, &self.filter)
-                    .map(|(score, indices)| FilteredValue {
-                        raw: value.as_str(),
-                        display,
-                        score,
-                        matched: indices,
-                    })
-            })
-            .collect();
-        results.sort_by_key(|result| Reverse(result.score));
-        results
+                .map(|value| (value.as_str(), format_search_result_text(value))),
+            &self.filter,
+        )
     }
 
     pub fn move_up(&mut self) {
@@ -119,7 +81,7 @@ impl ValuePickerState {
         let offset = usize::from(self.custom_value_available());
         filtered
             .get(self.selected.saturating_sub(offset))
-            .map(|entry| entry.raw)
+            .map(|(raw, _, _)| *raw)
     }
 
     pub fn push_filter_char(&mut self, ch: char) {
@@ -152,17 +114,13 @@ impl ValuePickerState {
         entries.extend(
             self.filtered_values()
                 .into_iter()
-                .map(|entry| (entry.display, entry.matched, false)),
+                .map(|(_, display, matched)| (display, matched, false)),
         );
         entries
     }
 
     fn is_textual(&self) -> bool {
-        let upper = self.col_type.to_uppercase();
-        !(upper.contains("INT")
-            || upper.contains("REAL")
-            || upper.contains("FLOAT")
-            || upper.contains("DOUBLE"))
+        !expects_number(&self.col_type)
     }
 }
 
@@ -175,14 +133,7 @@ pub fn render(
 ) {
     let popup_width = (area.width / 2).max(30).min(area.width);
     let popup_height = 15u16.min(area.height);
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect {
-        x,
-        y,
-        width: popup_width,
-        height: popup_height,
-    };
+    let popup_area = super::centered_rect(area, popup_width, popup_height);
 
     super::paint_popup_surface(frame, popup_area, theme);
 
@@ -249,17 +200,17 @@ pub fn render(
                 "Use new value: ",
                 Style::default().fg(theme.fg_dim).bg(bg),
             ));
-            spans.extend(truncated_spans(
+            spans.extend(highlighted_spans(
                 val,
-                &[],
+                |_| false,
                 inner.width.saturating_sub(17) as usize,
                 Style::default().fg(theme.green).bg(bg),
                 Style::default().fg(theme.green).bg(bg),
             ));
         } else {
-            spans.extend(truncated_spans(
+            spans.extend(highlighted_spans(
                 val,
-                matched,
+                |idx| matched.binary_search(&idx).is_ok(),
                 inner.width.saturating_sub(4) as usize,
                 Style::default().fg(theme.fg).bg(bg),
                 Style::default().fg(theme.accent).bg(bg),
@@ -280,84 +231,4 @@ pub fn render(
         Paragraph::new(lines).style(Style::default().bg(theme.bg_raised)),
         inner,
     );
-}
-
-fn truncated_spans<'a>(
-    value: &'a str,
-    matched: &[usize],
-    max_width: usize,
-    base_style: Style,
-    matched_style: Style,
-) -> Vec<Span<'a>> {
-    if max_width == 0 {
-        return Vec::new();
-    }
-
-    let chars: Vec<(usize, char)> = value.chars().enumerate().collect();
-    let total_width: usize = chars
-        .iter()
-        .map(|(_, ch)| UnicodeWidthChar::width(*ch).unwrap_or(1))
-        .sum();
-    let needs_ellipsis = total_width > max_width;
-    let content_limit = if needs_ellipsis && max_width > 3 {
-        max_width - 3
-    } else {
-        max_width
-    };
-
-    let mut spans = Vec::new();
-    let mut used_width = 0usize;
-    for (idx, ch) in chars {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(1);
-        if used_width + ch_width > content_limit {
-            break;
-        }
-        let style = if matched.contains(&idx) {
-            matched_style
-        } else {
-            base_style
-        };
-        spans.push(Span::styled(ch.to_string(), style));
-        used_width += ch_width;
-    }
-
-    if needs_ellipsis {
-        spans.push(Span::styled("...".to_string(), base_style));
-    }
-
-    spans
-}
-
-#[cfg(test)]
-mod tests {
-    use super::truncated_spans;
-    use ratatui::style::Style;
-
-    #[test]
-    fn truncates_long_values_with_ellipsis() {
-        let spans = truncated_spans(
-            "Embraer - Empresa Brasileira de Aeronáutica S.A.",
-            &[],
-            12,
-            Style::default(),
-            Style::default(),
-        );
-        let rendered = spans
-            .into_iter()
-            .map(|span| span.content)
-            .collect::<String>();
-
-        assert_eq!(rendered, "Embraer -...");
-    }
-
-    #[test]
-    fn leaves_short_values_untouched() {
-        let spans = truncated_spans("Apple Inc.", &[0], 20, Style::default(), Style::default());
-        let rendered = spans
-            .into_iter()
-            .map(|span| span.content)
-            .collect::<String>();
-
-        assert_eq!(rendered, "Apple Inc.");
-    }
 }

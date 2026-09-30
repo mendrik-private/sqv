@@ -1,7 +1,7 @@
 pub mod predicate;
 pub mod rule;
 
-pub use rule::{ColumnFilter, FilterOp, FilterSet, FilterValue};
+pub use rule::{ColumnFilter, Condition, FilterOp, FilterRule, FilterSet};
 
 use std::path::PathBuf;
 
@@ -22,8 +22,7 @@ pub fn filter_path(db_path: &str, table_name: &str) -> Option<PathBuf> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Some(
-        crate::app_dirs::data_local_dir()?
-            .join("filters-v2")
+        crate::app_dirs::filter_dir()?
             .join(format!("{database_key:016x}"))
             .join(format!("{table_key}.toml")),
     )

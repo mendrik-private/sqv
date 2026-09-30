@@ -147,14 +147,7 @@ fn write_osc(sequence: &str) -> std::io::Result<()> {
 }
 
 fn terminal_background_osc(theme: &theme::Theme) -> Option<String> {
-    color_osc_spec(theme.bg).map(|color| format!("\x1b]11;{color}\x07"))
-}
-
-fn color_osc_spec(color: ratatui::style::Color) -> Option<String> {
-    match color {
-        ratatui::style::Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
-        _ => None,
-    }
+    theme::hex_color(theme.bg).map(|color| format!("\x1b]11;{color}\x07"))
 }
 
 #[tokio::main]

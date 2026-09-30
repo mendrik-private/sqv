@@ -17,11 +17,17 @@ use super::search_results_table::{
     SearchResultTableRow,
 };
 
+/// Finds rows of the current view by case-insensitive substring over each
+/// cell's displayed text. Display text and matches are cached because the popup
+/// holds up to thousands of rows and redraws on every key.
 pub struct FindState {
-    pub query: String,
+    query: String,
     pub table_name: String,
     pub columns: Vec<Column>,
-    pub rows: Vec<Vec<SqlValue>>,
+    rows: Vec<Vec<SqlValue>>,
+    /// Lowercased display text of every cell, parallel to `rows`.
+    search_text: Vec<Vec<String>>,
+    hits: Vec<FindHit>,
     pub selected: usize,
     pub loading: bool,
 }
@@ -39,19 +45,35 @@ impl FindState {
             table_name,
             columns,
             rows: Vec::new(),
+            search_text: Vec::new(),
+            hits: Vec::new(),
             selected: 0,
             loading: true,
         }
     }
 
+    pub fn set_rows(&mut self, rows: Vec<Vec<SqlValue>>) {
+        self.search_text = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| formatted_search_result_value(value).to_lowercase())
+                    .collect()
+            })
+            .collect();
+        self.rows = rows;
+        self.loading = false;
+        self.refresh_hits();
+    }
+
     pub fn push_char(&mut self, ch: char) {
         self.query.push(ch);
-        self.selected = 0;
+        self.refresh_hits();
     }
 
     pub fn pop_char(&mut self) {
         self.query.pop();
-        self.selected = 0;
+        self.refresh_hits();
     }
 
     pub fn move_up(&mut self) {
@@ -59,15 +81,20 @@ impl FindState {
     }
 
     pub fn move_down(&mut self) {
-        let count = self.hit_count();
-        if self.selected + 1 < count {
+        if self.selected + 1 < self.hits.len() {
             self.selected += 1;
         }
     }
 
-    pub fn visible_hits(&self) -> Vec<FindHit> {
-        if self.query.trim().is_empty() {
-            return self
+    pub fn hits(&self) -> &[FindHit] {
+        &self.hits
+    }
+
+    fn refresh_hits(&mut self) {
+        self.selected = 0;
+        let needle = self.query.trim().to_lowercase();
+        if needle.is_empty() {
+            self.hits = self
                 .rows
                 .iter()
                 .enumerate()
@@ -77,45 +104,32 @@ impl FindState {
                     matched_ranges: vec![None; row.len()],
                 })
                 .collect();
+            return;
         }
 
-        let needle = self.query.trim().to_lowercase();
         let needle_chars = needle.chars().count();
-        self.rows
+        self.hits = self
+            .search_text
             .iter()
             .enumerate()
-            .filter_map(|(idx, row)| {
-                let mut found = false;
-                let mut first_match_col = 0;
-                let mut matched_ranges = Vec::with_capacity(row.len());
-                for (col_idx, value) in row.iter().enumerate() {
-                    let display = formatted_search_result_value(value);
-                    let lower = display.to_lowercase();
-                    let range = lower.find(&needle).map(|byte_start| {
-                        let start = lower[..byte_start].chars().count();
-                        if !found {
-                            found = true;
-                            first_match_col = col_idx;
-                        }
-                        (start, start + needle_chars)
-                    });
-                    matched_ranges.push(range);
-                }
-                found.then_some(FindHit {
+            .filter_map(|(idx, cells)| {
+                let matched_ranges = cells
+                    .iter()
+                    .map(|text| {
+                        text.find(&needle).map(|byte_start| {
+                            let start = text[..byte_start].chars().count();
+                            (start, start + needle_chars)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let first_match_col = matched_ranges.iter().position(Option::is_some)?;
+                Some(FindHit {
                     abs_row_index: idx,
                     first_match_col,
                     matched_ranges,
                 })
             })
-            .collect()
-    }
-
-    fn hit_count(&self) -> usize {
-        if self.query.trim().is_empty() {
-            self.rows.len()
-        } else {
-            self.visible_hits().len()
-        }
+            .collect();
     }
 
     fn column_headers(&self) -> Vec<String> {
@@ -129,14 +143,7 @@ impl FindState {
 pub fn render(frame: &mut Frame, area: Rect, state: &FindState, theme: &Theme, symbols: &Symbols) {
     let popup_width = ((area.width * 4) / 5).max(60).min(area.width);
     let popup_height = ((area.height * 3) / 5).max(12).min(area.height);
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect {
-        x,
-        y,
-        width: popup_width,
-        height: popup_height,
-    };
+    let popup_area = super::centered_rect(area, popup_width, popup_height);
 
     super::paint_popup_surface(frame, popup_area, theme);
 
@@ -206,7 +213,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FindState, theme: &Theme, s
         input_area,
     );
 
-    let hits = state.visible_hits();
+    let hits = state.hits();
     let headers = state.column_headers();
     let visible_columns: Vec<_> = (0..headers.len()).collect();
     let table_rows: Vec<_> = hits

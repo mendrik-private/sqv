@@ -1,3 +1,4 @@
+use super::text_cursor;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Style,
@@ -8,12 +9,11 @@ use ratatui::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    db::types::{affinity, ColAffinity, SqlValue},
+    db::types::{affinity, expects_number, parse_input, ColAffinity, SqlValue},
     symbols::Symbols,
     theme::Theme,
 };
 
-#[allow(dead_code)]
 pub struct TextEditorState {
     pub table: String,
     pub rowid: i64,
@@ -109,36 +109,17 @@ impl TextEditorState {
         if self.readonly {
             return;
         }
-        let byte_pos = self
-            .current
-            .char_indices()
-            .nth(self.cursor_pos)
-            .map_or(self.current.len(), |(i, _)| i);
-        self.current.insert(byte_pos, ch);
+        text_cursor::insert(&mut self.current, &mut self.cursor_pos, ch);
         self.dirty = true;
-        self.cursor_pos += 1;
         self.follow_cursor = true;
         self.validate();
     }
 
     pub fn delete_backward(&mut self) {
-        if self.readonly || self.cursor_pos == 0 {
+        if self.readonly || !text_cursor::delete_backward(&mut self.current, &mut self.cursor_pos) {
             return;
         }
-        let byte_pos = self
-            .current
-            .char_indices()
-            .nth(self.cursor_pos - 1)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let end_pos = self
-            .current
-            .char_indices()
-            .nth(self.cursor_pos)
-            .map_or(self.current.len(), |(i, _)| i);
-        self.current.replace_range(byte_pos..end_pos, "");
         self.dirty = true;
-        self.cursor_pos -= 1;
         self.follow_cursor = true;
         self.validate();
     }
@@ -149,10 +130,7 @@ impl TextEditorState {
     }
 
     pub fn move_cursor_right(&mut self) {
-        let len = self.current.chars().count();
-        if self.cursor_pos < len {
-            self.cursor_pos += 1;
-        }
+        text_cursor::move_right(&self.current, &mut self.cursor_pos);
         self.follow_cursor = true;
     }
 
@@ -244,20 +222,16 @@ impl TextEditorState {
     }
 
     fn validate(&mut self) {
-        let upper = self.col_type.to_uppercase();
-        if matches!(self.original, SqlValue::Blob(_)) {
-            self.valid = self.current.len().is_multiple_of(2)
-                && self.current.bytes().all(|byte| byte.is_ascii_hexdigit());
-        } else if upper.contains("INT") {
-            self.valid = self.current.is_empty() || self.current.parse::<i64>().is_ok();
-        } else if upper.contains("REAL") || upper.contains("FLOAT") || upper.contains("DOUBLE") {
-            self.valid = self.current.is_empty() || self.current.parse::<f64>().is_ok();
-        } else if self.json_mode {
-            self.valid = self.current.trim().is_empty()
-                || serde_json::from_str::<serde_json::Value>(&self.current).is_ok();
+        self.valid = if matches!(self.original, SqlValue::Blob(_)) {
+            self.current.len().is_multiple_of(2)
+                && self.current.bytes().all(|byte| byte.is_ascii_hexdigit())
+        } else if self.current.trim().is_empty() {
+            true
+        } else if self.json_mode && !expects_number(&self.col_type) {
+            serde_json::from_str::<serde_json::Value>(&self.current).is_ok()
         } else {
-            self.valid = true;
-        }
+            parse_input(&self.col_type, &self.current).is_ok()
+        };
     }
 
     pub fn as_sql_value(&self) -> anyhow::Result<SqlValue> {
@@ -286,14 +260,8 @@ impl TextEditorState {
                 SqlValue::Null
             });
         }
-        let upper = self.col_type.to_uppercase();
-        if upper.contains("INT") {
-            Ok(self.current.parse::<i64>().map(SqlValue::Integer)?)
-        } else if upper.contains("REAL") || upper.contains("FLOAT") || upper.contains("DOUBLE") {
-            Ok(self.current.parse::<f64>().map(SqlValue::Real)?)
-        } else {
-            Ok(SqlValue::Text(self.current.clone()))
-        }
+        parse_input(&self.col_type, &self.current)
+            .map_err(|error| anyhow::anyhow!("{} {error}", self.col_name))
     }
 
     fn move_cursor_vertically(&mut self, direction: isize) {
@@ -478,12 +446,7 @@ pub fn render(
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
-    let upper = state.col_type.to_uppercase();
-    let show_validity = state.json_mode
-        || upper.contains("INT")
-        || upper.contains("REAL")
-        || upper.contains("FLOAT")
-        || upper.contains("DOUBLE");
+    let show_validity = state.json_mode || expects_number(&state.col_type);
 
     let sections = if state.is_multiline {
         Layout::vertical([

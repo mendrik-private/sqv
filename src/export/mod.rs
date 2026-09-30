@@ -7,147 +7,121 @@ use std::{
 
 use rusqlite::Connection;
 
-use crate::{
-    db::{schema::Column, types::SqlValue},
-    filter::{predicate::filter_to_sql, FilterSet},
-    grid::{SortDir, SortSpec},
+use crate::db::{
+    query::{quote_identifier, ViewQuery},
+    schema::Column,
+    types::SqlValue,
+    visit_rows,
 };
 
-pub fn export_csv(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Csv,
+    Json,
+    Sql,
+}
+
+impl ExportFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Csv => "csv",
+            ExportFormat::Json => "json",
+            ExportFormat::Sql => "sql",
+        }
+    }
+}
+
+/// Streams every row of `view` into `path`, replacing it atomically, and returns
+/// the number of exported rows.
+pub fn export(
     conn: &Connection,
-    table: &str,
+    format: ExportFormat,
+    view: &ViewQuery,
     columns: &[Column],
-    filter: &FilterSet,
-    sort: &Option<SortSpec>,
     path: &Path,
 ) -> anyhow::Result<u64> {
-    let (where_clause, where_params) = filter_to_sql(filter)?;
-    let order = sort.as_ref().and_then(|s| {
-        columns
-            .get(s.col_idx)
-            .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
-    });
-    let order_ref = order.as_ref().map(|(s, b)| (s.as_str(), *b));
-
-    atomic_export(path, |file| {
-        let mut writer = csv::Writer::from_writer(file);
-        writer.write_record(columns.iter().map(|column| column.name.as_str()))?;
-        let count = crate::db::visit_rows(
-            conn,
-            row_fetch(table, columns, order_ref, &where_clause, &where_params),
-            |row| {
-                writer.write_record(row.iter().map(val_to_str))?;
-                Ok(())
-            },
-        )?;
-        writer.flush()?;
-        Ok(count)
+    atomic_export(path, |file| match format {
+        ExportFormat::Csv => write_csv(conn, view, columns, file),
+        ExportFormat::Json => write_json(conn, view, columns, file),
+        ExportFormat::Sql => write_sql(conn, view, columns, file),
     })
 }
 
-pub fn export_json(
+fn write_csv(
     conn: &Connection,
-    table: &str,
+    view: &ViewQuery,
     columns: &[Column],
-    filter: &FilterSet,
-    sort: &Option<SortSpec>,
-    path: &Path,
+    file: File,
 ) -> anyhow::Result<u64> {
-    let (where_clause, where_params) = filter_to_sql(filter)?;
-    let order = sort.as_ref().and_then(|s| {
-        columns
-            .get(s.col_idx)
-            .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
-    });
-    let order_ref = order.as_ref().map(|(s, b)| (s.as_str(), *b));
-
-    atomic_export(path, |file| {
-        let mut out = BufWriter::new(file);
-        out.write_all(b"[")?;
-        let mut first = true;
-        let count = crate::db::visit_rows(
-            conn,
-            row_fetch(table, columns, order_ref, &where_clause, &where_params),
-            |row| {
-                if !first {
-                    out.write_all(b",")?;
-                }
-                first = false;
-                let object = columns
-                    .iter()
-                    .zip(row)
-                    .map(|(column, value)| (column.name.clone(), val_to_json(value)))
-                    .collect::<serde_json::Map<_, _>>();
-                serde_json::to_writer(&mut out, &object)?;
-                Ok(())
-            },
-        )?;
-        out.write_all(b"]\n")?;
-        out.flush()?;
-        Ok(count)
-    })
+    let mut writer = csv::Writer::from_writer(file);
+    writer.write_record(columns.iter().map(|column| column.name.as_str()))?;
+    let count = visit_rows(conn, view, columns, |row| {
+        writer.write_record(row.iter().map(val_to_str))?;
+        Ok(())
+    })?;
+    writer.flush()?;
+    Ok(count)
 }
 
-pub fn export_sql(
+fn write_json(
     conn: &Connection,
-    table: &str,
+    view: &ViewQuery,
     columns: &[Column],
-    filter: &FilterSet,
-    sort: &Option<SortSpec>,
-    path: &Path,
+    file: File,
 ) -> anyhow::Result<u64> {
-    let (where_clause, where_params) = filter_to_sql(filter)?;
-    let order = sort.as_ref().and_then(|s| {
-        columns
-            .get(s.col_idx)
-            .map(|c| (c.name.clone(), s.direction == SortDir::Asc))
-    });
-    let order_ref = order.as_ref().map(|(s, b)| (s.as_str(), *b));
+    let mut out = BufWriter::new(file);
+    out.write_all(b"[")?;
+    let mut first = true;
+    let count = visit_rows(conn, view, columns, |row| {
+        if !first {
+            out.write_all(b",")?;
+        }
+        first = false;
+        serde_json::to_writer(&mut out, &row_to_json(columns, &row))?;
+        Ok(())
+    })?;
+    out.write_all(b"]\n")?;
+    out.flush()?;
+    Ok(count)
+}
 
-    let col_names: String = columns
+fn write_sql(
+    conn: &Connection,
+    view: &ViewQuery,
+    columns: &[Column],
+    file: File,
+) -> anyhow::Result<u64> {
+    let col_names = columns
         .iter()
-        .map(|column| crate::db::query::quote_identifier(&column.name))
+        .map(|column| quote_identifier(&column.name))
         .collect::<Vec<_>>()
         .join(", ");
-    let quoted_table = crate::db::query::quote_identifier(table);
-    atomic_export(path, |file| {
-        let mut out = BufWriter::new(file);
-        let count = crate::db::visit_rows(
-            conn,
-            row_fetch(table, columns, order_ref, &where_clause, &where_params),
-            |row| {
-                let values = row.iter().map(val_to_sql_literal).collect::<Vec<_>>();
-                writeln!(
-                    out,
-                    "INSERT INTO {} ({}) VALUES ({});",
-                    quoted_table,
-                    col_names,
-                    values.join(", ")
-                )?;
-                Ok(())
-            },
+    let quoted_table = view.quoted_table();
+    let mut out = BufWriter::new(file);
+    let count = visit_rows(conn, view, columns, |row| {
+        let values = row.iter().map(val_to_sql_literal).collect::<Vec<_>>();
+        writeln!(
+            out,
+            "INSERT INTO {} ({}) VALUES ({});",
+            quoted_table,
+            col_names,
+            values.join(", ")
         )?;
-        out.flush()?;
-        Ok(count)
-    })
+        Ok(())
+    })?;
+    out.flush()?;
+    Ok(count)
 }
 
-fn row_fetch<'a>(
-    table: &'a str,
-    columns: &'a [Column],
-    order_by: Option<(&'a str, bool)>,
-    where_clause: &'a str,
-    where_params: &'a [rusqlite::types::Value],
-) -> crate::db::RowFetch<'a> {
-    crate::db::RowFetch {
-        table,
-        columns,
-        offset: 0,
-        limit: i64::MAX,
-        order_by,
-        where_clause,
-        where_params,
-    }
+/// One row as a JSON object keyed by column name. BLOBs have no JSON
+/// representation and become `null`.
+pub fn row_to_json(columns: &[Column], row: &[SqlValue]) -> serde_json::Value {
+    columns
+        .iter()
+        .zip(row)
+        .map(|(column, value)| (column.name.clone(), val_to_json(value)))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 static NEXT_EXPORT_ID: AtomicU64 = AtomicU64::new(0);
@@ -181,13 +155,11 @@ fn temporary_export_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{file_name}.{}-{id}.tmp", std::process::id()))
 }
 
+/// CSV has no NULL; an empty field is the conventional spelling.
 fn val_to_str(v: &SqlValue) -> String {
     match v {
         SqlValue::Null => String::new(),
-        SqlValue::Integer(n) => n.to_string(),
-        SqlValue::Real(f) => f.to_string(),
-        SqlValue::Text(s) => s.clone(),
-        SqlValue::Blob(b) => format!("<blob {} bytes>", b.len()),
+        value => value.to_text().into_owned(),
     }
 }
 
@@ -229,15 +201,14 @@ mod tests {
     };
 
     use crate::{
-        db::schema::Column,
-        filter::{rule::FilterRule, ColumnFilter, FilterOp, FilterSet, FilterValue},
+        db::{query::OrderBy, schema::Column},
+        filter::{predicate::filter_to_sql, ColumnFilter, Condition, FilterRule, FilterSet},
     };
 
     static NEXT_TEST_FILE_ID: AtomicUsize = AtomicUsize::new(0);
 
-    fn column(cid: i64, name: &str, col_type: &str) -> Column {
+    fn column(name: &str, col_type: &str) -> Column {
         Column {
-            cid,
             name: name.to_string(),
             col_type: col_type.to_string(),
             not_null: false,
@@ -263,17 +234,25 @@ mod tests {
         content
     }
 
+    fn sorted_view(column: &str, ascending: bool, filter: &FilterSet) -> ViewQuery {
+        let (where_clause, where_params) = filter_to_sql(filter).expect("compile filter");
+        ViewQuery {
+            order_by: Some(OrderBy {
+                column: column.to_string(),
+                ascending,
+            }),
+            where_clause,
+            where_params,
+            ..ViewQuery::table("items")
+        }
+    }
+
     fn literal_filter(column_name: &str, value: SqlValue) -> FilterSet {
         FilterSet {
             columns: HashMap::from([(
                 column_name.to_string(),
                 ColumnFilter {
-                    rules: vec![FilterRule {
-                        op: FilterOp::Eq,
-                        value: FilterValue::Literal(value),
-                        enabled: true,
-                        label: None,
-                    }],
+                    rules: vec![FilterRule::new(Condition::Eq(value))],
                 },
             )]),
         }
@@ -295,19 +274,15 @@ again');
         .expect("seed items");
 
         let columns = vec![
-            column(0, "id", "INTEGER"),
-            column(1, "category", "TEXT"),
-            column(2, "note", "TEXT"),
+            column("id", "INTEGER"),
+            column("category", "TEXT"),
+            column("note", "TEXT"),
         ];
         let filter = literal_filter("category", SqlValue::Text("keep".to_string()));
-        let sort = Some(SortSpec {
-            col_idx: 0,
-            direction: SortDir::Desc,
-        });
+        let view = sorted_view("id", false, &filter);
         let path = temp_export_path("csv");
 
-        let count =
-            export_csv(&conn, "items", &columns, &filter, &sort, &path).expect("export csv");
+        let count = export(&conn, ExportFormat::Csv, &view, &columns, &path).expect("export csv");
         let content = read_export(&path);
         let mut reader = csv::Reader::from_reader(content.as_bytes());
 
@@ -355,19 +330,14 @@ next line', X'00FF');
         .expect("seed items");
 
         let columns = vec![
-            column(0, "id", "INTEGER"),
-            column(1, "note", "TEXT"),
-            column(2, "payload", "BLOB"),
+            column("id", "INTEGER"),
+            column("note", "TEXT"),
+            column("payload", "BLOB"),
         ];
-        let filter = FilterSet::default();
-        let sort = Some(SortSpec {
-            col_idx: 0,
-            direction: SortDir::Asc,
-        });
+        let view = sorted_view("id", true, &FilterSet::default());
         let path = temp_export_path("json");
 
-        let count =
-            export_json(&conn, "items", &columns, &filter, &sort, &path).expect("export json");
+        let count = export(&conn, ExportFormat::Json, &view, &columns, &path).expect("export json");
         let content = read_export(&path);
         let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid json");
 
@@ -395,18 +365,17 @@ next line', X'00FF');
         .expect("seed items");
 
         let columns = vec![
-            column(0, "id", "INTEGER"),
-            column(1, "note", "TEXT"),
-            column(2, "payload", "BLOB"),
+            column("id", "INTEGER"),
+            column("note", "TEXT"),
+            column("payload", "BLOB"),
         ];
         let path = temp_export_path("sql");
 
-        let count = export_sql(
+        let count = export(
             &conn,
-            "items",
+            ExportFormat::Sql,
+            &ViewQuery::table("items"),
             &columns,
-            &FilterSet::default(),
-            &None,
             &path,
         )
         .expect("export sql");

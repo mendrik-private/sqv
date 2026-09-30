@@ -4,22 +4,12 @@ use ratatui::{
     Frame,
 };
 
-use crate::{
-    db::types::{affinity, ColAffinity},
-    grid::GridState,
-    theme::Theme,
-};
+use super::{GridState, HEADER_ROWS};
+use crate::theme::Theme;
 
+/// Letter jumps only pay off on long, text-sorted tables.
 pub fn should_show_rail(state: &GridState) -> bool {
-    if state.window.total_rows < 200 {
-        return false;
-    }
-    if let Some(sort) = &state.sort {
-        if let Some(col) = state.columns.get(sort.col_idx) {
-            return matches!(affinity(&col.col_type), ColAffinity::Text);
-        }
-    }
-    false
+    state.window.total_rows >= 200 && state.is_text_sorted()
 }
 
 pub const RAIL_WIDTH: u16 = 2;
@@ -65,13 +55,13 @@ pub fn hit_test(area: Rect, state: &GridState, x: u16, y: u16) -> Option<char> {
         return None;
     }
 
-    let track_height = area.height.saturating_sub(3) as usize;
+    let track_height = area.height.saturating_sub(HEADER_ROWS) as usize;
     if track_height == 0 {
         return None;
     }
 
     let rail_x = area.x + area.width.saturating_sub(RAIL_WIDTH + 1);
-    let rail_y_start = area.y + 3;
+    let rail_y_start = area.y + HEADER_ROWS;
     let letters = letters_to_show(track_height);
     let rail_y_end = rail_y_start + letters.len() as u16;
     if x < rail_x || x >= rail_x + RAIL_WIDTH || y < rail_y_start || y >= rail_y_end {
@@ -86,14 +76,14 @@ pub fn render_rail(frame: &mut Frame, area: Rect, state: &GridState, theme: &The
         return;
     }
 
-    let track_height = area.height.saturating_sub(3) as usize;
+    let track_height = area.height.saturating_sub(HEADER_ROWS) as usize;
     if track_height == 0 {
         return;
     }
 
     // Rail is 2 chars wide, to the left of the scrollbar (1 col)
     let rail_x = area.x + area.width.saturating_sub(RAIL_WIDTH + 1);
-    let rail_y_start = area.y + 3; // after header and divider
+    let rail_y_start = area.y + HEADER_ROWS;
 
     let current_letter = active_letter(state);
     let letters_to_show = letters_to_show(track_height);
@@ -131,7 +121,6 @@ mod tests {
 
     fn text_col(name: &str) -> Column {
         Column {
-            cid: 0,
             name: name.to_string(),
             col_type: "TEXT".to_string(),
             not_null: false,

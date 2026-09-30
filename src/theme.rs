@@ -2,7 +2,6 @@ use anyhow::{bail, Context};
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     pub bg: Color,
@@ -103,6 +102,14 @@ fn apply_color_override(
         *target = parse_hex_color(field, value)?;
     }
     Ok(())
+}
+
+/// `#rrggbb` for an RGB color, the inverse of the config's color syntax.
+pub fn hex_color(color: Color) -> Option<String> {
+    match color {
+        Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+        _ => None,
+    }
 }
 
 fn parse_hex_color(field: &str, value: &str) -> anyhow::Result<Color> {

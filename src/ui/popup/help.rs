@@ -109,17 +109,11 @@ fn popup_area(area: Rect, help_text: &str) -> Rect {
 
     let desired_width = content_width.saturating_add(4);
     let desired_height = content_height.saturating_add(4);
-    let popup_width = desired_width.min(area.width.saturating_sub(4));
-    let popup_height = desired_height.min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-
-    Rect {
-        x,
-        y,
-        width: popup_width,
-        height: popup_height,
-    }
+    super::centered_rect(
+        area,
+        desired_width.min(area.width.saturating_sub(4)),
+        desired_height.min(area.height.saturating_sub(4)),
+    )
 }
 
 fn help_text(symbols: &Symbols) -> String {
@@ -197,19 +191,19 @@ fn help_text(symbols: &Symbols) -> String {
                     format!("{}{} / k j", symbols.arrow_up, symbols.arrow_down),
                     "Move up/down",
                     "Export CSV",
-                    "Save to ~/sqview_export.csv",
+                    "Save to ~/sqview_<table>_*.csv",
                 ),
                 help_row(
                     format!("{}{} / h l", symbols.arrow_left, symbols.arrow_right),
                     "Close/open",
                     "Export JSON",
-                    "Save to ~/sqview_export.json",
+                    "Save to ~/sqview_<table>_*.json",
                 ),
                 help_row(
                     "Enter",
                     "Open table",
                     "Export SQL",
-                    "Save to ~/sqview_export.sql",
+                    "Save to ~/sqview_<table>_*.sql",
                 ),
             ],
         },

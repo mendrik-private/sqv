@@ -127,7 +127,7 @@ Configuration is read from:
 $XDG_CONFIG_HOME/sqview/config.toml
 ```
 
-On first launch, sqview creates this file automatically if it is missing. If only the legacy `sqv` config exists, sqview copies it forward to the current path before loading it.
+On first launch, sqview creates this file automatically if it is missing.
 
 Example:
 

@@ -15,7 +15,6 @@ use super::search_results_table::{
 
 pub struct FkPickerState {
     pub target_table: String,
-    #[allow(dead_code)]
     pub target_col: String,
     pub display_cols: Vec<String>,
     pub rows: Vec<Vec<SqlValue>>,
@@ -191,14 +190,7 @@ pub fn render(
 ) {
     let popup_width = ((area.width * 3) / 5).max(54).min(area.width);
     let popup_height = ((area.height * 3) / 5).max(12).min(area.height);
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect {
-        x,
-        y,
-        width: popup_width,
-        height: popup_height,
-    };
+    let popup_area = super::centered_rect(area, popup_width, popup_height);
 
     super::paint_popup_surface(frame, popup_area, theme);
 

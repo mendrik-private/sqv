@@ -347,7 +347,7 @@ fn build_sidebar_items(
                 format!(" {} ", symbols.view_icon),
                 Style::default().fg(theme.purple),
             );
-            let name_span = Span::styled(view.name.clone(), name_style);
+            let name_span = Span::styled(view.clone(), name_style);
             items.push(ListItem::new(Line::from(vec![icon_span, name_span])));
         }
     }
@@ -367,7 +367,7 @@ fn build_sidebar_items(
                 format!(" {} ", symbols.index_icon),
                 Style::default().fg(theme.yellow),
             );
-            let name_span = Span::styled(index.name.clone(), name_style);
+            let name_span = Span::styled(index.clone(), name_style);
             items.push(ListItem::new(Line::from(vec![icon_span, name_span])));
         }
     }
@@ -446,7 +446,7 @@ mod tests {
     use ratatui::{buffer::Buffer, widgets::StatefulWidget};
 
     use super::*;
-    use crate::db::schema::{IndexMeta, Schema, TableMeta, ViewMeta};
+    use crate::db::schema::{Schema, TableMeta};
 
     fn make_schema() -> Schema {
         Schema {
@@ -454,18 +454,10 @@ mod tests {
                 name: "users".to_string(),
                 columns: vec![],
                 foreign_keys: vec![],
-                indexes: vec![],
                 row_identity: None,
             }],
-            views: vec![ViewMeta {
-                name: "active_users".to_string(),
-                sql: None,
-            }],
-            indexes: vec![IndexMeta {
-                name: "users_name_idx".to_string(),
-                table: "users".to_string(),
-                unique: false,
-            }],
+            views: vec!["active_users".to_string()],
+            indexes: vec!["users_name_idx".to_string()],
         }
     }
 

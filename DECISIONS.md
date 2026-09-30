@@ -19,14 +19,13 @@
 
 ## Column Sizing Algorithm
 
-**Decision**: Three-case greedy algorithm with TEXT columns getting 2× weight.
+**Decision**: Size each column independently from a trimmed mean of sampled cell widths, and scroll horizontally when the columns do not fit.
 
 **Rationale**:
-- Case 1 (fits): Prefer content-driven widths for readability. Give TEXT extra slack because long strings benefit most from wider columns.
-- Case 2 (doesn't fit but headers fit): Show at least column headers. Distribute remaining space weighted toward TEXT columns since they're most useful to read.
-- Case 3 (headers don't fit): Everything at minimum; horizontal scrolling is required.
-- The weight-2 for TEXT is a heuristic that feels natural — numeric columns rarely need extra width, while text columns benefit greatly from a few extra chars.
-- Unicode grapheme width is measured with `unicode-width` to handle CJK and emoji correctly.
+- Widths come from the first rows loaded for a table and stay stable while scrolling, so columns do not jump as the window moves.
+- Dropping the widest and narrowest samples keeps one long value from dominating a column; widths are capped at 40 cells.
+- Every column is at least wide enough for its header name, its key or link markers, and a floor of 6 cells.
+- Unicode display width is measured with `unicode-width` to handle CJK and emoji correctly.
 
 ## No Animation Except the Loading Stripe
 

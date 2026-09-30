@@ -1,3 +1,5 @@
+use super::text_cursor;
+use crate::ui::truncate_with_ellipsis;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -8,8 +10,8 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    db::types::SqlValue,
-    filter::{rule::FilterRule, FilterOp, FilterValue},
+    db::types::{parse_input, SqlValue},
+    filter::{Condition, FilterOp, FilterRule},
     symbols::Symbols,
     theme::Theme,
 };
@@ -66,7 +68,7 @@ impl FilterPopupState {
         let draft_op = col_filter
             .rules
             .last()
-            .map(|rule| rule.op)
+            .map(|rule| rule.condition.op())
             .unwrap_or(crate::filter::FilterOp::Contains);
         let mut state = Self {
             col_name,
@@ -87,15 +89,17 @@ impl FilterPopupState {
     }
 
     pub fn next_op(&mut self) {
-        let ops = popup_ops();
-        let idx = ops.iter().position(|op| *op == self.draft_op).unwrap_or(0);
-        self.draft_op = ops[(idx + 1) % ops.len()];
+        self.shift_op(1);
     }
 
     pub fn prev_op(&mut self) {
-        let ops = popup_ops();
+        self.shift_op(FilterOp::ALL.len() - 1);
+    }
+
+    fn shift_op(&mut self, steps: usize) {
+        let ops = FilterOp::ALL;
         let idx = ops.iter().position(|op| *op == self.draft_op).unwrap_or(0);
-        self.draft_op = ops[(idx + ops.len() - 1) % ops.len()];
+        self.draft_op = ops[(idx + steps) % ops.len()];
     }
 
     pub fn select_prev_rule(&mut self) {
@@ -115,39 +119,15 @@ impl FilterPopupState {
     }
 
     pub fn move_cursor_right(&mut self) {
-        let len = self.draft_value.chars().count();
-        if self.draft_cursor_pos < len {
-            self.draft_cursor_pos += 1;
-        }
+        text_cursor::move_right(&self.draft_value, &mut self.draft_cursor_pos);
     }
 
     pub fn push_char(&mut self, ch: char) {
-        let byte_pos = self
-            .draft_value
-            .char_indices()
-            .nth(self.draft_cursor_pos)
-            .map_or(self.draft_value.len(), |(i, _)| i);
-        self.draft_value.insert(byte_pos, ch);
-        self.draft_cursor_pos += 1;
+        text_cursor::insert(&mut self.draft_value, &mut self.draft_cursor_pos, ch);
     }
 
     pub fn pop_char(&mut self) {
-        if self.draft_cursor_pos == 0 {
-            return;
-        }
-        let byte_pos = self
-            .draft_value
-            .char_indices()
-            .nth(self.draft_cursor_pos - 1)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let end_pos = self
-            .draft_value
-            .char_indices()
-            .nth(self.draft_cursor_pos)
-            .map_or(self.draft_value.len(), |(i, _)| i);
-        self.draft_value.replace_range(byte_pos..end_pos, "");
-        self.draft_cursor_pos -= 1;
+        text_cursor::delete_backward(&mut self.draft_value, &mut self.draft_cursor_pos);
     }
 
     pub fn next_focus(&mut self) {
@@ -225,7 +205,6 @@ impl FilterPopupState {
         if self.selected_rule < self.col_filter.rules.len() {
             let existing = &self.col_filter.rules[self.selected_rule];
             rule.enabled = existing.enabled;
-            rule.label = existing.label.clone();
             self.col_filter.rules[self.selected_rule] = rule;
         } else {
             self.col_filter.rules.push(rule);
@@ -255,42 +234,15 @@ impl FilterPopupState {
             return Err("Needle is required".to_string());
         }
 
-        let value = match self.draft_op {
-            FilterOp::Contains => FilterValue::Pattern(needle.to_string()),
-            FilterOp::Regex => FilterValue::Regex(needle.to_string()),
-            FilterOp::Eq | FilterOp::Lt | FilterOp::Gt => {
-                FilterValue::Literal(self.parse_literal(needle)?)
-            }
-            _ => return Err("Unsupported filter operator".to_string()),
-        };
-
-        Ok(FilterRule {
-            op: self.draft_op,
-            value,
-            enabled: true,
-            label: None,
-        })
-    }
-
-    fn parse_literal(&self, needle: &str) -> Result<SqlValue, String> {
-        let upper = self.col_type.to_uppercase();
-        if upper.contains("INT") {
-            return needle
-                .parse::<i64>()
-                .map(SqlValue::Integer)
-                .map_err(|_| "Needle must be a valid integer".to_string());
-        }
-        if upper.contains("REAL")
-            || upper.contains("FLOAT")
-            || upper.contains("DOUBLE")
-            || upper.contains("NUM")
-        {
-            return needle
-                .parse::<f64>()
-                .map(SqlValue::Real)
-                .map_err(|_| "Needle must be a valid number".to_string());
-        }
-        Ok(SqlValue::Text(needle.to_string()))
+        let literal =
+            || parse_input(&self.col_type, needle).map_err(|error| format!("Needle {error}"));
+        Ok(FilterRule::new(match self.draft_op {
+            FilterOp::Lt => Condition::Lt(literal()?),
+            FilterOp::Gt => Condition::Gt(literal()?),
+            FilterOp::Eq => Condition::Eq(literal()?),
+            FilterOp::Contains => Condition::Contains(needle.to_string()),
+            FilterOp::Regex => Condition::Regex(needle.to_string()),
+        }))
     }
 
     fn clamp_selection(&mut self) {
@@ -306,17 +258,12 @@ impl FilterPopupState {
 
     fn sync_editor_from_selection(&mut self) {
         if let Some(rule) = self.col_filter.rules.get(self.selected_rule) {
-            if popup_ops().contains(&rule.op) {
-                self.draft_op = rule.op;
-            }
-            self.draft_value = draft_value(rule);
+            self.draft_op = rule.condition.op();
+            self.draft_value = rule.condition.operand_text().into_owned();
             self.draft_cursor_pos = self.draft_value.chars().count();
         } else {
             self.draft_value.clear();
             self.draft_cursor_pos = 0;
-            if !popup_ops().contains(&self.draft_op) {
-                self.draft_op = FilterOp::Contains;
-            }
         }
     }
 }
@@ -332,12 +279,7 @@ fn popup_layout(area: Rect) -> FilterPopupLayout {
         .saturating_sub(6)
         .max(12)
         .min(area.height);
-    let popup_area = Rect {
-        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
-        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
-        width: popup_w,
-        height: popup_h,
-    };
+    let popup_area = super::centered_rect(area, popup_w, popup_h);
     let inner = inner_rect(popup_area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -493,58 +435,16 @@ pub fn hit_test(area: Rect, state: &FilterPopupState, x: u16, y: u16) -> Option<
     None
 }
 
-fn popup_ops() -> &'static [FilterOp] {
-    &[
-        FilterOp::Lt,
-        FilterOp::Gt,
-        FilterOp::Eq,
-        FilterOp::Contains,
-        FilterOp::Regex,
-    ]
-}
-
-fn popup_op_label(op: FilterOp) -> &'static str {
-    match op {
-        FilterOp::Lt => "<",
-        FilterOp::Gt => ">",
-        FilterOp::Eq => "==",
-        FilterOp::Contains => "contains",
-        FilterOp::Regex => "regexp",
-        _ => op.label(),
-    }
-}
-
-fn draft_value(rule: &FilterRule) -> String {
-    match &rule.value {
-        FilterValue::Literal(SqlValue::Null) => "NULL".to_string(),
-        FilterValue::Literal(SqlValue::Integer(n)) => n.to_string(),
-        FilterValue::Literal(SqlValue::Real(f)) => f.to_string(),
-        FilterValue::Literal(SqlValue::Text(s)) => s.clone(),
-        FilterValue::Literal(SqlValue::Blob(b)) => format!("<blob {} bytes>", b.len()),
-        FilterValue::Pattern(s) => s.clone(),
-        FilterValue::Regex(s) => s.clone(),
-        FilterValue::Range(_, _)
-        | FilterValue::List(_)
-        | FilterValue::Formula(_)
-        | FilterValue::N(_) => format_rule(rule),
-    }
-}
-
 fn format_rule(rule: &FilterRule) -> String {
-    let value = match &rule.value {
-        FilterValue::Literal(SqlValue::Null) => "NULL".to_string(),
-        FilterValue::Literal(SqlValue::Integer(n)) => n.to_string(),
-        FilterValue::Literal(SqlValue::Real(f)) => f.to_string(),
-        FilterValue::Literal(SqlValue::Text(s)) => format!("\"{}\"", s),
-        FilterValue::Literal(SqlValue::Blob(b)) => format!("<blob {} bytes>", b.len()),
-        FilterValue::Pattern(s) => format!("\"{}\"", s),
-        FilterValue::Regex(s) => format!("\"{}\"", s),
-        FilterValue::Range(lo, hi) => format!("{lo:?}..{hi:?}"),
-        FilterValue::List(values) => format!("{} values", values.len()),
-        FilterValue::Formula(s) => s.clone(),
-        FilterValue::N(n) => n.to_string(),
+    let operand = match &rule.condition {
+        Condition::Lt(SqlValue::Text(text))
+        | Condition::Gt(SqlValue::Text(text))
+        | Condition::Eq(SqlValue::Text(text))
+        | Condition::Contains(text)
+        | Condition::Regex(text) => format!("\"{text}\""),
+        condition => condition.operand_text().into_owned(),
     };
-    format!("{} {}", popup_op_label(rule.op), value)
+    format!("{} {}", rule.condition.op().symbol(), operand)
 }
 
 fn format_rule_summary(col_name: &str, rule: &FilterRule) -> String {
@@ -563,7 +463,7 @@ fn render_rule_list(
     buf.set_string(
         area.x,
         area.y,
-        truncate(&title, area.width as usize, symbols.ellipsis),
+        truncate_with_ellipsis(&title, area.width as usize, symbols.ellipsis),
         Style::default()
             .fg(theme.fg_faint)
             .bg(theme.bg_raised)
@@ -642,7 +542,7 @@ fn render_rule_list(
         buf.set_string(
             area.x,
             y,
-            truncate(&text, text_width, symbols.ellipsis),
+            truncate_with_ellipsis(&text, text_width, symbols.ellipsis),
             base_style,
         );
         if !actions.is_empty() {
@@ -698,7 +598,7 @@ fn render_editor(
     frame.buffer_mut().set_string(
         area.x,
         area.y,
-        truncate(heading, area.width as usize, symbols.ellipsis),
+        truncate_with_ellipsis(heading, area.width as usize, symbols.ellipsis),
         Style::default()
             .fg(theme.fg_faint)
             .bg(theme.bg_raised)
@@ -731,8 +631,8 @@ fn render_editor(
     frame.buffer_mut().set_string(
         layout.operator_inner.x,
         layout.operator_inner.y,
-        truncate(
-            &format!("{} {}", popup_op_label(state.draft_op), symbols.dropdown),
+        truncate_with_ellipsis(
+            &format!("{} {}", state.draft_op.symbol(), symbols.dropdown),
             layout.operator_inner.width as usize,
             symbols.ellipsis,
         ),
@@ -753,7 +653,7 @@ fn render_editor(
     frame.buffer_mut().set_string(
         layout.value_inner.x,
         layout.value_inner.y,
-        truncate(
+        truncate_with_ellipsis(
             &editor_value,
             layout.value_inner.width as usize,
             symbols.ellipsis,
@@ -880,33 +780,12 @@ fn render_footer(
     );
 }
 
-fn truncate(text: &str, max_width: usize, ellipsis: char) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let width = UnicodeWidthChar::width(ch).unwrap_or(1);
-        if used + width > max_width {
-            break;
-        }
-        out.push(ch);
-        used += width;
-    }
-    if UnicodeWidthStr::width(text) > max_width && max_width > 1 {
-        out.pop();
-        out.push(ellipsis);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::{hit_test, popup_layout, FilterPopupFocus, FilterPopupHit, FilterPopupState};
     use crate::{
         db::types::SqlValue,
-        filter::{rule::FilterRule, ColumnFilter, FilterOp},
+        filter::{ColumnFilter, Condition, FilterOp, FilterRule},
     };
     use ratatui::layout::Rect;
 
@@ -924,10 +803,10 @@ mod tests {
         state.add_rule().expect("expected valid rule");
 
         assert_eq!(state.col_filter.rules.len(), 1);
-        assert!(matches!(
-            state.col_filter.rules[0].value,
-            crate::filter::FilterValue::Literal(SqlValue::Integer(42))
-        ));
+        assert_eq!(
+            state.col_filter.rules[0].condition,
+            Condition::Gt(SqlValue::Integer(42))
+        );
     }
 
     #[test]
@@ -937,18 +816,8 @@ mod tests {
             "TEXT".to_string(),
             ColumnFilter {
                 rules: vec![
-                    FilterRule {
-                        op: FilterOp::Contains,
-                        value: crate::filter::FilterValue::Pattern("a".to_string()),
-                        enabled: true,
-                        label: None,
-                    },
-                    FilterRule {
-                        op: FilterOp::Contains,
-                        value: crate::filter::FilterValue::Pattern("b".to_string()),
-                        enabled: true,
-                        label: None,
-                    },
+                    FilterRule::new(Condition::Contains("a".to_string())),
+                    FilterRule::new(Condition::Contains("b".to_string())),
                 ],
             },
         );
@@ -982,12 +851,7 @@ mod tests {
             "name".to_string(),
             "TEXT".to_string(),
             ColumnFilter {
-                rules: vec![FilterRule {
-                    op: FilterOp::Contains,
-                    value: crate::filter::FilterValue::Pattern("gon".to_string()),
-                    enabled: true,
-                    label: None,
-                }],
+                rules: vec![FilterRule::new(Condition::Contains("gon".to_string()))],
             },
         );
 
@@ -1002,12 +866,7 @@ mod tests {
             "name".to_string(),
             "TEXT".to_string(),
             ColumnFilter {
-                rules: vec![FilterRule {
-                    op: FilterOp::Contains,
-                    value: crate::filter::FilterValue::Pattern("gon".to_string()),
-                    enabled: true,
-                    label: None,
-                }],
+                rules: vec![FilterRule::new(Condition::Contains("gon".to_string()))],
             },
         );
 
@@ -1021,12 +880,7 @@ mod tests {
             "name".to_string(),
             "TEXT".to_string(),
             ColumnFilter {
-                rules: vec![FilterRule {
-                    op: FilterOp::Contains,
-                    value: crate::filter::FilterValue::Pattern("gon".to_string()),
-                    enabled: true,
-                    label: None,
-                }],
+                rules: vec![FilterRule::new(Condition::Contains("gon".to_string()))],
             },
         );
 
@@ -1042,12 +896,7 @@ mod tests {
             "name".to_string(),
             "TEXT".to_string(),
             ColumnFilter {
-                rules: vec![FilterRule {
-                    op: FilterOp::Contains,
-                    value: crate::filter::FilterValue::Pattern("gon".to_string()),
-                    enabled: true,
-                    label: None,
-                }],
+                rules: vec![FilterRule::new(Condition::Contains("gon".to_string()))],
             },
         );
         state.draft_op = FilterOp::Regex;
@@ -1057,7 +906,10 @@ mod tests {
         state.add_rule().expect("expected updated rule");
 
         assert_eq!(state.col_filter.rules.len(), 1);
-        assert_eq!(state.col_filter.rules[0].op, FilterOp::Regex);
+        assert_eq!(
+            state.col_filter.rules[0].condition,
+            Condition::Regex("^g.*".to_string())
+        );
     }
 
     #[test]
@@ -1066,12 +918,7 @@ mod tests {
             "name".to_string(),
             "TEXT".to_string(),
             ColumnFilter {
-                rules: vec![FilterRule {
-                    op: FilterOp::Contains,
-                    value: crate::filter::FilterValue::Pattern("gon".to_string()),
-                    enabled: true,
-                    label: None,
-                }],
+                rules: vec![FilterRule::new(Condition::Contains("gon".to_string()))],
             },
         );
         let area = Rect {

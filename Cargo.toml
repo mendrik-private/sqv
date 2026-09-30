@@ -1,6 +1,6 @@
 [package]
 name = "sqview"
-version = "0.2.6"
+version = "0.3.0"
 edition = "2021"
 description = "Keyboard-first terminal SQLite viewer"
 readme = "README.md"
@@ -40,7 +40,6 @@ toml = "0.8"
 directories = "5"
 clap = { version = "4", features = ["derive"] }
 unicode-width = "0.2"
-unicode-segmentation = "1"
 fuzzy-matcher = "0.3"
 regex = "1"
 csv = "1.3"

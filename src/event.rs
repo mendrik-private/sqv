@@ -12,7 +12,7 @@ pub fn translate_event(event: Event) -> Option<Message> {
             }
         }
         Event::Mouse(mouse) => Some(Message::Mouse(mouse)),
-        Event::Resize(w, h) => Some(Message::Resize(w, h)),
+        Event::Resize(..) => Some(Message::Resize),
         _ => None,
     }
 }

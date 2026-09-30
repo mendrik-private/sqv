@@ -1,6 +1,5 @@
-use std::cmp::Reverse;
+use std::borrow::Cow;
 
-use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
@@ -9,6 +8,7 @@ use ratatui::{
     Frame,
 };
 
+use super::{fuzzy_filter, FuzzyMatch};
 use crate::{symbols::Symbols, theme::Theme};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,7 +22,6 @@ pub enum PaletteCommand {
     ReloadSchema,
     ToggleSidebar,
     ToggleReadonly,
-    ResetColumnWidths,
     ClearFilters,
     Quit,
 }
@@ -39,9 +38,15 @@ impl PaletteCommand {
             PaletteCommand::ReloadSchema => "Reload schema",
             PaletteCommand::ToggleSidebar => "Toggle sidebar",
             PaletteCommand::ToggleReadonly => "Toggle read-only",
-            PaletteCommand::ResetColumnWidths => "Reset column widths",
             PaletteCommand::ClearFilters => "Clear filters",
             PaletteCommand::Quit => "Quit",
+        }
+    }
+
+    pub fn display_label(&self) -> Cow<'static, str> {
+        match self {
+            PaletteCommand::SwitchTable(name) => format!("Switch Table: {name}").into(),
+            command => command.label().into(),
         }
     }
 }
@@ -63,7 +68,6 @@ impl CommandPaletteState {
             PaletteCommand::ReloadSchema,
             PaletteCommand::ToggleSidebar,
             PaletteCommand::ToggleReadonly,
-            PaletteCommand::ResetColumnWidths,
             PaletteCommand::ClearFilters,
             PaletteCommand::Quit,
         ];
@@ -77,35 +81,13 @@ impl CommandPaletteState {
         }
     }
 
-    pub fn filtered(&self) -> Vec<(usize, &PaletteCommand, Vec<usize>)> {
-        if self.query.is_empty() {
-            return self
-                .commands
+    fn filtered(&self) -> Vec<FuzzyMatch<&PaletteCommand>> {
+        fuzzy_filter(
+            self.commands
                 .iter()
-                .enumerate()
-                .map(|(i, c)| (i, c, vec![]))
-                .collect();
-        }
-        let matcher = SkimMatcherV2::default();
-        let mut results: Vec<(usize, &PaletteCommand, i64, Vec<usize>)> = self
-            .commands
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| {
-                let label = match c {
-                    PaletteCommand::SwitchTable(name) => format!("Switch Table: {}", name),
-                    _ => c.label().to_string(),
-                };
-                matcher
-                    .fuzzy_indices(&label, &self.query)
-                    .map(|(score, indices)| (i, c, score, indices))
-            })
-            .collect();
-        results.sort_by_key(|result| Reverse(result.2));
-        results
-            .into_iter()
-            .map(|(i, c, _, idx)| (i, c, idx))
-            .collect()
+                .map(|command| (command, command.display_label().into_owned())),
+            &self.query,
+        )
     }
 
     pub fn move_up(&mut self) {
@@ -122,7 +104,7 @@ impl CommandPaletteState {
     pub fn selected_command(&self) -> Option<PaletteCommand> {
         self.filtered()
             .get(self.selected)
-            .map(|(_, c, _)| (*c).clone())
+            .map(|(command, _, _)| (*command).clone())
     }
 
     pub fn push_char(&mut self, ch: char) {
@@ -188,7 +170,8 @@ pub fn render(
         0
     };
 
-    for (view_i, (_, cmd, matched_chars)) in filtered.iter().skip(start).take(visible).enumerate() {
+    for (view_i, (_, label, matched_chars)) in filtered.iter().skip(start).take(visible).enumerate()
+    {
         let row_y = list_area.y + view_i as u16;
         let abs_i = view_i + start;
         let is_sel = abs_i == state.selected;
@@ -197,11 +180,6 @@ pub fn render(
             theme.bg_soft
         } else {
             theme.bg_raised
-        };
-
-        let label = match cmd {
-            PaletteCommand::SwitchTable(name) => format!("Switch Table: {}", name),
-            _ => cmd.label().to_string(),
         };
 
         let buf = frame.buffer_mut();
