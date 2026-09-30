@@ -1,0 +1,13 @@
+:root {
+  --content-max-width: 82rem;
+}
+
+.content main img {
+  border: 1px solid var(--table-border-color);
+  border-radius: 0.35rem;
+  box-shadow: 0 0.35rem 1.25rem rgb(0 0 0 / 18%);
+}
+
+.content main p:has(> a > img) {
+  text-align: center;
+}

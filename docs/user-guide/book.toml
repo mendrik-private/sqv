@@ -1,0 +1,15 @@
+[book]
+authors = ["sqview contributors"]
+language = "en"
+src = "src"
+title = "sqview User Guide"
+
+[build]
+build-dir = "../../target/docs-site"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/mendrik-private/sqv"
+site-url = "/sqv/"
+edit-url-template = "https://github.com/mendrik-private/sqv/edit/main/docs/user-guide/{path}"
+additional-css = ["theme/sqview.css"]

@@ -6,6 +6,8 @@
 <br/>
 <img width="2874" height="1593" alt="image" src="https://github.com/user-attachments/assets/43446fd9-01b1-4856-999a-2a59e59fb183" />
 
+[Read the sqview User Guide](https://mendrik-private.github.io/sqv/) for installation, browsing, editing, filtering, SQL, export, and troubleshooting.
+
 ## Highlights
 
 - Fast virtual scrolling for large tables and views
@@ -85,6 +87,7 @@ sqview paths
 Press `?` in the app for the same list. Every command is also in the command palette (`Ctrl-P`),
 which shows its key next to it.
 
+<!-- ANCHOR: keymap -->
 <!-- keymap:start -->
 
 ### Move
@@ -198,6 +201,7 @@ which shows its key next to it.
 | `Ctrl-Q` | Quit |
 
 <!-- keymap:end -->
+<!-- ANCHOR_END: keymap -->
 
 ## Configuration
 

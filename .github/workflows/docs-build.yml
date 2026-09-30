@@ -1,0 +1,29 @@
+name: Documentation build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and check guide
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install mdBook
+        run: cargo install mdbook --version 0.5.4 --locked
+
+      - name: Build and check guide
+        run: sh build-aux/build-docs.sh
+
+      - name: Store built guide
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: sqview-docs-site
+          path: target/docs-site
+          if-no-files-found: error
+          retention-days: 1

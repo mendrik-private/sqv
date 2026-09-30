@@ -38,6 +38,34 @@ cargo test
 
 Please make sure your changes pass these checks.
 
+## User guide
+
+The [published user guide](https://mendrik-private.github.io/sqv/) lives in
+`docs/user-guide` and uses mdBook, like the Diorama user guide. Install the pinned
+builder and validate the site, including local links, images, and anchors:
+
+```bash
+cargo install mdbook --version 0.5.4 --locked
+sh build-aux/build-docs.sh
+```
+
+The link checker requires Ruby. Build output goes to `target/docs-site`.
+For a live local preview:
+
+```bash
+mdbook serve docs/user-guide --open
+```
+
+Add new chapters to `docs/user-guide/src/SUMMARY.md`. Keep screenshots under
+`docs/user-guide/src/assets/screenshots`. The shortcut chapter includes the
+README keymap section, which `cargo test` checks against the application's help.
+When bindings change, run `SQVIEW_UPDATE_README=1 cargo test` to update those tables.
+
+The **Documentation** workflow builds and checks the guide on pull requests and
+pushes to `main`. Successful pushes to `main` deploy to GitHub Pages; manual
+deployment is also available through **Run workflow** on `main`. Repository
+Settings → Pages must use **GitHub Actions** as the publishing source.
+
 ## Reporting bugs
 
 When reporting a bug, include:
