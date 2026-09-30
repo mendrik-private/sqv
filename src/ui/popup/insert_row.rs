@@ -1,9 +1,13 @@
-use super::text_cursor;
 use anyhow::{anyhow, Result};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::db::{
-    schema::Column,
-    types::{parse_input, SqlValue},
+use super::PopupAction;
+use crate::{
+    db::{
+        schema::Column,
+        types::{parse_input, SqlValue},
+    },
+    ui::widgets::input::TextInput,
 };
 
 pub struct InsertFieldState {
@@ -12,105 +16,118 @@ pub struct InsertFieldState {
     pub not_null: bool,
     pub default_value: Option<String>,
     pub is_pk: bool,
-    pub input: String,
+    /// Generated columns are shown but never written.
+    pub writable: bool,
+    pub input: TextInput,
     pub touched: bool,
-    pub cursor_pos: usize,
 }
 
+/// A new row staged inline in the grid. There is one field per column, in
+/// column order, so field indexes are grid column indexes.
 pub struct InsertRowState {
     pub table: String,
     pub fields: Vec<InsertFieldState>,
     pub selected: usize,
     pub insert_position: usize,
-    pub editing: bool,
 }
 
 impl InsertRowState {
     pub fn new(table: String, columns: Vec<Column>, insert_position: usize) -> Self {
         let fields: Vec<InsertFieldState> = columns
             .into_iter()
-            .filter(|column| column.writable)
             .map(|col| InsertFieldState {
                 name: col.name,
                 col_type: col.col_type,
                 not_null: col.not_null,
                 default_value: col.default_value,
                 is_pk: col.is_pk,
-                input: String::new(),
+                writable: col.writable,
+                input: TextInput::default(),
                 touched: false,
-                cursor_pos: 0,
             })
             .collect();
         let selected = fields
             .iter()
-            .position(|field| !field.is_pk && field.not_null && field.default_value.is_none())
+            .position(|field| {
+                field.writable && !field.is_pk && field.not_null && field.default_value.is_none()
+            })
+            .or_else(|| fields.iter().position(|field| field.writable))
             .unwrap_or(0);
         Self {
             table,
             fields,
             selected,
             insert_position,
-            editing: false,
+        }
+    }
+
+    fn step_field(&mut self, forward: bool) {
+        let mut index = self.selected;
+        loop {
+            let next = if forward {
+                index + 1
+            } else {
+                match index.checked_sub(1) {
+                    Some(prev) => prev,
+                    None => return,
+                }
+            };
+            let Some(field) = self.fields.get(next) else {
+                return;
+            };
+            index = next;
+            if field.writable {
+                self.selected = index;
+                return;
+            }
         }
     }
 
     pub fn move_prev_field(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        self.step_field(false);
     }
 
     pub fn move_next_field(&mut self) {
-        if self.selected + 1 < self.fields.len() {
-            self.selected += 1;
-        }
-    }
-
-    pub fn start_editing(&mut self) {
-        self.editing = true;
-        if let Some(field) = self.selected_field_mut() {
-            field.cursor_pos = field.input.chars().count();
-        }
-    }
-
-    pub fn insert_char(&mut self, ch: char) {
-        let Some(field) = self.selected_field_mut() else {
-            return;
-        };
-        field.touched = true;
-        text_cursor::insert(&mut field.input, &mut field.cursor_pos, ch);
-    }
-
-    pub fn delete_backward(&mut self) {
-        let Some(field) = self.selected_field_mut() else {
-            return;
-        };
-        if text_cursor::delete_backward(&mut field.input, &mut field.cursor_pos) {
-            field.touched = true;
-        }
-    }
-
-    pub fn move_cursor_left(&mut self) {
-        if let Some(field) = self.selected_field_mut() {
-            field.cursor_pos = field.cursor_pos.saturating_sub(1);
-        }
-    }
-
-    pub fn move_cursor_right(&mut self) {
-        if let Some(field) = self.selected_field_mut() {
-            text_cursor::move_right(&field.input, &mut field.cursor_pos);
-        }
+        self.step_field(true);
     }
 
     pub fn reset_selected(&mut self) {
-        if let Some(field) = self.selected_field_mut() {
+        if let Some(field) = self.fields.get_mut(self.selected) {
             field.input.clear();
             field.touched = false;
-            field.cursor_pos = 0;
         }
+    }
+
+    /// Enter, Tab and ↓ move to the next field, Shift-Tab and ↑ to the previous;
+    /// Alt-Enter commits the row (`Submit`), Esc discards it.
+    pub fn handle_key(&mut self, key: &KeyEvent) -> PopupAction {
+        match key.code {
+            KeyCode::Esc => return PopupAction::Close,
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                return PopupAction::Submit
+            }
+            KeyCode::Enter | KeyCode::Tab | KeyCode::Down => self.move_next_field(),
+            KeyCode::BackTab | KeyCode::Up => self.move_prev_field(),
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::SHIFT) => self.reset_selected(),
+            _ => {
+                let Some(field) = self.fields.get_mut(self.selected) else {
+                    return PopupAction::Ignored;
+                };
+                match field.input.handle_key(key) {
+                    crate::ui::widgets::input::InputOutcome::Changed => field.touched = true,
+                    crate::ui::widgets::input::InputOutcome::Moved => {}
+                    crate::ui::widgets::input::InputOutcome::Ignored => {
+                        return PopupAction::Ignored
+                    }
+                }
+            }
+        }
+        PopupAction::Handled
     }
 
     pub fn build_insert_values(&self) -> Result<Vec<(String, SqlValue)>> {
         let mut values = Vec::new();
-        for field in &self.fields {
+        for field in self.fields.iter().filter(|field| field.writable) {
             match field.parsed_value()? {
                 Some(value) => {
                     if value == SqlValue::Null && field.not_null && !field.is_pk {
@@ -127,10 +144,6 @@ impl InsertRowState {
         }
         Ok(values)
     }
-
-    fn selected_field_mut(&mut self) -> Option<&mut InsertFieldState> {
-        self.fields.get_mut(self.selected)
-    }
 }
 
 impl InsertFieldState {
@@ -141,7 +154,7 @@ impl InsertFieldState {
         if self.input.is_empty() {
             return Ok(Some(SqlValue::Null));
         }
-        parse_input(&self.col_type, &self.input)
+        parse_input(&self.col_type, self.input.value())
             .map(Some)
             .map_err(|error| anyhow!("{} {error}", self.name))
     }
@@ -150,36 +163,18 @@ impl InsertFieldState {
         self.parsed_value().is_ok()
     }
 
-    fn display_value(&self) -> String {
+    /// The field's text when it is not being edited: the typed value, or what
+    /// the database will fill in.
+    pub fn placeholder(&self) -> String {
+        if !self.writable {
+            return "<generated>".to_string();
+        }
         if self.touched {
-            if self.input.is_empty() {
+            return if self.input.is_empty() {
                 "NULL".to_string()
             } else {
-                self.input.clone()
-            }
-        } else if self.is_pk {
-            "<auto>".to_string()
-        } else if let Some(default_value) = &self.default_value {
-            format!("<default: {}>", default_value)
-        } else if self.not_null {
-            "<required>".to_string()
-        } else {
-            "NULL".to_string()
-        }
-    }
-
-    fn display_editor_value(&self, cursor: char) -> String {
-        let before: String = self.input.chars().take(self.cursor_pos).collect();
-        let after: String = self.input.chars().skip(self.cursor_pos).collect();
-        format!("{before}{cursor}{after}")
-    }
-
-    pub fn grid_display_value(&self, selected: bool, cursor: char) -> String {
-        if self.touched && selected {
-            return self.display_editor_value(cursor);
-        }
-        if self.touched {
-            return self.display_value();
+                self.input.value().to_string()
+            };
         }
         if self.is_pk {
             "<auto>".to_string()
@@ -211,6 +206,25 @@ mod tests {
     }
 
     #[test]
+    fn generated_columns_keep_field_positions_and_are_skipped() {
+        let mut generated = column("total", "INTEGER", false, None);
+        generated.writable = false;
+        let mut state = InsertRowState::new(
+            "t".to_string(),
+            vec![
+                column("a", "TEXT", false, None),
+                generated,
+                column("b", "TEXT", false, None),
+            ],
+            0,
+        );
+        assert_eq!(state.fields.len(), 3);
+        state.move_next_field();
+        assert_eq!(state.selected, 2, "the generated column is skipped");
+        assert_eq!(state.fields[1].placeholder(), "<generated>");
+    }
+
+    #[test]
     fn build_insert_values_requires_missing_required_fields() {
         let state = InsertRowState::new(
             "users".to_string(),
@@ -235,13 +249,11 @@ mod tests {
             ],
             0,
         );
-        state.start_editing();
-        state.insert_char('A');
-        state.insert_char('l');
-        state.insert_char('i');
-        state.insert_char('c');
-        state.insert_char('e');
-        state.editing = false;
+        for ch in "Alice".chars() {
+            state.handle_key(&crossterm::event::KeyEvent::from(
+                crossterm::event::KeyCode::Char(ch),
+            ));
+        }
 
         let values = state.build_insert_values().expect("build insert values");
 

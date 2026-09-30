@@ -7,10 +7,18 @@ use ratatui::{
     Frame,
 };
 
-use crate::{db::schema::Schema, symbols::Symbols, theme::Theme};
+use crate::{
+    db::schema::Schema,
+    symbols::Symbols,
+    theme::Theme,
+    ui::widgets::{scrollbar::Scrollbar, text::sanitize},
+};
 
 pub enum SidebarAction {
+    /// Open a table or view.
     OpenTable(String),
+    /// Show the definition of an index.
+    ShowSchema(String),
     Toggle,
 }
 
@@ -111,7 +119,39 @@ impl SidebarState {
             return Some(SidebarAction::Toggle);
         }
 
-        None
+        if self.selected > views_header && self.selected < indexes_header {
+            return schema
+                .views
+                .get(self.selected - views_header - 1)
+                .map(|view| SidebarAction::OpenTable(view.name.clone()));
+        }
+
+        schema
+            .indexes
+            .get(self.selected.checked_sub(indexes_header + 1)?)
+            .map(|index| SidebarAction::ShowSchema(index.clone()))
+    }
+
+    /// The table, view or index under the selection; `None` on a section header.
+    pub fn selected_name(&self, schema: &Schema) -> Option<String> {
+        let views_header = self.views_header_idx(schema);
+        let indexes_header = self.indexes_header_idx(schema);
+        if self.selected == 0 || self.selected == views_header || self.selected == indexes_header {
+            return None;
+        }
+        if self.selected < views_header {
+            return schema.tables.get(self.selected - 1).map(|t| t.name.clone());
+        }
+        if self.selected < indexes_header {
+            return schema
+                .views
+                .get(self.selected - views_header - 1)
+                .map(|v| v.name.clone());
+        }
+        schema
+            .indexes
+            .get(self.selected - indexes_header - 1)
+            .cloned()
     }
 
     pub fn collapse_selected_section(&mut self, schema: &Schema) -> bool {
@@ -290,12 +330,15 @@ pub fn render_sidebar(
 
     frame.render_stateful_widget(list, list_area, &mut state.list_state);
     if scrollbar_area.width > 0 {
-        render_scrollbar(
+        Scrollbar {
+            offset: state.list_state.offset(),
+            total: state.visible_count(schema),
+            viewport: list_area.height as usize,
+        }
+        .render(
             frame.buffer_mut(),
-            scrollbar_area,
-            state.list_state.offset(),
-            state.visible_count(schema),
-            list_area.height as usize,
+            Rect::new(scrollbar_area.x, scrollbar_area.y, 1, scrollbar_area.height),
+            theme.bg_soft,
             theme,
             symbols,
         );
@@ -327,7 +370,7 @@ fn build_sidebar_items(
                 format!(" {} ", symbols.table_icon),
                 Style::default().fg(theme.teal),
             );
-            let name_span = Span::styled(table.name.clone(), name_style);
+            let name_span = Span::styled(sanitize(&table.name).into_owned(), name_style);
             items.push(ListItem::new(Line::from(vec![icon_span, name_span])));
         }
     }
@@ -347,7 +390,7 @@ fn build_sidebar_items(
                 format!(" {} ", symbols.view_icon),
                 Style::default().fg(theme.purple),
             );
-            let name_span = Span::styled(view.clone(), name_style);
+            let name_span = Span::styled(sanitize(&view.name).into_owned(), name_style);
             items.push(ListItem::new(Line::from(vec![icon_span, name_span])));
         }
     }
@@ -367,7 +410,7 @@ fn build_sidebar_items(
                 format!(" {} ", symbols.index_icon),
                 Style::default().fg(theme.yellow),
             );
-            let name_span = Span::styled(index.clone(), name_style);
+            let name_span = Span::styled(sanitize(index).into_owned(), name_style);
             items.push(ListItem::new(Line::from(vec![icon_span, name_span])));
         }
     }
@@ -398,49 +441,6 @@ fn clear_area(buf: &mut Buffer, area: Rect, style: Style) {
     }
 }
 
-fn render_scrollbar(
-    buf: &mut Buffer,
-    area: Rect,
-    offset: usize,
-    total: usize,
-    viewport: usize,
-    theme: &Theme,
-    symbols: &Symbols,
-) {
-    if area.width == 0 || area.height == 0 || total <= viewport || viewport == 0 {
-        return;
-    }
-
-    let track_height = area.height as usize;
-    let thumb_height = ((viewport * track_height) / total).max(1).min(track_height);
-    let max_offset = total.saturating_sub(viewport);
-    let thumb_top = if max_offset == 0 {
-        0
-    } else {
-        offset
-            .min(max_offset)
-            .checked_mul(track_height.saturating_sub(thumb_height))
-            .and_then(|n| n.checked_div(max_offset))
-            .unwrap_or(0)
-            .min(track_height.saturating_sub(thumb_height))
-    };
-
-    for row in 0..track_height {
-        let y = area.y + row as u16;
-        let style = if row >= thumb_top && row < thumb_top + thumb_height {
-            Style::default().fg(theme.fg_mute).bg(theme.bg_soft)
-        } else {
-            Style::default().fg(theme.line).bg(theme.bg_soft)
-        };
-        let glyph = if row >= thumb_top && row < thumb_top + thumb_height {
-            symbols.scrollbar_thumb.to_string()
-        } else {
-            symbols.box_vertical.to_string()
-        };
-        buf.set_string(area.x, y, glyph, style);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use ratatui::{buffer::Buffer, widgets::StatefulWidget};
@@ -453,10 +453,17 @@ mod tests {
             tables: vec![TableMeta {
                 name: "users".to_string(),
                 columns: vec![],
+                is_view: false,
                 foreign_keys: vec![],
                 row_identity: None,
             }],
-            views: vec!["active_users".to_string()],
+            views: vec![TableMeta {
+                name: "active_users".to_string(),
+                is_view: true,
+                columns: vec![],
+                foreign_keys: vec![],
+                row_identity: None,
+            }],
             indexes: vec!["users_name_idx".to_string()],
         }
     }
@@ -501,6 +508,28 @@ mod tests {
             buf[(area.right() - 1, area.bottom() - 1)].style().bg,
             Some(theme.bg_soft)
         );
+    }
+
+    #[test]
+    fn views_open_and_indexes_show_their_schema() {
+        let schema = make_schema();
+        let mut state = SidebarState {
+            selected: 3,
+            ..SidebarState::default()
+        };
+        assert!(
+            matches!(state.enter(&schema), Some(SidebarAction::OpenTable(name)) if name == "active_users")
+        );
+        state.selected = 5;
+        assert!(
+            matches!(state.enter(&schema), Some(SidebarAction::ShowSchema(name)) if name == "users_name_idx")
+        );
+        assert_eq!(
+            state.selected_name(&schema).as_deref(),
+            Some("users_name_idx")
+        );
+        state.selected = 0;
+        assert_eq!(state.selected_name(&schema), None);
     }
 
     #[test]

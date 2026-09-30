@@ -5,11 +5,22 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{block::BorderType, Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
-use crate::{db::types::SqlValue, symbols::Symbols, theme::Theme};
+use crossterm::event::{KeyCode, KeyEvent};
+
+use super::PopupAction;
+use crate::{
+    db::types::SqlValue,
+    symbols::Symbols,
+    theme::Theme,
+    ui::widgets::{
+        frame::PopupFrame,
+        hints::{hint, render_hints},
+    },
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DateFocus {
@@ -201,6 +212,28 @@ impl DatePickerState {
         }
     }
 
+    /// Arrows move the day in the calendar or step the focused field.
+    pub fn handle_key(&mut self, key: &KeyEvent) -> PopupAction {
+        let calendar = self.focus == DateFocus::Calendar;
+        match key.code {
+            KeyCode::Esc => return PopupAction::Close,
+            KeyCode::Enter => return PopupAction::Submit,
+            KeyCode::PageUp => self.prev_month(),
+            KeyCode::PageDown => self.next_month(),
+            KeyCode::Left if calendar => self.move_day(-1),
+            KeyCode::Right if calendar => self.move_day(1),
+            KeyCode::Left | KeyCode::BackTab => self.focus_prev(),
+            KeyCode::Right | KeyCode::Tab => self.focus_next(),
+            KeyCode::Up if calendar => self.move_day(-7),
+            KeyCode::Down if calendar => self.move_day(7),
+            KeyCode::Up => self.adjust_focused(1),
+            KeyCode::Down => self.adjust_focused(-1),
+            KeyCode::Delete => self.clear(),
+            _ => return PopupAction::Ignored,
+        }
+        PopupAction::Handled
+    }
+
     fn selected_date(&self) -> NaiveDate {
         self.date.unwrap_or(self.view_month)
     }
@@ -299,24 +332,16 @@ pub fn render(
     theme: &Theme,
     symbols: &Symbols,
 ) {
-    let (popup_width, popup_height, title) = if state.has_time() {
-        (42u16, 19u16, "DateTime")
+    let (width, height, verb) = if state.has_time() {
+        (46u16, 19u16, "Pick date and time")
     } else {
-        (34, 16, "Date")
+        (38, 16, "Pick date")
     };
-    let popup_area = super::centered_rect(area, popup_width, popup_height);
-
-    super::paint_popup_surface(frame, popup_area, theme);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.accent))
-        .title(format!(" {title}: {} ", state.col_name))
-        .style(Style::default().bg(theme.bg_raised));
-
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
+    let inner =
+        PopupFrame::new(verb, Some(&state.col_name), width, height).render(frame, area, theme);
+    if inner.height < 2 {
+        return;
+    }
 
     let selected = state.selected_date();
     let calendar_pad = " ".repeat(calendar_left_padding(inner.width));
@@ -369,17 +394,31 @@ pub fn render(
         ));
         lines.push(divider(inner.width, theme, symbols));
     }
-    lines.push(Line::from(Span::styled(
-        format!(
-            " Tab next {} Shift-Tab prev {} PgUp/PgDn month {} Enter ok",
-            symbols.separator, symbols.separator, symbols.separator
-        ),
-        Style::default().fg(theme.fg_faint).bg(theme.bg_raised),
-    )));
-
+    let body = Rect {
+        height: inner.height - 1,
+        ..inner
+    };
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme.bg_raised)),
-        inner,
+        body,
+    );
+    render_hints(
+        frame.buffer_mut(),
+        Rect::new(
+            inner.x + 1,
+            inner.bottom() - 1,
+            inner.width.saturating_sub(1),
+            1,
+        ),
+        &[
+            hint("Enter", "save"),
+            hint("Tab", "field"),
+            hint("PgUp/PgDn", "month"),
+            hint("Del", "clear"),
+            hint("Esc", "cancel"),
+        ],
+        theme,
+        theme.bg_raised,
     );
 }
 

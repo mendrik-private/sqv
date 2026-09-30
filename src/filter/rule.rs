@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::types::SqlValue;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct FilterSet {
     pub columns: HashMap<String, ColumnFilter>,
 }
@@ -24,7 +24,7 @@ impl FilterSet {
 }
 
 /// Rules on one column; a row matches when any enabled rule matches.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ColumnFilter {
     pub rules: Vec<FilterRule>,
 }

@@ -8,11 +8,16 @@
 
 ## Highlights
 
-- Fast virtual scrolling for large tables
+- Fast virtual scrolling for large tables and views
 - Rich cell editors for text, enums, dates, datetimes, and foreign keys
-- Per-column filters, sorting, and alphabet jump navigation
-- Export current views to CSV, JSON, or SQL
-- Read-only mode for safe inspection
+- Per-column filters, multi-column sorting, and alphabet jump navigation
+- Tabs that keep their position, and saved per-table filters, sort order, hidden, resized and frozen columns
+- Row detail view with a JSON tree viewer, schema/DDL and index inspection
+- Foreign-key links both ways: follow a link, or list the rows that reference the current one
+- Find in a table, search across all tables, go to a row number
+- SQL console with a persistent history
+- Export views or selections to CSV, JSON, or SQL; copy rows as JSON, CSV or SQL inserts
+- Read-only mode for safe inspection, shown in the status bar
 
 ## Install
 
@@ -73,51 +78,126 @@ sqview paths
 - `--readonly`: disable writes
 - `--no-watch`: disable automatic external refresh when the database file changes
 - `check-terminal`: print detected terminal capabilities
-- `paths`: print the config, data, and filter-state paths used by sqview
+- `paths`: print the config, data, saved-view and SQL-history paths used by sqview
 
 ## Keybindings
 
-### Navigation
+Press `?` in the app for the same list. Every command is also in the command palette (`Ctrl-P`),
+which shows its key next to it.
 
-| Key | Action |
-|-----|--------|
-| `↑ ↓ ← →` / `h j k l` | Move focused cell |
-| `Home` / `End` | First / last column in row |
-| `Ctrl-Home` / `Ctrl-End` | First / last cell in table |
-| `PgUp` / `PgDn` / `Ctrl-↑` / `Ctrl-↓` | Scroll one viewport |
-| `Mouse wheel` | Scroll rows |
-| `Shift-wheel` | Scroll columns |
-| `Click gutter` | Select a row |
-| `Ctrl-click gutter` | Toggle a row in the selection |
-| `Click cell` | Focus cell |
+<!-- keymap:start -->
 
-### Editing
+### Move
 
-| Key | Action |
-|-----|--------|
-| `Enter` | Open the focused cell picker/editor |
-| `Alt-Enter` | Insert a newline in the direct text editor |
-| `Mouse wheel` / scrollbar drag | Scroll long direct-editor text |
-| `e` | Open the focused cell in the direct editor |
-| `n` | Set the focused cell to `NULL` when allowed |
-| `Esc` | Clear selection or close popup |
-| `Alt-Enter` | Save an inserted row from the staged row editor |
-| `i` | Insert row in a staged editor, then validate on save |
-| `d` | Delete row |
-| `Ctrl-z` | Undo last write |
+| Keys | Action |
+| --- | --- |
+| `↑↓←→ / h j k l` | Move between cells |
+| `Home / End` | First / last column |
+| `Ctrl-Home / Ctrl-End` | First / last cell of the table |
+| `PgUp / PgDn` | Scroll one page |
+| `Ctrl-↑ / Ctrl-↓` | Scroll one page |
+| `Ctrl-G` | Go to row number |
+| `' then a letter` | Jump to letter in a text-sorted column |
 
-### Filtering, sorting, and other actions
+### Select & copy
 
-| Key | Action |
-|-----|--------|
-| `s` | Cycle sort on focused column |
-| `f` | Open filter popup for focused column |
-| `Shift-F` | Clear filters |
-| `j` | Jump through a foreign key |
-| `Backspace` | Jump back |
-| `Ctrl-b` | Toggle sidebar |
-| `Ctrl-Shift-P` | Command palette |
+| Keys | Action |
+| --- | --- |
+| `Shift-↑ / Shift-↓` | Extend the row selection |
+| `Space` | Toggle the focused row |
+| `Ctrl-A` | Select all rows |
+| `Esc` | Clear the selection, then focus the sidebar |
+| `y / Ctrl-C` | Copy the focused cell |
+| `Y` | Copy the focused or selected rows as JSON |
+
+### Edit
+
+| Keys | Action |
+| --- | --- |
+| `Enter` | Edit the cell with the matching picker |
+| `e` | Edit the value as text |
+| `n` | Set the cell to NULL |
+| `i / Ins` | Insert a row below |
+| `d / Del` | Delete the focused or selected rows |
+| `Ctrl-Z` | Undo the last write |
+
+### Inspect
+
+| Keys | Action |
+| --- | --- |
+| `v` | Show the focused row as a record |
+| `j` | Follow the link on a foreign-key cell |
+| `r` | Rows in other tables that reference this row |
+| `Backspace` | Go back after following a link |
+| `Ctrl-F` | Find rows in this table |
+| `:` | SQL console |
+
+### Filter, sort & columns
+
+| Keys | Action |
+| --- | --- |
+| `f` | Filter the focused column |
+| `F` | Clear all filters |
+| `s` | Sort by the focused column (asc, desc, off) |
+| `S` | Add the focused column as a further sort key |
+| `< / >` | Narrow / widen the focused column |
+| `-` | Hide the focused column |
+
+### Tabs & panels
+
+| Keys | Action |
+| --- | --- |
+| `Tab / Shift-Tab` | Switch focus between sidebar and table |
+| `Ctrl-B` | Show / hide the sidebar |
+| `1-9 / 0` | Go to tab 1-10 |
+| `] / [ / Ctrl-PgDn / Ctrl-PgUp` | Next / previous tab |
+| `Ctrl-W` | Close the current tab |
+
+### Sidebar
+
+| Keys | Action |
+| --- | --- |
+| `↑↓ / j k` | Move |
+| `← → / h l` | Collapse / expand a section |
+| `Enter` | Open a table or view, fold a section |
+| `i` | Show the schema of the selected item |
+| `Esc` | Back to the table |
+
+### Popups
+
+| Keys | Action |
+| --- | --- |
+| `Esc` | Close |
+| `Enter` | Confirm the selection |
+| `↑↓ PgUp PgDn Home End` | Move in lists |
+| `typing` | Filter the list or edit the field |
+| `Ctrl-A / Ctrl-E` | Start / end of the input |
+| `Ctrl-U / Ctrl-W` | Delete to start / previous word |
+| `Alt-Enter` | New line in the editor; save a staged row |
+| `y / n` | Confirm / cancel a deletion |
+
+### Mouse
+
+| Keys | Action |
+| --- | --- |
+| `Wheel` | Scroll the panel or list under the pointer |
+| `Shift-wheel` | Scroll table columns |
+| `Click` | Focus a cell, select a list item |
+| `Click header` | Sort by that column |
+| `Click / Ctrl-click gutter` | Select / toggle rows |
+| `Drag scrollbar` | Scroll |
+| `Click rail letter` | Jump to that letter |
+| `Click / middle-click tab` | Activate / close the tab |
+
+### App
+
+| Keys | Action |
+| --- | --- |
+| `Ctrl-P` | Command palette: export, copy as CSV/SQL, search all tables, columns |
+| `?` | This help |
 | `Ctrl-Q` | Quit |
+
+<!-- keymap:end -->
 
 ## Configuration
 

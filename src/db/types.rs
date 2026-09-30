@@ -137,9 +137,116 @@ pub fn temporal_kind(col_type: &str) -> Option<TemporalKind> {
     }
 }
 
+/// How a column is presented and edited, derived once from its declared type
+/// and name. Badges, cell formatting and editor choice all use this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnKind {
+    Integer,
+    /// REAL columns; `scale` comes from a declared `(precision, scale)`.
+    Real {
+        scale: Option<u8>,
+    },
+    Numeric {
+        scale: Option<u8>,
+    },
+    Text,
+    Blob,
+    /// No declared type: SQLite stores whatever it is given.
+    Untyped,
+    Boolean,
+    Date,
+    Datetime,
+    /// Integer seconds or milliseconds since the epoch, recognised by name.
+    EpochDatetime,
+}
+
+impl ColumnKind {
+    pub fn of(col_type: &str, name: &str) -> Self {
+        match temporal_kind(col_type) {
+            Some(TemporalKind::Datetime) => return ColumnKind::Datetime,
+            Some(TemporalKind::Date) => return ColumnKind::Date,
+            None => {}
+        }
+        let upper = col_type.to_uppercase();
+        if upper.contains("BOOL") {
+            return ColumnKind::Boolean;
+        }
+        let scale = declared_scale(&upper);
+        match affinity(col_type) {
+            ColAffinity::Integer if looks_like_epoch(name) => ColumnKind::EpochDatetime,
+            ColAffinity::Integer => ColumnKind::Integer,
+            ColAffinity::Real => ColumnKind::Real { scale },
+            ColAffinity::Numeric => ColumnKind::Numeric { scale },
+            ColAffinity::Text => ColumnKind::Text,
+            ColAffinity::Blob if upper.trim().is_empty() => ColumnKind::Untyped,
+            ColAffinity::Blob => ColumnKind::Blob,
+        }
+    }
+
+    pub fn badge(self) -> &'static str {
+        match self {
+            ColumnKind::Integer => "INT",
+            ColumnKind::Real { .. } => "REA",
+            ColumnKind::Numeric { .. } => "NUM",
+            ColumnKind::Text => "TXT",
+            ColumnKind::Blob => "BLB",
+            ColumnKind::Untyped => "ANY",
+            ColumnKind::Boolean => "BOO",
+            ColumnKind::Date => "DAT",
+            ColumnKind::Datetime | ColumnKind::EpochDatetime => "DT",
+        }
+    }
+
+    pub fn is_numeric(self) -> bool {
+        matches!(
+            self,
+            ColumnKind::Integer | ColumnKind::Real { .. } | ColumnKind::Numeric { .. }
+        )
+    }
+
+    pub fn is_temporal(self) -> bool {
+        matches!(
+            self,
+            ColumnKind::Date | ColumnKind::Datetime | ColumnKind::EpochDatetime
+        )
+    }
+
+    /// Free text that benefits from extra width and can be enum-like.
+    pub fn is_textual(self) -> bool {
+        matches!(self, ColumnKind::Text | ColumnKind::Untyped)
+    }
+}
+
+fn looks_like_epoch(name: &str) -> bool {
+    let name = name.to_lowercase();
+    name.ends_with("_at") || name.contains("timestamp") || name.ends_with("_time")
+}
+
+/// The `s` of a declared `DECIMAL(p,s)` / `NUMERIC(p,s)` / `REAL(p,s)`.
+fn declared_scale(upper: &str) -> Option<u8> {
+    let inner = upper.split_once('(')?.1.split_once(')')?.0;
+    inner.split_once(',')?.1.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_input, SqlValue};
+    use super::{parse_input, ColumnKind, SqlValue};
+
+    #[test]
+    fn column_kinds_come_from_declared_type_and_name() {
+        assert_eq!(
+            ColumnKind::of("NUMERIC(10,2)", "price"),
+            ColumnKind::Numeric { scale: Some(2) }
+        );
+        assert_eq!(
+            ColumnKind::of("INTEGER", "created_at"),
+            ColumnKind::EpochDatetime
+        );
+        assert_eq!(ColumnKind::of("INTEGER", "id"), ColumnKind::Integer);
+        assert_eq!(ColumnKind::of("", "anything"), ColumnKind::Untyped);
+        assert_eq!(ColumnKind::of("BOOLEAN", "active"), ColumnKind::Boolean);
+        assert_eq!(ColumnKind::of("DATETIME", "x"), ColumnKind::Datetime);
+    }
 
     #[test]
     fn input_parsing_follows_column_affinity() {

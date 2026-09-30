@@ -41,10 +41,14 @@ impl VirtualWindow {
         self.rows.get(idx)
     }
 
+    /// Whether the focus is near an edge of the window that has more rows
+    /// beyond it.
     pub fn needs_prefetch(&self, focused_row: i64) -> bool {
         let window_end = self.offset + self.rows.len() as i64;
         let vp = self.viewport_rows as i64;
-        focused_row < self.offset + 10 || focused_row + vp + 20 > window_end
+        let behind = self.offset > 0 && focused_row < self.offset + 10;
+        let ahead = window_end < self.total_rows && focused_row + vp + 20 > window_end;
+        behind || ahead
     }
 
     pub fn fetch_params(&self, focused_row: i64) -> (i64, i64) {

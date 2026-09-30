@@ -9,7 +9,10 @@ use super::*;
 use crate::{
     config::Config,
     db::{self, schema::Column, types::SqlValue},
-    ui::{popup::HelpState, tabbar::TabMouseAction},
+    ui::{
+        popup::{command_palette::CopyFormat, HelpState},
+        tabbar::TabMouseAction,
+    },
 };
 
 // ---------- helpers ----------
@@ -109,23 +112,6 @@ fn seed_user_rows(app: &App, count: usize) {
     }
 }
 
-fn seed_grid_rows(app: &App, count: usize) {
-    let conn = app.pool.get().expect("test conn");
-    for index in 0..count {
-        let id = index as i64;
-        conn.execute(
-            "INSERT INTO users (id, name, age, email) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                id,
-                format!("user-{id}"),
-                20 + (id % 40),
-                format!("user{id}@example.com")
-            ],
-        )
-        .expect("seed grid row");
-    }
-}
-
 fn make_constrained_insert_app() -> (App, mpsc::UnboundedReceiver<Message>) {
     let manager = SqliteConnectionManager::memory();
     let pool = Arc::new(
@@ -169,20 +155,6 @@ fn make_constrained_insert_app() -> (App, mpsc::UnboundedReceiver<Message>) {
     (app, rx)
 }
 
-#[test]
-fn normalize_enumerated_values_skips_unique_columns() {
-    let values = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-
-    assert!(normalize_enumerated_values(values, 3).is_empty());
-}
-
-#[test]
-fn normalize_enumerated_values_keeps_repeated_short_values() {
-    let values = vec!["pending".to_string(), "done".to_string()];
-
-    assert_eq!(normalize_enumerated_values(values.clone(), 5), values);
-}
-
 fn try_recv_variant(rx: &mut mpsc::UnboundedReceiver<Message>) -> String {
     let msg = rx.try_recv();
     match msg {
@@ -196,6 +168,15 @@ fn drain_messages(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>) {
     while let Ok(message) = rx.try_recv() {
         app.update(message);
     }
+}
+
+/// Waits for the next message from background work and applies it.
+async fn receive_one(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>) {
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("background work should reply")
+        .expect("channel open");
+    app.update(message);
 }
 
 fn render_test_app(app: &mut App) {
@@ -215,8 +196,8 @@ fn text_editor_scroll_y(app: &App) -> u16 {
 
 // ---------- global shortcuts ----------
 
-#[test]
-fn ctrl_q_sets_should_quit() {
+#[tokio::test]
+async fn ctrl_q_sets_should_quit() {
     let (mut app, _rx) = make_test_app();
     app.update(Message::Key(crossterm::event::KeyEvent::new(
         KeyCode::Char('q'),
@@ -225,8 +206,8 @@ fn ctrl_q_sets_should_quit() {
     assert!(app.should_quit);
 }
 
-#[test]
-fn ctrl_b_toggles_sidebar() {
+#[tokio::test]
+async fn ctrl_b_toggles_sidebar() {
     let (mut app, _rx) = make_test_app();
     assert!(app.sidebar_visible);
     app.update(Message::Key(crossterm::event::KeyEvent::new(
@@ -241,12 +222,10 @@ fn ctrl_b_toggles_sidebar() {
     assert!(app.sidebar_visible);
 }
 
-#[test]
-fn ctrl_w_closes_current_tab() {
+#[tokio::test]
+async fn ctrl_w_closes_current_tab() {
     let (mut app, mut rx) = make_test_app();
-    app.open_tabs = vec![TableTab {
-        table_name: "users".to_string(),
-    }];
+    app.open_tabs = vec![TableTab::new("users".to_string())];
     app.active_tab = Some(0);
 
     app.update(Message::Key(crossterm::event::KeyEvent::new(
@@ -259,8 +238,8 @@ fn ctrl_w_closes_current_tab() {
     assert_eq!(app.active_tab, None);
 }
 
-#[test]
-fn tab_toggles_focus_sidebar_to_grid() {
+#[tokio::test]
+async fn tab_toggles_focus_sidebar_to_grid() {
     let (mut app, _rx) = make_test_app();
     app.sidebar_visible = true;
     app.focus = FocusPane::Sidebar;
@@ -276,8 +255,8 @@ fn tab_toggles_focus_sidebar_to_grid() {
     assert!(matches!(app.focus, FocusPane::Sidebar));
 }
 
-#[test]
-fn backtab_toggles_focus() {
+#[tokio::test]
+async fn backtab_toggles_focus() {
     let (mut app, _rx) = make_test_app();
     app.sidebar_visible = true;
     app.focus = FocusPane::Sidebar;
@@ -288,8 +267,8 @@ fn backtab_toggles_focus() {
     assert!(matches!(app.focus, FocusPane::Grid));
 }
 
-#[test]
-fn question_mark_opens_and_closes_help() {
+#[tokio::test]
+async fn question_mark_opens_and_closes_help() {
     let (mut app, mut rx) = make_test_app();
     assert!(app.popup.is_none());
     app.update(Message::Key(crossterm::event::KeyEvent::new(
@@ -309,8 +288,8 @@ fn question_mark_opens_and_closes_help() {
     assert!(app.popup.is_none(), "popup should be closed after second ?");
 }
 
-#[test]
-fn ctrl_p_opens_command_palette() {
+#[tokio::test]
+async fn ctrl_p_opens_command_palette() {
     let (mut app, mut rx) = make_test_app();
     app.update(Message::Key(crossterm::event::KeyEvent::new(
         KeyCode::Char('p'),
@@ -323,19 +302,8 @@ fn ctrl_p_opens_command_palette() {
     );
 }
 
-#[test]
-fn ctrl_h_opens_help() {
-    let (mut app, mut rx) = make_test_app();
-    app.update(Message::Key(crossterm::event::KeyEvent::new(
-        KeyCode::Char('h'),
-        KeyModifiers::CONTROL,
-    )));
-    drain_messages(&mut app, &mut rx);
-    assert!(matches!(app.popup, Some(PopupKind::Help(_))));
-}
-
-#[test]
-fn esc_in_help_closes_popup() {
+#[tokio::test]
+async fn esc_in_help_closes_popup() {
     let (mut app, mut rx) = make_test_app();
     app.popup = Some(PopupKind::Help(HelpState::new()));
     app.mode = AppMode::Edit;
@@ -347,8 +315,8 @@ fn esc_in_help_closes_popup() {
     assert!(app.popup.is_none(), "help popup should be closed");
 }
 
-#[test]
-fn ctrl_enter_in_help_is_noop() {
+#[tokio::test]
+async fn ctrl_enter_in_help_is_noop() {
     let (mut app, mut rx) = make_test_app();
     app.popup = Some(PopupKind::Help(HelpState::new()));
     app.mode = AppMode::Edit;
@@ -360,8 +328,8 @@ fn ctrl_enter_in_help_is_noop() {
     assert!(rx.try_recv().is_err());
 }
 
-#[test]
-fn ctrl_enter_in_text_editor_is_noop() {
+#[tokio::test]
+async fn ctrl_enter_in_text_editor_is_noop() {
     let (mut app, mut rx) = make_test_app();
     app.popup = Some(PopupKind::TextEditor(TextEditorState::new(
         "users".to_string(),
@@ -381,8 +349,8 @@ fn ctrl_enter_in_text_editor_is_noop() {
     assert!(rx.try_recv().is_err());
 }
 
-#[test]
-fn enter_in_text_editor_sends_commit_edit() {
+#[tokio::test]
+async fn enter_in_text_editor_sends_commit_edit() {
     let (mut app, mut rx) = make_test_app();
     app.popup = Some(PopupKind::TextEditor(TextEditorState::new(
         "users".to_string(),
@@ -402,8 +370,8 @@ fn enter_in_text_editor_sends_commit_edit() {
     assert_eq!(try_recv_variant(&mut rx), "CommitEdit");
 }
 
-#[test]
-fn alt_enter_in_text_editor_inserts_newline() {
+#[tokio::test]
+async fn alt_enter_in_text_editor_inserts_newline() {
     let (mut app, mut rx) = make_test_app();
     app.popup = Some(PopupKind::TextEditor(TextEditorState::new(
         "users".to_string(),
@@ -427,8 +395,8 @@ fn alt_enter_in_text_editor_inserts_newline() {
     assert!(rx.try_recv().is_err());
 }
 
-#[test]
-fn alt_enter_in_insert_row_sends_commit_insert_row() {
+#[tokio::test]
+async fn alt_enter_in_insert_row_sends_commit_insert_row() {
     let (mut app, mut rx) = make_constrained_insert_app();
     app.update(Message::InsertRow);
     drain_messages(&mut app, &mut rx);
@@ -443,8 +411,8 @@ fn alt_enter_in_insert_row_sends_commit_insert_row() {
 
 // ---------- grid navigation shortcuts ----------
 
-#[test]
-fn arrow_down_sends_move_down() {
+#[tokio::test]
+async fn arrow_down_sends_move_down() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -455,8 +423,8 @@ fn arrow_down_sends_move_down() {
     assert_eq!(try_recv_variant(&mut rx), "MoveDown");
 }
 
-#[test]
-fn arrow_up_sends_move_up() {
+#[tokio::test]
+async fn arrow_up_sends_move_up() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -467,8 +435,8 @@ fn arrow_up_sends_move_up() {
     assert_eq!(try_recv_variant(&mut rx), "MoveUp");
 }
 
-#[test]
-fn shift_down_selects_rows_from_focused_row() {
+#[tokio::test]
+async fn shift_down_selects_rows_from_focused_row() {
     let (mut app, _rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -486,8 +454,8 @@ fn shift_down_selects_rows_from_focused_row() {
     );
 }
 
-#[test]
-fn shift_up_extends_selection_toward_previous_rows() {
+#[tokio::test]
+async fn shift_up_extends_selection_toward_previous_rows() {
     let (mut app, _rx) = make_test_app();
     let mut grid = make_grid();
     grid.focused_row = 3;
@@ -507,8 +475,8 @@ fn shift_up_extends_selection_toward_previous_rows() {
     );
 }
 
-#[test]
-fn move_down_preserves_existing_selection() {
+#[tokio::test]
+async fn move_down_preserves_existing_selection() {
     let (mut app, _rx) = make_test_app();
     let mut grid = make_grid();
     grid.row_selection = crate::grid::RowSelection::Rows(BTreeSet::from([1, 3]));
@@ -525,8 +493,8 @@ fn move_down_preserves_existing_selection() {
     );
 }
 
-#[test]
-fn ctrl_a_selects_all_rows_in_grid() {
+#[tokio::test]
+async fn ctrl_a_selects_all_rows_in_grid() {
     let (mut app, _rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -540,8 +508,8 @@ fn ctrl_a_selects_all_rows_in_grid() {
     assert_eq!(grid.row_selection, crate::grid::RowSelection::all());
 }
 
-#[test]
-fn arrow_left_sends_move_left() {
+#[tokio::test]
+async fn arrow_left_sends_move_left() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -552,8 +520,8 @@ fn arrow_left_sends_move_left() {
     assert_eq!(try_recv_variant(&mut rx), "MoveLeft");
 }
 
-#[test]
-fn arrow_right_sends_move_right() {
+#[tokio::test]
+async fn arrow_right_sends_move_right() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -564,8 +532,8 @@ fn arrow_right_sends_move_right() {
     assert_eq!(try_recv_variant(&mut rx), "MoveRight");
 }
 
-#[test]
-fn vim_hjkl_navigation() {
+#[tokio::test]
+async fn vim_hjkl_navigation() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -600,8 +568,8 @@ fn vim_hjkl_navigation() {
     assert_eq!(try_recv_variant(&mut rx), "MoveDown");
 }
 
-#[test]
-fn home_sends_move_col_first() {
+#[tokio::test]
+async fn home_sends_move_col_first() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -612,8 +580,8 @@ fn home_sends_move_col_first() {
     assert_eq!(try_recv_variant(&mut rx), "MoveColFirst");
 }
 
-#[test]
-fn end_sends_move_col_last() {
+#[tokio::test]
+async fn end_sends_move_col_last() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -624,8 +592,8 @@ fn end_sends_move_col_last() {
     assert_eq!(try_recv_variant(&mut rx), "MoveColLast");
 }
 
-#[test]
-fn ctrl_home_sends_move_first_cell() {
+#[tokio::test]
+async fn ctrl_home_sends_move_first_cell() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -636,8 +604,8 @@ fn ctrl_home_sends_move_first_cell() {
     assert_eq!(try_recv_variant(&mut rx), "MoveFirstCell");
 }
 
-#[test]
-fn ctrl_end_sends_move_last_cell() {
+#[tokio::test]
+async fn ctrl_end_sends_move_last_cell() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -648,8 +616,8 @@ fn ctrl_end_sends_move_last_cell() {
     assert_eq!(try_recv_variant(&mut rx), "MoveLastCell");
 }
 
-#[test]
-fn page_down_scrolls_viewport() {
+#[tokio::test]
+async fn page_down_scrolls_viewport() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     let vp = make_viewport_rows(&app).saturating_sub(1);
@@ -668,8 +636,8 @@ fn page_down_scrolls_viewport() {
     );
 }
 
-#[test]
-fn page_up_scrolls_viewport() {
+#[tokio::test]
+async fn page_up_scrolls_viewport() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     let vp = make_viewport_rows(&app).saturating_sub(1);
@@ -688,8 +656,8 @@ fn page_up_scrolls_viewport() {
     );
 }
 
-#[test]
-fn ctrl_up_scrolls_viewport() {
+#[tokio::test]
+async fn ctrl_up_scrolls_viewport() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     let vp = make_viewport_rows(&app).saturating_sub(1);
@@ -708,8 +676,8 @@ fn ctrl_up_scrolls_viewport() {
     );
 }
 
-#[test]
-fn ctrl_down_scrolls_viewport() {
+#[tokio::test]
+async fn ctrl_down_scrolls_viewport() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     let vp = make_viewport_rows(&app).saturating_sub(1);
@@ -730,8 +698,8 @@ fn ctrl_down_scrolls_viewport() {
 
 // ---------- sort and filter shortcuts ----------
 
-#[test]
-fn s_key_sends_cycle_sort() {
+#[tokio::test]
+async fn s_key_sends_cycle_sort() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -742,8 +710,8 @@ fn s_key_sends_cycle_sort() {
     assert_eq!(try_recv_variant(&mut rx), "CycleSort");
 }
 
-#[test]
-fn f_key_sends_open_filter_popup() {
+#[tokio::test]
+async fn f_key_sends_open_filter_popup() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -754,8 +722,8 @@ fn f_key_sends_open_filter_popup() {
     assert_eq!(try_recv_variant(&mut rx), "OpenFilterPopup");
 }
 
-#[test]
-fn shift_f_sends_clear_filters() {
+#[tokio::test]
+async fn shift_f_sends_clear_filters() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -766,8 +734,8 @@ fn shift_f_sends_clear_filters() {
     assert_eq!(try_recv_variant(&mut rx), "ClearFilters");
 }
 
-#[test]
-fn j_on_fk_col_sends_jump_to_fk() {
+#[tokio::test]
+async fn j_on_fk_col_sends_jump_to_fk() {
     let (mut app, mut rx) = make_test_app();
     let mut grid = make_grid();
     grid.fk_cols[1] = true; // name col is FK
@@ -781,8 +749,8 @@ fn j_on_fk_col_sends_jump_to_fk() {
     assert_eq!(try_recv_variant(&mut rx), "JumpToFk");
 }
 
-#[test]
-fn esc_in_grid_clears_selection() {
+#[tokio::test]
+async fn esc_in_grid_clears_selection() {
     let (mut app, _rx) = make_test_app();
     let mut grid = make_grid();
     grid.select_only_row(2);
@@ -799,8 +767,8 @@ fn esc_in_grid_clears_selection() {
     assert!(matches!(app.focus, FocusPane::Grid));
 }
 
-#[test]
-fn backspace_with_jump_stack_sends_jump_back() {
+#[tokio::test]
+async fn backspace_with_jump_stack_sends_jump_back() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -816,8 +784,8 @@ fn backspace_with_jump_stack_sends_jump_back() {
     assert_eq!(try_recv_variant(&mut rx), "JumpBack");
 }
 
-#[test]
-fn backspace_without_jump_stack_is_noop() {
+#[tokio::test]
+async fn backspace_without_jump_stack_is_noop() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -834,8 +802,8 @@ fn backspace_without_jump_stack_is_noop() {
 
 // ---------- editing shortcuts ----------
 
-#[test]
-fn i_key_in_grid_sends_insert_row() {
+#[tokio::test]
+async fn i_key_in_grid_sends_insert_row() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -846,8 +814,8 @@ fn i_key_in_grid_sends_insert_row() {
     assert_eq!(try_recv_variant(&mut rx), "InsertRow");
 }
 
-#[test]
-fn insert_key_in_grid_sends_insert_row() {
+#[tokio::test]
+async fn insert_key_in_grid_sends_insert_row() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -858,8 +826,8 @@ fn insert_key_in_grid_sends_insert_row() {
     assert_eq!(try_recv_variant(&mut rx), "InsertRow");
 }
 
-#[test]
-fn insert_row_opens_insert_popup_for_constrained_table() {
+#[tokio::test]
+async fn insert_row_opens_insert_popup_for_constrained_table() {
     let (mut app, _rx) = make_constrained_insert_app();
     app.focus = FocusPane::Grid;
 
@@ -868,16 +836,12 @@ fn insert_row_opens_insert_popup_for_constrained_table() {
     assert!(matches!(
         app.popup,
         Some(PopupKind::InsertRow(ref state))
-            if state.editing && state.insert_position == 0
-    ));
-    assert!(matches!(
-        app.toast.toasts.back(),
-        Some(toast) if toast.message == "Alt-Enter commits" && toast.kind == ToastKind::Info
+            if state.insert_position == 0
     ));
 }
 
-#[test]
-fn invalid_insert_commit_shows_error_toast() {
+#[tokio::test]
+async fn invalid_insert_commit_shows_error_toast() {
     let (mut app, _rx) = make_constrained_insert_app();
     app.focus = FocusPane::Grid;
     app.update(Message::InsertRow);
@@ -891,8 +855,8 @@ fn invalid_insert_commit_shows_error_toast() {
     ));
 }
 
-#[test]
-fn d_key_in_grid_shows_confirm_dialog() {
+#[tokio::test]
+async fn d_key_in_grid_shows_confirm_dialog() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -904,8 +868,8 @@ fn d_key_in_grid_shows_confirm_dialog() {
     assert_eq!(try_recv_variant(&mut rx), "DeleteRow");
 }
 
-#[test]
-fn delete_key_in_grid_sends_delete_row() {
+#[tokio::test]
+async fn delete_key_in_grid_sends_delete_row() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -917,15 +881,16 @@ fn delete_key_in_grid_sends_delete_row() {
     assert_eq!(try_recv_variant(&mut rx), "DeleteRow");
 }
 
-#[test]
-fn delete_row_confirms_selected_row_range() {
-    let (mut app, _rx) = make_test_app();
+#[tokio::test]
+async fn delete_row_confirms_selected_row_range() {
+    let (mut app, mut rx) = make_test_app();
     seed_user_rows(&app, 6);
     let mut grid = make_grid();
     grid.row_selection = crate::grid::RowSelection::Rows(BTreeSet::from([1, 3, 5]));
     app.grid = Some(grid);
 
     app.update(Message::DeleteRow);
+    receive_one(&mut app, &mut rx).await;
 
     assert!(matches!(
         app.pending_confirm.as_ref().map(|confirm| &confirm.kind),
@@ -936,15 +901,16 @@ fn delete_row_confirms_selected_row_range() {
     ));
 }
 
-#[test]
-fn delete_row_confirms_table_clear_for_select_all() {
-    let (mut app, _rx) = make_test_app();
+#[tokio::test]
+async fn delete_row_confirms_table_clear_for_select_all() {
+    let (mut app, mut rx) = make_test_app();
     let mut grid = make_grid();
     grid.row_selection = crate::grid::RowSelection::all();
     app.grid = Some(grid);
     seed_user_rows(&app, 5);
 
     app.update(Message::DeleteRow);
+    receive_one(&mut app, &mut rx).await;
 
     assert!(matches!(
         app.pending_confirm.as_ref().map(|confirm| &confirm.kind),
@@ -958,8 +924,8 @@ fn delete_row_confirms_table_clear_for_select_all() {
     assert!(message.contains("Delete all 5 rows from users?"));
 }
 
-#[test]
-fn y_in_grid_sends_copy_cell() {
+#[tokio::test]
+async fn y_in_grid_sends_copy_cell() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -970,8 +936,8 @@ fn y_in_grid_sends_copy_cell() {
     assert_eq!(try_recv_variant(&mut rx), "CopyCell");
 }
 
-#[test]
-fn ctrl_c_in_grid_sends_copy_cell() {
+#[tokio::test]
+async fn ctrl_c_in_grid_sends_copy_cell() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -982,8 +948,8 @@ fn ctrl_c_in_grid_sends_copy_cell() {
     assert_eq!(try_recv_variant(&mut rx), "CopyCell");
 }
 
-#[test]
-fn shift_y_in_grid_sends_copy_row_json() {
+#[tokio::test]
+async fn shift_y_in_grid_sends_copy_row_json() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -991,58 +957,11 @@ fn shift_y_in_grid_sends_copy_row_json() {
         KeyCode::Char('Y'),
         KeyModifiers::SHIFT,
     )));
-    assert_eq!(try_recv_variant(&mut rx), "CopyRowJson");
+    assert_eq!(try_recv_variant(&mut rx), "CopyRows(Json)");
 }
 
-#[test]
-fn row_json_text_returns_single_object_without_selection() {
-    let (mut app, _rx) = make_test_app();
-    app.grid = Some(make_grid());
-    seed_grid_rows(&app, 50);
-
-    let (json_text, copied_selected_rows) =
-        app.row_json_text().expect("row json").expect("json text");
-    let json: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
-
-    assert!(!copied_selected_rows);
-    assert_eq!(json["id"], serde_json::json!(0));
-    assert_eq!(json["name"], serde_json::json!("user-0"));
-}
-
-#[test]
-fn row_json_text_returns_selected_rows_as_array() {
-    let (mut app, _rx) = make_test_app();
-    let mut grid = make_grid();
-    grid.row_selection = crate::grid::RowSelection::Rows(BTreeSet::from([1, 3]));
-    app.grid = Some(grid);
-    seed_grid_rows(&app, 50);
-
-    let (json_text, copied_selected_rows) =
-        app.row_json_text().expect("row json").expect("json text");
-    let json: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
-
-    assert!(copied_selected_rows);
-    assert_eq!(
-        json,
-        serde_json::json!([
-            {
-                "id": 1,
-                "name": "user-1",
-                "age": 21,
-                "email": "user1@example.com"
-            },
-            {
-                "id": 3,
-                "name": "user-3",
-                "age": 23,
-                "email": "user3@example.com"
-            }
-        ])
-    );
-}
-
-#[test]
-fn ctrl_z_sends_undo_action() {
+#[tokio::test]
+async fn ctrl_z_sends_undo_action() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -1054,8 +973,8 @@ fn ctrl_z_sends_undo_action() {
     assert_eq!(try_recv_variant(&mut rx), "UndoAction");
 }
 
-#[test]
-fn enter_in_grid_sends_open_popup() {
+#[tokio::test]
+async fn enter_in_grid_sends_open_popup() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -1067,8 +986,8 @@ fn enter_in_grid_sends_open_popup() {
     assert_eq!(try_recv_variant(&mut rx), "OpenPopup");
 }
 
-#[test]
-fn e_in_grid_sends_open_direct_edit() {
+#[tokio::test]
+async fn e_in_grid_sends_open_direct_edit() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.focus = FocusPane::Grid;
@@ -1080,8 +999,8 @@ fn e_in_grid_sends_open_direct_edit() {
     assert_eq!(try_recv_variant(&mut rx), "OpenDirectEdit");
 }
 
-#[test]
-fn n_in_grid_sends_set_focused_cell_null_when_allowed() {
+#[tokio::test]
+async fn n_in_grid_sends_set_focused_cell_null_when_allowed() {
     let (mut app, _rx) = make_test_app();
     let mut grid = make_grid();
     grid.focused_col = 1;
@@ -1098,8 +1017,8 @@ fn n_in_grid_sends_set_focused_cell_null_when_allowed() {
     assert_eq!(try_recv_variant(&mut rx), "SetFocusedCellNull");
 }
 
-#[test]
-fn n_in_grid_does_nothing_when_cell_cannot_be_null() {
+#[tokio::test]
+async fn n_in_grid_does_nothing_when_cell_cannot_be_null() {
     let (mut app, _rx) = make_test_app();
     let mut grid = make_grid();
     grid.focused_col = 1;
@@ -1117,8 +1036,8 @@ fn n_in_grid_does_nothing_when_cell_cannot_be_null() {
     assert_eq!(try_recv_variant(&mut rx), "no message");
 }
 
-#[test]
-fn open_direct_edit_opens_text_editor() {
+#[tokio::test]
+async fn open_direct_edit_opens_text_editor() {
     let (mut app, _rx) = make_test_app();
     let mut grid = make_grid();
     grid.focused_col = 1;
@@ -1132,8 +1051,8 @@ fn open_direct_edit_opens_text_editor() {
 
 // ---------- sidebar shortcuts ----------
 
-#[test]
-fn enter_in_sidebar_opens_table() {
+#[tokio::test]
+async fn enter_in_sidebar_opens_table() {
     let (mut app, mut rx) = make_test_app();
     app.focus = FocusPane::Sidebar;
     // navigate to first table entry
@@ -1142,12 +1061,13 @@ fn enter_in_sidebar_opens_table() {
         KeyCode::Enter,
         KeyModifiers::NONE,
     )));
-    let msg = try_recv_variant(&mut rx);
-    assert!(msg.contains("OpenTable"), "expected OpenTable, got {}", msg);
+    drain_messages(&mut app, &mut rx);
+    assert_eq!(app.active_table_name().as_deref(), Some("users"));
+    assert!(matches!(app.focus, FocusPane::Grid));
 }
 
-#[test]
-fn up_down_arrows_in_sidebar_navigate() {
+#[tokio::test]
+async fn up_down_arrows_in_sidebar_navigate() {
     let (mut app, _rx) = make_test_app();
     let initial = app.sidebar.selected;
     app.focus = FocusPane::Sidebar;
@@ -1158,8 +1078,8 @@ fn up_down_arrows_in_sidebar_navigate() {
     assert_ne!(app.sidebar.selected, initial);
 }
 
-#[test]
-fn left_right_arrows_in_sidebar_collapse_and_expand_selected_section() {
+#[tokio::test]
+async fn left_right_arrows_in_sidebar_collapse_and_expand_selected_section() {
     let (mut app, _rx) = make_test_app();
     app.focus = FocusPane::Sidebar;
 
@@ -1176,8 +1096,8 @@ fn left_right_arrows_in_sidebar_collapse_and_expand_selected_section() {
     assert!(app.sidebar.tables_expanded);
 }
 
-#[test]
-fn left_right_arrows_in_sidebar_apply_to_views_and_indexes_headers() {
+#[tokio::test]
+async fn left_right_arrows_in_sidebar_apply_to_views_and_indexes_headers() {
     let (mut app, _rx) = make_test_app();
     app.focus = FocusPane::Sidebar;
 
@@ -1210,17 +1130,18 @@ fn left_right_arrows_in_sidebar_apply_to_views_and_indexes_headers() {
 
 // ---------- letter jumps ----------
 
-#[test]
-fn letter_key_on_text_sorted_column_sends_jump_to_letter() {
+#[tokio::test]
+async fn letter_key_on_text_sorted_column_sends_jump_to_letter() {
     let (mut app, mut rx) = make_test_app();
     let mut grid = make_grid();
-    grid.sort = Some(SortSpec {
-        col_idx: 1,
-        direction: SortDir::Asc,
-    }); // name is TEXT -> text sort
+    grid.cycle_sort(1); // name is TEXT -> text sort
     app.grid = Some(grid);
     app.focus = FocusPane::Grid;
     let _ = rx.try_recv(); // drain
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('\''),
+        KeyModifiers::NONE,
+    )));
     app.update(Message::Key(crossterm::event::KeyEvent::new(
         KeyCode::Char('a'),
         KeyModifiers::NONE,
@@ -1228,17 +1149,18 @@ fn letter_key_on_text_sorted_column_sends_jump_to_letter() {
     assert_eq!(try_recv_variant(&mut rx), "JumpToLetter('a')");
 }
 
-#[test]
-fn hash_key_on_text_sorted_column_sends_jump_to_letter() {
+#[tokio::test]
+async fn hash_key_on_text_sorted_column_sends_jump_to_letter() {
     let (mut app, mut rx) = make_test_app();
     let mut grid = make_grid();
-    grid.sort = Some(SortSpec {
-        col_idx: 1,
-        direction: SortDir::Asc,
-    });
+    grid.cycle_sort(1);
     app.grid = Some(grid);
     app.focus = FocusPane::Grid;
     let _ = rx.try_recv(); // drain
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('\''),
+        KeyModifiers::NONE,
+    )));
     app.update(Message::Key(crossterm::event::KeyEvent::new(
         KeyCode::Char('#'),
         KeyModifiers::NONE,
@@ -1246,11 +1168,10 @@ fn hash_key_on_text_sorted_column_sends_jump_to_letter() {
     assert_eq!(try_recv_variant(&mut rx), "JumpToLetter('#')");
 }
 
-#[test]
-fn letter_key_without_text_sort_does_nothing() {
+#[tokio::test]
+async fn letter_key_without_text_sort_does_nothing() {
     let (mut app, mut rx) = make_test_app();
-    let mut grid = make_grid();
-    grid.sort = None; // no sort
+    let grid = make_grid();
     app.grid = Some(grid);
     app.focus = FocusPane::Grid;
     let _ = rx.try_recv(); // drain
@@ -1262,97 +1183,57 @@ fn letter_key_without_text_sort_does_nothing() {
     assert!(!msg.contains("JumpToLetter"), "unexpected: {}", msg);
 }
 
-#[tokio::test]
-async fn commit_find_repositions_and_fetches_target_window() {
-    let (mut app, _rx) = make_test_app();
-    let mut grid = make_grid();
-    let find_rows = grid.window.rows.clone();
-    grid.window.rows.truncate(10);
-    grid.window.offset = 0;
-    app.grid = Some(grid);
-
-    let columns = app.grid.as_ref().expect("grid").columns.clone();
-    let mut find = FindState::new("users".to_string(), columns);
-    find.set_rows(find_rows);
-    "user-40".chars().for_each(|c| find.push_char(c));
-    app.popup = Some(PopupKind::Find(find));
-    app.mode = AppMode::Edit;
-
-    app.update(Message::CommitFind);
-
-    assert!(app.popup.is_none(), "find popup should close after commit");
-    assert_eq!(app.mode, AppMode::Browse);
-
-    let grid = app.grid.as_ref().expect("grid");
-    assert_eq!(grid.focused_row, 40);
-    assert_eq!(grid.focused_col, 1);
-    assert!(
-        grid.viewport_start > 0,
-        "viewport should move to target row"
-    );
-    assert!(
-        grid.window.fetch_in_flight,
-        "jump should start loading the target window immediately"
-    );
-}
-
 // ---------- help popup navigation ----------
 
-#[test]
-fn help_scroll_up_and_down() {
-    let mut state = HelpState::new();
-    // simulate large viewport so scroll is visible
-    state.max_scroll = 10;
-    state.scroll_down(3);
-    assert_eq!(state.scroll, 3);
-    state.scroll_up(2);
-    assert_eq!(state.scroll, 1);
-    state.scroll_up(5);
-    assert_eq!(state.scroll, 0); // clamps at 0
-    state.scroll_down(100);
-    assert_eq!(state.scroll, 10); // clamps at max_scroll
+#[tokio::test]
+async fn question_mark_types_into_text_popups() {
+    let (mut app, _rx) = make_test_app();
+    app.grid = Some(make_grid());
+    app.update(Message::OpenDirectEdit);
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('?'),
+        KeyModifiers::NONE,
+    )));
+    assert!(
+        matches!(&app.popup, Some(PopupKind::TextEditor(state)) if state.current.ends_with('?'))
+    );
 }
 
-#[test]
-fn help_up_down_keys_scroll_in_edit_mode() {
-    let (mut app, _rx) = make_test_app();
-    let mut state = HelpState::new();
-    state.max_scroll = 10;
-    app.popup = Some(PopupKind::Help(state));
-    app.mode = AppMode::Edit;
-
+#[tokio::test]
+async fn help_stacks_over_a_popup_and_restores_it() {
+    let (mut app, mut rx) = make_test_app();
+    app.grid = Some(make_grid());
+    app.focus = FocusPane::Grid;
+    app.open_record();
+    assert!(matches!(app.popup, Some(PopupKind::Record(_))));
     app.update(Message::Key(crossterm::event::KeyEvent::new(
-        KeyCode::Down,
+        KeyCode::Char('?'),
         KeyModifiers::NONE,
     )));
-    assert!(matches!(&app.popup, Some(PopupKind::Help(s)) if s.scroll == 3));
-
+    drain_messages(&mut app, &mut rx);
+    assert!(matches!(app.popup, Some(PopupKind::Help(_))));
     app.update(Message::Key(crossterm::event::KeyEvent::new(
-        KeyCode::Up,
+        KeyCode::Esc,
         KeyModifiers::NONE,
     )));
-    assert!(matches!(&app.popup, Some(PopupKind::Help(s)) if s.scroll == 0));
-}
-
-#[test]
-fn help_page_up_down_scrolls_faster() {
-    let (mut app, _rx) = make_test_app();
-    let mut state = HelpState::new();
-    state.max_scroll = 30;
-    app.popup = Some(PopupKind::Help(state));
-    app.mode = AppMode::Edit;
-
+    drain_messages(&mut app, &mut rx);
+    assert!(
+        matches!(app.popup, Some(PopupKind::Record(_))),
+        "closing help restores the record"
+    );
     app.update(Message::Key(crossterm::event::KeyEvent::new(
-        KeyCode::PageDown,
+        KeyCode::Esc,
         KeyModifiers::NONE,
     )));
-    assert!(matches!(&app.popup, Some(PopupKind::Help(s)) if s.scroll == 10));
+    drain_messages(&mut app, &mut rx);
+    assert!(app.popup.is_none());
+    assert_eq!(app.mode, AppMode::Browse);
 }
 
 // ---------- confirm dialog ----------
 
-#[test]
-fn y_confirm_and_n_cancel_in_confirm_dialog() {
+#[tokio::test]
+async fn y_confirm_and_n_cancel_in_confirm_dialog() {
     let (mut app, mut rx) = make_test_app();
     app.pending_confirm = Some(PendingConfirm {
         message: "Delete?".to_string(),
@@ -1372,8 +1253,8 @@ fn y_confirm_and_n_cancel_in_confirm_dialog() {
     assert!(app.pending_confirm.is_none());
 }
 
-#[test]
-fn esc_cancels_confirm_dialog() {
+#[tokio::test]
+async fn esc_cancels_confirm_dialog() {
     let (mut app, mut rx) = make_test_app();
     app.pending_confirm = Some(PendingConfirm {
         message: "Delete?".to_string(),
@@ -1397,8 +1278,8 @@ fn esc_cancels_confirm_dialog() {
 // mouse scroll triggers async fetch which needs tokio runtime;
 // tested instead via scroll shortcuts which verify scroll messages directly
 
-#[test]
-fn mouse_click_on_grid_focuses_grid() {
+#[tokio::test]
+async fn mouse_click_on_grid_focuses_grid() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.grid_inner_area = Some(ratatui::layout::Rect {
@@ -1418,8 +1299,8 @@ fn mouse_click_on_grid_focuses_grid() {
     assert!(matches!(app.focus, FocusPane::Grid));
 }
 
-#[test]
-fn mouse_drag_on_grid_scrollbar_scrolls_rows() {
+#[tokio::test]
+async fn mouse_drag_on_grid_scrollbar_scrolls_rows() {
     let (mut app, mut rx) = make_test_app();
     app.grid = Some(make_grid());
     app.grid.as_mut().expect("grid").window.fetch_in_flight = true;
@@ -1461,8 +1342,8 @@ fn mouse_drag_on_grid_scrollbar_scrolls_rows() {
     assert!(app.grid_scrollbar_drag.is_none());
 }
 
-#[test]
-fn mouse_wheel_scrolls_text_editor_only_under_the_pointer() {
+#[tokio::test]
+async fn mouse_wheel_scrolls_text_editor_only_under_the_pointer() {
     let (mut app, _rx) = make_test_app();
     app.popup = Some(PopupKind::TextEditor(TextEditorState::new(
         "users".to_string(),
@@ -1503,8 +1384,8 @@ fn mouse_wheel_scrolls_text_editor_only_under_the_pointer() {
     assert_eq!(text_editor_scroll_y(&app), initial_scroll);
 }
 
-#[test]
-fn mouse_drag_on_text_editor_scrollbar_scrolls_to_end() {
+#[tokio::test]
+async fn mouse_drag_on_text_editor_scrollbar_scrolls_to_end() {
     let (mut app, _rx) = make_test_app();
     app.popup = Some(PopupKind::TextEditor(TextEditorState::new(
         "users".to_string(),
@@ -1552,8 +1433,8 @@ fn mouse_drag_on_text_editor_scrollbar_scrolls_to_end() {
     assert_eq!(text_editor_scroll_y(&app), max_scroll);
 }
 
-#[test]
-fn ctrl_click_on_row_gutter_toggles_rows_without_clearing_selection() {
+#[tokio::test]
+async fn ctrl_click_on_row_gutter_toggles_rows_without_clearing_selection() {
     let (mut app, _rx) = make_test_app();
     app.grid = Some(make_grid());
     app.grid_inner_area = Some(ratatui::layout::Rect {
@@ -1584,12 +1465,10 @@ fn ctrl_click_on_row_gutter_toggles_rows_without_clearing_selection() {
     );
 }
 
-#[test]
-fn tabbar_hit_test_targets_visible_close_glyph() {
+#[tokio::test]
+async fn tabbar_hit_test_targets_visible_close_glyph() {
     let (mut app, _rx) = make_test_app();
-    app.open_tabs = vec![TableTab {
-        table_name: "ghost".to_string(),
-    }];
+    app.open_tabs = vec![TableTab::new("ghost".to_string())];
     app.active_tab = Some(0);
 
     assert!(matches!(
@@ -1609,12 +1488,10 @@ fn tabbar_hit_test_targets_visible_close_glyph() {
     ));
 }
 
-#[test]
-fn mouse_click_on_tab_close_button_closes_tab() {
+#[tokio::test]
+async fn mouse_click_on_tab_close_button_closes_tab() {
     let (mut app, mut rx) = make_test_app();
-    app.open_tabs = vec![TableTab {
-        table_name: "ghost".to_string(),
-    }];
+    app.open_tabs = vec![TableTab::new("ghost".to_string())];
     app.active_tab = Some(0);
     app.tabbar_area = ratatui::layout::Rect {
         x: 0,
@@ -1634,17 +1511,20 @@ fn mouse_click_on_tab_close_button_closes_tab() {
 
     assert!(app.open_tabs.is_empty());
     assert_eq!(app.active_tab, None);
-    assert!(matches!(app.focus, FocusPane::Grid));
+    assert!(
+        matches!(app.focus, FocusPane::Sidebar),
+        "closing the last tab returns to the sidebar"
+    );
 }
 
-#[test]
-fn closing_inactive_tab_keeps_same_active_tab() {
+#[tokio::test]
+async fn closing_inactive_tab_keeps_same_active_tab() {
     assert_eq!(next_active_tab_after_close(Some(2), 0, 3), Some(1));
     assert_eq!(next_active_tab_after_close(Some(1), 2, 3), Some(1));
 }
 
-#[test]
-fn closing_active_tab_activates_previous_tab() {
+#[tokio::test]
+async fn closing_active_tab_activates_previous_tab() {
     assert_eq!(next_active_tab_after_close(Some(2), 2, 3), Some(1));
     assert_eq!(next_active_tab_after_close(Some(0), 0, 2), Some(0));
     assert_eq!(next_active_tab_after_close(Some(0), 0, 0), None);
@@ -1652,8 +1532,8 @@ fn closing_active_tab_activates_previous_tab() {
 
 // ---------- value picker tests (existing) ----------
 
-#[test]
-fn value_picker_allows_long_entries_when_distinct_set_is_small() {
+#[tokio::test]
+async fn value_picker_allows_long_entries_when_distinct_set_is_small() {
     let values = vec![
         "Apple Inc.".to_string(),
         "Embraer - Empresa Brasileira de Aeronáutica S.A.".to_string(),
@@ -1662,8 +1542,8 @@ fn value_picker_allows_long_entries_when_distinct_set_is_small() {
     assert!(should_use_value_picker(&values));
 }
 
-#[test]
-fn value_picker_rejects_empty_and_oversized_distinct_sets() {
+#[tokio::test]
+async fn value_picker_rejects_empty_and_oversized_distinct_sets() {
     assert!(!should_use_value_picker(&[]));
 
     let values = (0..101).map(|i| format!("value-{i}")).collect::<Vec<_>>();
@@ -1684,8 +1564,8 @@ fn make_schema_with(table: &str) -> crate::db::schema::Schema {
     crate::db::load_schema(&conn).expect("schema")
 }
 
-#[test]
-fn external_refresh_with_identical_schema_does_not_push_toast() {
+#[tokio::test]
+async fn external_refresh_with_identical_schema_does_not_push_toast() {
     let (mut app, _rx) = make_test_app();
     // First: send a schema with a DIFFERENT table name → should push a toast.
     let different_schema = make_schema_with("other_table");
@@ -1752,8 +1632,8 @@ async fn close_popup_clears_pending_refresh_and_triggers_fetch() {
     }
 }
 
-#[test]
-fn stale_window_response_is_ignored() {
+#[tokio::test]
+async fn stale_window_response_is_ignored() {
     let (mut app, _rx) = make_test_app();
     app.grid = Some(make_grid());
     app.grid_request_serial = 2;
@@ -1765,17 +1645,18 @@ fn stale_window_response_is_ignored() {
         offset: 0,
         rows: vec![vec![SqlValue::Text("stale".to_string())]],
         rowids: vec![Some(99)],
-        total_rows: 1,
+        total_rows: Some(1),
     });
 
     assert_eq!(app.grid.as_ref().expect("grid").window.rows[0], original);
 }
 
-#[test]
-fn in_flight_window_completion_preserves_a_queued_scroll_fetch() {
+#[tokio::test]
+async fn in_flight_window_completion_preserves_a_queued_scroll_fetch() {
     let (mut app, _rx) = make_test_app();
     let mut grid = make_grid();
     grid.window.fetch_in_flight = true;
+    grid.window.total_rows = 100;
     app.grid = Some(grid);
 
     app.scroll_grid_to_row(40);
@@ -1788,7 +1669,7 @@ fn in_flight_window_completion_preserves_a_queued_scroll_fetch() {
             .map(|index| vec![SqlValue::Integer(index)])
             .collect(),
         rowids: (1..=20).map(Some).collect(),
-        total_rows: 100,
+        total_rows: Some(100),
     });
 
     let grid = app.grid.as_ref().expect("grid");
@@ -1796,8 +1677,8 @@ fn in_flight_window_completion_preserves_a_queued_scroll_fetch() {
     assert!(!grid.window.fetch_in_flight);
 }
 
-#[test]
-fn stale_alphabet_navigation_is_ignored() {
+#[tokio::test]
+async fn stale_alphabet_navigation_is_ignored() {
     let (mut app, _rx) = make_test_app();
     app.grid = Some(make_grid());
     app.navigation_request_serial = 2;
@@ -1811,8 +1692,8 @@ fn stale_alphabet_navigation_is_ignored() {
     assert_eq!(app.grid.as_ref().expect("grid").focused_row, 0);
 }
 
-#[test]
-fn export_failure_does_not_release_the_write_gate() {
+#[tokio::test]
+async fn export_failure_does_not_release_the_write_gate() {
     let (mut app, _rx) = make_test_app();
     app.write_in_flight = true;
 
@@ -1821,8 +1702,8 @@ fn export_failure_does_not_release_the_write_gate() {
     assert!(app.write_in_flight);
 }
 
-#[test]
-fn opening_direct_editor_invalidates_pending_distinct_lookup() {
+#[tokio::test]
+async fn opening_direct_editor_invalidates_pending_distinct_lookup() {
     let (mut app, _rx) = make_test_app();
     app.grid = Some(make_grid());
     app.popup_request_serial = 1;
@@ -1868,9 +1749,7 @@ async fn external_refresh_detects_column_changes() {
 async fn schema_refresh_restarts_a_pending_initial_grid_load() {
     let (mut app, _rx) = make_test_app();
     app.grid = None;
-    app.open_tabs = vec![TableTab {
-        table_name: "users".to_string(),
-    }];
+    app.open_tabs = vec![TableTab::new("users".to_string())];
     app.active_tab = Some(0);
     app.grid_request_serial = 1;
     let conn = app.pool.get().expect("connection");
@@ -1880,26 +1759,31 @@ async fn schema_refresh_restarts_a_pending_initial_grid_load() {
     drop(conn);
 
     app.update(Message::ExternalRefresh(changed));
-    let current_request = app.grid_request_serial;
-    assert!(current_request > 1);
-    app.update(Message::GridDataReady {
+    assert!(app.grid_request_serial > 1);
+    app.update(Message::WindowReady {
         request_id: 1,
         table: "users".to_string(),
-        columns: make_grid().columns,
-        fk_cols: vec![false; 4],
-        fetched: db::FetchedRows::default(),
-        total_rows: 0,
+        offset: 0,
+        rows: vec![vec![SqlValue::Integer(7)]],
+        rowids: vec![Some(7)],
+        total_rows: Some(1),
     });
-    assert!(app.grid.is_none(), "stale initial response must be ignored");
+    let grid = app
+        .grid
+        .as_ref()
+        .expect("the grid is rebuilt from the new schema");
+    assert!(grid.columns.iter().any(|column| column.name == "nickname"));
+    assert!(
+        grid.window.rows.is_empty(),
+        "stale initial response must be ignored"
+    );
 }
 
 #[tokio::test]
 async fn dropping_a_table_invalidates_its_pending_initial_grid_load() {
     let (mut app, _rx) = make_test_app();
     app.grid = None;
-    app.open_tabs = vec![TableTab {
-        table_name: "users".to_string(),
-    }];
+    app.open_tabs = vec![TableTab::new("users".to_string())];
     app.active_tab = Some(0);
     app.grid_request_serial = 1;
     let conn = app.pool.get().expect("connection");
@@ -1909,13 +1793,13 @@ async fn dropping_a_table_invalidates_its_pending_initial_grid_load() {
 
     app.update(Message::ExternalRefresh(changed));
     assert!(app.grid_request_serial > 1);
-    app.update(Message::GridDataReady {
+    app.update(Message::WindowReady {
         request_id: 1,
         table: "users".to_string(),
-        columns: make_grid().columns,
-        fk_cols: vec![false; 4],
-        fetched: db::FetchedRows::default(),
-        total_rows: 0,
+        offset: 0,
+        rows: Vec::new(),
+        rowids: Vec::new(),
+        total_rows: Some(0),
     });
     assert!(app.grid.is_none(), "dropped table must not be restored");
 }
@@ -1946,4 +1830,371 @@ async fn write_completion_applies_a_pending_schema_refresh() {
         .columns
         .iter()
         .any(|column| column.name == "nickname"));
+}
+
+// ---------- audit features ----------
+
+fn make_related_app(readonly: bool) -> (App, mpsc::UnboundedReceiver<Message>) {
+    let manager = SqliteConnectionManager::memory();
+    let pool = Arc::new(
+        r2d2::Pool::builder()
+            .max_size(1)
+            .build(manager)
+            .expect("test pool"),
+    );
+    let conn = pool.get().expect("test conn");
+    conn.execute_batch(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id), item TEXT);
+         CREATE VIEW big_orders AS SELECT * FROM orders WHERE id > 1;
+         INSERT INTO users VALUES (1, 'Ada'), (2, 'Bob');
+         INSERT INTO orders VALUES (1, 1, 'pen'), (2, 1, 'ink'), (3, 2, 'pad');",
+    )
+    .expect("seed schema");
+    let schema = db::load_schema(&conn).expect("load schema");
+    drop(conn);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let app = App::new(
+        schema,
+        Config::default(),
+        pool,
+        tx,
+        readonly,
+        ":memory:".to_string(),
+    );
+    (app, rx)
+}
+
+/// Applies background replies until the active grid has its rows.
+async fn settle(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>) {
+    for _ in 0..20 {
+        let loaded = app
+            .grid
+            .as_ref()
+            .is_some_and(|grid| grid.count_known && !grid.window.fetch_in_flight);
+        if loaded {
+            while let Ok(message) = rx.try_recv() {
+                app.update(message);
+            }
+            return;
+        }
+        receive_one(app, rx).await;
+    }
+    panic!("grid did not load");
+}
+
+fn key(code: KeyCode) -> Message {
+    Message::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+#[tokio::test]
+async fn switching_tabs_keeps_each_tabs_position() {
+    let (mut app, mut rx) = make_related_app(false);
+    app.open_table("orders".to_string());
+    settle(&mut app, &mut rx).await;
+    app.update_grid(|grid| grid.focus_cell(2, 2));
+
+    app.open_table("users".to_string());
+    settle(&mut app, &mut rx).await;
+    assert_eq!(app.grid.as_ref().expect("users grid").focused_row, 0);
+
+    app.update(key(KeyCode::Char('[')));
+    drain_messages(&mut app, &mut rx);
+    let grid = app.grid.as_ref().expect("orders grid");
+    assert_eq!(grid.table_name, "orders");
+    assert_eq!(
+        (grid.focused_row, grid.focused_col),
+        (2, 2),
+        "the tab keeps its focus"
+    );
+}
+
+#[tokio::test]
+async fn views_open_read_only() {
+    let (mut app, mut rx) = make_related_app(false);
+    app.open_table("big_orders".to_string());
+    settle(&mut app, &mut rx).await;
+    let grid = app.grid.as_ref().expect("view grid");
+    assert!(grid.readonly);
+    assert_eq!(grid.window.total_rows, 2);
+    assert!(app.is_readonly_view());
+
+    app.update(Message::OpenPopup);
+    assert!(app.popup.is_none());
+    assert_eq!(
+        app.toast.toasts.back().map(|t| t.message.as_str()),
+        Some("Views are read-only")
+    );
+}
+
+#[tokio::test]
+async fn readonly_flag_cannot_be_toggled_off() {
+    let (mut app, _rx) = make_related_app(true);
+    assert!(app.readonly_locked);
+    app.execute_palette_command(PaletteCommand::ToggleReadonly);
+    assert!(app.readonly, "the pool cannot write, so read-only stays on");
+    assert!(app
+        .toast
+        .toasts
+        .back()
+        .is_some_and(|toast| toast.kind == ToastKind::Error));
+}
+
+#[tokio::test]
+async fn referencing_rows_open_filtered_and_back_returns() {
+    let (mut app, mut rx) = make_related_app(false);
+    app.open_table("users".to_string());
+    settle(&mut app, &mut rx).await;
+
+    app.update(key(KeyCode::Char('r')));
+    let Some(PopupKind::References(state)) = &app.popup else {
+        panic!("expected the references popup");
+    };
+    assert_eq!(state.references.len(), 1);
+    assert_eq!(state.references[0].table, "orders");
+    assert_eq!(state.references[0].value, SqlValue::Integer(1));
+
+    app.update(key(KeyCode::Enter));
+    settle(&mut app, &mut rx).await;
+    let grid = app.grid.as_ref().expect("orders grid");
+    assert_eq!(grid.table_name, "orders");
+    assert_eq!(grid.filter.active_count(), 1);
+    assert_eq!(grid.window.total_rows, 2, "only Ada's orders");
+    assert_eq!(app.jump_stack.len(), 1);
+}
+
+#[tokio::test]
+async fn column_keys_hide_resize_and_add_sort_keys() {
+    let (mut app, mut rx) = make_related_app(false);
+    app.open_table("orders".to_string());
+    settle(&mut app, &mut rx).await;
+    render_test_app(&mut app);
+    let before = app.grid.as_ref().expect("grid").col_widths[0];
+
+    app.update(key(KeyCode::Char('>')));
+    assert_eq!(app.grid.as_ref().expect("grid").col_widths[0], before + 2);
+
+    app.update(key(KeyCode::Char('s')));
+    app.update(key(KeyCode::Right));
+    app.update(key(KeyCode::Char('S')));
+    drain_messages(&mut app, &mut rx);
+    assert_eq!(app.grid.as_ref().expect("grid").sort.len(), 2);
+
+    app.update(key(KeyCode::Char('-')));
+    let grid = app.grid.as_ref().expect("grid");
+    assert_eq!(grid.display_columns(), vec![0, 2]);
+    assert_eq!(
+        grid.focused_col, 2,
+        "focus moves to the next visible column"
+    );
+}
+
+#[tokio::test]
+async fn esc_focuses_the_sidebar_and_hiding_it_returns_focus() {
+    let (mut app, mut rx) = make_related_app(false);
+    app.open_table("users".to_string());
+    settle(&mut app, &mut rx).await;
+    assert!(matches!(app.focus, FocusPane::Grid));
+
+    app.update(key(KeyCode::Esc));
+    assert!(matches!(app.focus, FocusPane::Sidebar));
+
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('b'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(!app.sidebar_visible);
+    assert!(matches!(app.focus, FocusPane::Grid));
+}
+
+#[tokio::test]
+async fn space_toggles_the_focused_row() {
+    let (mut app, _rx) = make_test_app();
+    app.grid = Some(make_grid());
+    app.focus = FocusPane::Grid;
+    app.update(key(KeyCode::Char(' ')));
+    assert!(app.grid.as_ref().expect("grid").is_row_selected(0));
+    app.update(key(KeyCode::Char(' ')));
+    assert!(!app.grid.as_ref().expect("grid").has_row_selection());
+}
+
+#[tokio::test]
+async fn sidebar_i_shows_the_schema() {
+    let (mut app, mut rx) = make_related_app(false);
+    app.focus = FocusPane::Sidebar;
+    app.sidebar.move_down(&app.schema);
+    app.update(key(KeyCode::Char('i')));
+    while app.popup.is_none() {
+        receive_one(&mut app, &mut rx).await;
+    }
+    let Some(PopupKind::Schema(state)) = &app.popup else {
+        panic!("expected the schema view");
+    };
+    assert_eq!(state.name, "orders");
+    assert!(state.ddl.contains("CREATE TABLE"));
+}
+
+#[tokio::test]
+async fn copy_rows_as_csv_uses_the_selection() {
+    let (mut app, mut rx) = make_related_app(false);
+    app.open_table("users".to_string());
+    settle(&mut app, &mut rx).await;
+    app.update_grid(GridState::select_all_rows);
+
+    app.copy_rows(CopyFormat::Csv);
+    for _ in 0..5 {
+        receive_one(&mut app, &mut rx).await;
+        if app.toast.toasts.back().is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        app.toast.toasts.back().map(|t| t.message.as_str()),
+        Some("Copied 2 rows as CSV")
+    );
+}
+
+#[tokio::test]
+async fn unconfirmed_deletion_says_so_when_it_expires() {
+    let (mut app, _rx) = make_test_app();
+    app.pending_confirm = Some(PendingConfirm {
+        message: "Delete?".to_string(),
+        kind: ConfirmKind::DeleteRow {
+            table: "users".to_string(),
+            rowid: 1,
+        },
+        created: std::time::Instant::now() - std::time::Duration::from_secs(CONFIRM_TIMEOUT_SECS),
+    });
+    app.update(Message::Tick);
+    assert!(app.pending_confirm.is_none());
+    assert_eq!(
+        app.toast.toasts.back().map(|t| t.message.as_str()),
+        Some("Deletion not confirmed; nothing deleted")
+    );
+}
+
+/// Every popup, drawn over a grid whose data holds control characters.
+fn every_popup(app: &App) -> Vec<PopupKind> {
+    use crate::ui::popup::{
+        record::RecordInit, references::Reference, schema_view::SchemaLine, CommandPaletteState,
+        DatePickerState, ExportState, FindState, FkPickerState, GlobalSearchState, GoToRowState,
+        JsonViewState, RecordState, ReferencesState, SchemaViewState, SqlConsoleState,
+        TextEditorState, ValuePickerState,
+    };
+    let grid = app.grid.as_ref().expect("grid");
+    let evil = SqlValue::Text("a\x1b]2;x\x07\nb\tc".to_string());
+    let long = "x".repeat(300);
+    vec![
+        PopupKind::TextEditor(TextEditorState::new(
+            "users".into(),
+            1,
+            "name".into(),
+            "TEXT".into(),
+            SqlValue::Text(format!("{long}\n{long}")),
+            false,
+        )),
+        PopupKind::ValuePicker(ValuePickerState::new(
+            "users".into(),
+            1,
+            "name".into(),
+            "TEXT".into(),
+            vec![long.clone(), "a\x1bb".into()],
+            evil.clone(),
+        )),
+        PopupKind::DatePicker(DatePickerState::datetime(
+            "users".into(),
+            1,
+            "at".into(),
+            SqlValue::Text("2026-09-30 12:00:00".into()),
+        )),
+        PopupKind::InsertRow(InsertRowState::new("users".into(), grid.columns.clone(), 0)),
+        PopupKind::FkPicker(FkPickerState::new(
+            "users".into(),
+            grid.columns.clone(),
+            "users".into(),
+            "id".into(),
+            1,
+            SqlValue::Integer(1),
+        )),
+        PopupKind::FilterPopup(FilterPopupState::new(
+            "name".into(),
+            "TEXT".into(),
+            Default::default(),
+        )),
+        PopupKind::CommandPalette(CommandPaletteState::new(vec![long.clone()])),
+        PopupKind::Help(HelpState::new()),
+        PopupKind::Find(FindState::new("users".into(), grid.columns.clone())),
+        PopupKind::GoToRow(GoToRowState::new(50)),
+        PopupKind::Record(RecordState::new(RecordInit {
+            table: "users".into(),
+            row_number: 1,
+            names: grid.columns.iter().map(|c| c.name.clone()).collect(),
+            kinds: grid.kinds.clone(),
+            values: vec![
+                SqlValue::Integer(1),
+                evil.clone(),
+                SqlValue::Null,
+                SqlValue::Text("{\"a\":[1]}".into()),
+            ],
+            links: vec![false, true, false, false],
+            editable: true,
+            focused: 1,
+        })),
+        PopupKind::Schema(SchemaViewState::new(
+            "users".into(),
+            "CREATE TABLE users (\n id INTEGER\n)".into(),
+            vec![
+                SchemaLine::Heading("Columns".into()),
+                SchemaLine::Text(long.clone()),
+            ],
+        )),
+        PopupKind::SqlConsole(SqlConsoleState::new(vec!["SELECT 1".into()])),
+        PopupKind::GlobalSearch(GlobalSearchState::new()),
+        PopupKind::Export(ExportState::new(
+            crate::export::ExportFormat::Csv,
+            long.clone(),
+            3,
+        )),
+        PopupKind::References(ReferencesState::new(
+            "users".into(),
+            vec![Reference {
+                table: "orders".into(),
+                column: "user_id".into(),
+                value: evil,
+            }],
+        )),
+        PopupKind::Json(JsonViewState::new(
+            "doc".into(),
+            serde_json::json!({"a": [1, {"b": long}]}),
+        )),
+    ]
+}
+
+#[tokio::test]
+async fn every_popup_renders_at_any_terminal_size() {
+    let (mut app, _rx) = make_test_app();
+    let mut grid = make_grid();
+    grid.window.rows[0][1] = SqlValue::Text("evil\x1b]2;PWNED\x07\ttab\nline".into());
+    app.grid = Some(grid);
+    app.open_tabs = vec![TableTab::new("users".to_string())];
+    app.active_tab = Some(0);
+    let popups = every_popup(&app);
+    for popup in popups {
+        app.popup = Some(popup);
+        app.mode = AppMode::Edit;
+        for (width, height) in [(1, 1), (20, 3), (30, 5), (40, 10), (80, 15), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| crate::ui::render(frame, &mut app))
+                .expect("render");
+            let buffer = terminal.backend().buffer();
+            assert!(
+                buffer
+                    .content()
+                    .iter()
+                    .all(|cell| !cell.symbol().chars().any(char::is_control)),
+                "control characters reached the terminal at {width}x{height}"
+            );
+        }
+    }
 }

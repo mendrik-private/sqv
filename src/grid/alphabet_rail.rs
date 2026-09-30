@@ -42,7 +42,7 @@ fn active_letter(state: &GridState) -> Option<char> {
         .window
         .get_row(state.focused_row as i64)
         .or_else(|| state.window.get_row(state.viewport_start))
-        .and_then(|row| state.sort.as_ref().and_then(|s| row.get(s.col_idx)))
+        .and_then(|row| state.sort.first().and_then(|s| row.get(s.col_idx)))
         .and_then(|val| match val {
             crate::db::types::SqlValue::Text(s) => s.chars().next(),
             _ => None,
@@ -143,10 +143,10 @@ mod tests {
             total_rows: 300,
             area_width: 40,
         });
-        grid.sort = Some(SortSpec {
+        grid.sort = vec![SortSpec {
             col_idx: 0,
             direction: SortDir::Asc,
-        });
+        }];
 
         let area = Rect {
             x: 0,
@@ -173,10 +173,10 @@ mod tests {
             total_rows: 300,
             area_width: 40,
         });
-        grid.sort = Some(SortSpec {
+        grid.sort = vec![SortSpec {
             col_idx: 0,
             direction: SortDir::Asc,
-        });
+        }];
         grid.viewport_start = 0;
         grid.focused_row = 1;
 

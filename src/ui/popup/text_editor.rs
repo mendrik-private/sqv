@@ -1,17 +1,23 @@
-use super::text_cursor;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Position, Rect},
     style::Style,
-    text::{Line, Span},
-    widgets::{block::BorderType, Block, Borders, Paragraph},
     Frame,
 };
 use unicode_width::UnicodeWidthChar;
 
+use super::PopupAction;
 use crate::{
     db::types::{affinity, expects_number, parse_input, ColAffinity, SqlValue},
     symbols::Symbols,
     theme::Theme,
+    ui::widgets::{
+        frame::PopupFrame,
+        hints::{hint, render_hints},
+        input::{delete_backward, insert_char, TextInput},
+        scrollbar::Scrollbar,
+        text::put,
+    },
 };
 
 pub struct TextEditorState {
@@ -41,14 +47,6 @@ pub struct TextEditorState {
 struct WrappedDisplay {
     lines: Vec<String>,
     cursor_line: usize,
-}
-
-#[derive(Clone, Copy)]
-struct ScrollbarMetrics {
-    track_height: usize,
-    thumb_height: usize,
-    thumb_top: usize,
-    max_thumb_top: usize,
 }
 
 impl TextEditorState {
@@ -109,14 +107,14 @@ impl TextEditorState {
         if self.readonly {
             return;
         }
-        text_cursor::insert(&mut self.current, &mut self.cursor_pos, ch);
+        insert_char(&mut self.current, &mut self.cursor_pos, ch);
         self.dirty = true;
         self.follow_cursor = true;
         self.validate();
     }
 
     pub fn delete_backward(&mut self) {
-        if self.readonly || !text_cursor::delete_backward(&mut self.current, &mut self.cursor_pos) {
+        if self.readonly || !delete_backward(&mut self.current, &mut self.cursor_pos) {
             return;
         }
         self.dirty = true;
@@ -130,8 +128,94 @@ impl TextEditorState {
     }
 
     pub fn move_cursor_right(&mut self) {
-        text_cursor::move_right(&self.current, &mut self.cursor_pos);
+        self.cursor_pos = (self.cursor_pos + 1).min(self.current.chars().count());
         self.follow_cursor = true;
+    }
+
+    fn delete_forward(&mut self) {
+        if self.readonly || self.cursor_pos >= self.current.chars().count() {
+            return;
+        }
+        self.cursor_pos += 1;
+        self.delete_backward();
+    }
+
+    /// Moves to the start or end of the current hard line.
+    fn move_to_line_edge(&mut self, end: bool) {
+        let chars: Vec<char> = self.current.chars().collect();
+        let mut pos = self.cursor_pos;
+        if end {
+            while pos < chars.len() && chars[pos] != '\n' {
+                pos += 1;
+            }
+        } else {
+            while pos > 0 && chars[pos - 1] != '\n' {
+                pos -= 1;
+            }
+        }
+        self.cursor_pos = pos;
+        self.follow_cursor = true;
+    }
+
+    fn page(&self) -> u16 {
+        usize_to_u16(self.viewport_lines.saturating_sub(1).max(1))
+    }
+
+    pub fn handle_key(&mut self, key: &KeyEvent) -> PopupAction {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => return PopupAction::Close,
+            KeyCode::Enter if alt && self.is_multiline => self.insert_char('\n'),
+            KeyCode::Enter if !alt && !ctrl => return PopupAction::Submit,
+            KeyCode::Tab if self.is_multiline => {
+                self.insert_char(' ');
+                self.insert_char(' ');
+            }
+            KeyCode::Char('a') if ctrl => self.move_to_line_edge(false),
+            KeyCode::Char('e') if ctrl => self.move_to_line_edge(true),
+            KeyCode::Char(ch) if !ctrl && !alt => self.insert_char(ch),
+            KeyCode::Backspace => self.delete_backward(),
+            KeyCode::Delete => self.delete_forward(),
+            KeyCode::Left => self.move_cursor_left(),
+            KeyCode::Right => self.move_cursor_right(),
+            KeyCode::Home => self.move_to_line_edge(false),
+            KeyCode::End => self.move_to_line_edge(true),
+            KeyCode::Up if self.is_multiline => self.move_cursor_up(),
+            KeyCode::Down if self.is_multiline => self.move_cursor_down(),
+            KeyCode::PageUp if self.is_multiline => self.scroll_up(self.page()),
+            KeyCode::PageDown if self.is_multiline => self.scroll_down(self.page()),
+            _ => return PopupAction::Ignored,
+        }
+        PopupAction::Handled
+    }
+
+    pub fn handle_mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) -> PopupAction {
+        let handled = match kind {
+            MouseEventKind::ScrollDown if self.mouse_scroll_area_contains(x, y) => {
+                self.scroll_down(3);
+                true
+            }
+            MouseEventKind::ScrollUp if self.mouse_scroll_area_contains(x, y) => {
+                self.scroll_up(3);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.end_scrollbar_drag();
+                self.begin_scrollbar_drag(x, y)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_scrollbar(y),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.end_scrollbar_drag();
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            PopupAction::Handled
+        } else {
+            PopupAction::Ignored
+        }
     }
 
     pub fn move_cursor_up(&mut self) {
@@ -153,67 +237,45 @@ impl TextEditorState {
     }
 
     pub(crate) fn mouse_scroll_area_contains(&self, x: u16, y: u16) -> bool {
-        self.is_multiline && rect_contains(self.scroll_area, x, y)
+        self.is_multiline && self.scroll_area.contains(Position { x, y })
+    }
+
+    fn scrollbar(&self) -> Scrollbar {
+        Scrollbar {
+            offset: self.scroll_y as usize,
+            total: self.visual_line_count,
+            viewport: self.viewport_lines,
+        }
     }
 
     pub(crate) fn begin_scrollbar_drag(&mut self, x: u16, y: u16) -> bool {
-        if !rect_contains(self.scrollbar_area, x, y) {
+        if !self.scrollbar_area.contains(Position { x, y }) {
             return false;
         }
-        let Some(metrics) = scrollbar_metrics(
-            self.scrollbar_area,
-            self.scroll_y as usize,
-            self.visual_line_count,
-            self.viewport_lines,
-        ) else {
+        let track = self.scrollbar_area.height;
+        let Some(thumb) = self.scrollbar().thumb(track) else {
             return false;
         };
-        if metrics.max_thumb_top == 0 {
-            return false;
-        }
-
-        let pointer_offset = usize::from(y.saturating_sub(self.scrollbar_area.y))
-            .min(metrics.track_height.saturating_sub(1));
-        self.scrollbar_drag_grab = Some(
-            if pointer_offset >= metrics.thumb_top
-                && pointer_offset < metrics.thumb_top.saturating_add(metrics.thumb_height)
-            {
-                pointer_offset.saturating_sub(metrics.thumb_top)
-            } else {
-                metrics.thumb_height / 2
-            },
-        );
+        let cell = y - self.scrollbar_area.y;
+        let grab = if cell >= thumb.start && cell < thumb.start + thumb.len {
+            cell - thumb.start
+        } else {
+            thumb.len / 2
+        };
+        self.scrollbar_drag_grab = Some(grab as usize);
         self.drag_scrollbar(y)
     }
 
     pub(crate) fn drag_scrollbar(&mut self, y: u16) -> bool {
-        let Some(grab_offset) = self.scrollbar_drag_grab else {
+        let Some(grab) = self.scrollbar_drag_grab else {
             return false;
         };
-        let Some(metrics) = scrollbar_metrics(
-            self.scrollbar_area,
-            self.scroll_y as usize,
-            self.visual_line_count,
-            self.viewport_lines,
-        ) else {
-            self.scrollbar_drag_grab = None;
-            return false;
-        };
-        if metrics.max_thumb_top == 0 {
-            return false;
-        }
-
-        let pointer_offset = usize::from(y.saturating_sub(self.scrollbar_area.y));
-        let thumb_top = pointer_offset
-            .saturating_sub(grab_offset)
-            .min(metrics.max_thumb_top);
-        let numerator = (thumb_top as u64)
-            .saturating_mul(u64::from(self.max_scroll_y))
-            .saturating_add((metrics.max_thumb_top / 2) as u64);
+        let cell = y.saturating_sub(self.scrollbar_area.y);
+        let offset = self
+            .scrollbar()
+            .offset_at(self.scrollbar_area.height, cell, grab as u16);
         self.follow_cursor = false;
-        self.scroll_y = u16::try_from(numerator / metrics.max_thumb_top as u64)
-            .unwrap_or(u16::MAX)
-            .min(self.max_scroll_y);
+        self.scroll_y = usize_to_u16(offset).min(self.max_scroll_y);
         true
     }
 
@@ -344,15 +406,6 @@ impl TextEditorState {
     }
 }
 
-fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
-    area.width > 0
-        && area.height > 0
-        && x >= area.x
-        && x < area.x.saturating_add(area.width)
-        && y >= area.y
-        && y < area.y.saturating_add(area.height)
-}
-
 fn push_display_char(
     lines: &mut Vec<String>,
     line_width: &mut usize,
@@ -364,7 +417,18 @@ fn push_display_char(
     *cursor_line = lines.len().saturating_sub(1);
 }
 
+/// Control characters are shown as visible glyphs so they can never reach the
+/// terminal; each still occupies one position so cursor maths stays per char.
+fn display_char(ch: char) -> char {
+    match ch {
+        '\t' => '→',
+        ch if ch.is_control() => '�',
+        ch => ch,
+    }
+}
+
 fn push_wrapped_char(lines: &mut Vec<String>, line_width: &mut usize, ch: char, width: usize) {
+    let ch = display_char(ch);
     let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
     if *line_width > 0 && line_width.saturating_add(char_width) > width {
         lines.push(String::new());
@@ -383,7 +447,7 @@ fn cursor_positions(text: &str, width: usize) -> Vec<(usize, usize)> {
     let mut col = 0usize;
 
     for ch in text.chars() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let char_width = UnicodeWidthChar::width(display_char(ch)).unwrap_or(0);
         if ch != '\n' && col > 0 && col.saturating_add(char_width) > width {
             line = line.saturating_add(1);
             col = 0;
@@ -419,115 +483,94 @@ pub fn render(
     theme: &Theme,
     symbols: &Symbols,
 ) {
-    let popup_width = (area.width * 6 / 10).max(40).min(area.width);
-    let popup_height = if state.is_multiline { 14u16 } else { 5u16 };
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + area.height / 3;
-    let popup_area = Rect {
-        x,
-        y,
-        width: popup_width,
-        height: popup_height.min(area.height),
-    };
+    let verb = if state.json_mode { "Edit JSON" } else { "Edit" };
+    let height = if state.is_multiline { 16 } else { 5 };
+    let inner = PopupFrame::new(
+        verb,
+        Some(&state.col_name),
+        (area.width * 6 / 10).max(40),
+        height,
+    )
+    .render(frame, area, theme);
+    if inner.height < 3 {
+        return;
+    }
+    let bg = theme.bg_raised;
+    let buf = frame.buffer_mut();
 
-    super::paint_popup_surface(frame, popup_area, theme);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.accent))
-        .title(format!(
-            " {}: {} ",
-            if state.json_mode { "JSON" } else { "Edit" },
-            state.col_name
-        ))
-        .style(Style::default().bg(theme.bg_raised));
-
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
-
-    let show_validity = state.json_mode || expects_number(&state.col_type);
-
-    let sections = if state.is_multiline {
-        Layout::vertical([
-            Constraint::Length(if show_validity { 2 } else { 1 }),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner)
-    } else {
-        Layout::vertical([
-            Constraint::Length(if show_validity { 2 } else { 1 }),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(inner)
-    };
-
-    let input_style = Style::default().fg(theme.fg).bg(theme.bg_raised);
-    let hint_style = Style::default().fg(theme.fg_faint);
-
-    let mut status_lines = Vec::new();
-    if show_validity {
-        let vi = if state.valid {
-            symbols.valid
+    // Status line: validity and read-only state.
+    let mut x = inner.x + 1;
+    if state.json_mode
+        || expects_number(&state.col_type)
+        || matches!(state.original, SqlValue::Blob(_))
+    {
+        let (glyph, color, label) = if state.valid {
+            (symbols.valid, theme.green, "valid")
         } else {
-            symbols.invalid
+            (symbols.invalid, theme.red, "invalid")
         };
-        let vc = if state.valid { theme.green } else { theme.red };
-        status_lines.push(Line::from(Span::styled(
-            format!(" {} ", vi),
-            Style::default().fg(vc).bg(theme.bg_raised),
-        )));
-    }
-
-    if state.readonly {
-        status_lines.push(Line::from(Span::styled(
-            format!(" {} read-only", symbols.readonly),
-            Style::default().fg(theme.red),
-        )));
-    }
-    if status_lines.is_empty() {
-        status_lines.push(Line::from(Span::styled(
-            " editing value",
-            Style::default().fg(theme.fg_faint).bg(theme.bg_raised),
-        )));
-    }
-    frame.render_widget(
-        Paragraph::new(status_lines).style(Style::default().bg(theme.bg_raised)),
-        sections[0],
-    );
-
-    if state.is_multiline {
-        let editor_chunks = Layout::horizontal([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(sections[1]);
-        state.scroll_area = sections[1];
-        state.scrollbar_area = editor_chunks[2];
-        let viewport_lines = editor_chunks[1].height.max(1) as usize;
-        let display = state.wrapped_display(symbols.cursor, editor_chunks[1].width as usize);
-        state.update_viewport(editor_chunks[1].width as usize, viewport_lines, &display);
-        let total_lines = display.lines.len();
-        let content_lines: Vec<Line<'static>> = display
-            .lines
-            .into_iter()
-            .map(|line| Line::from(Span::styled(line, input_style)))
-            .collect();
-        frame.render_widget(
-            Paragraph::new(content_lines)
-                .style(Style::default().bg(theme.bg_raised))
-                .scroll((state.scroll_y, 0)),
-            editor_chunks[1],
+        x = put(
+            buf,
+            x,
+            inner.y,
+            inner.right(),
+            &format!("{glyph} {label}  "),
+            Style::default().fg(color).bg(bg),
         );
-        render_scrollbar(
-            frame,
-            editor_chunks[2],
-            state.scroll_y as usize,
-            total_lines,
-            viewport_lines,
+    }
+    if state.readonly {
+        put(
+            buf,
+            x,
+            inner.y,
+            inner.right(),
+            &format!("{} read-only", symbols.readonly),
+            Style::default().fg(theme.red).bg(bg),
+        );
+    } else if x == inner.x + 1 {
+        put(
+            buf,
+            x,
+            inner.y,
+            inner.right(),
+            &state.col_type,
+            Style::default().fg(theme.fg_mute).bg(bg),
+        );
+    }
+
+    let editor = Rect::new(
+        inner.x + 1,
+        inner.y + 1,
+        inner.width.saturating_sub(2),
+        inner.height - 2,
+    );
+    let input_style = Style::default().fg(theme.fg).bg(bg);
+    if state.is_multiline {
+        state.scroll_area = editor;
+        state.scrollbar_area = Rect::new(inner.right() - 1, editor.y, 1, editor.height);
+        let text_width = editor.width.saturating_sub(1) as usize;
+        let display = state.wrapped_display(symbols.cursor, text_width);
+        state.update_viewport(text_width, editor.height as usize, &display);
+        for (row, line) in display
+            .lines
+            .iter()
+            .skip(state.scroll_y as usize)
+            .take(editor.height as usize)
+            .enumerate()
+        {
+            put(
+                buf,
+                editor.x,
+                editor.y + row as u16,
+                editor.x + text_width as u16,
+                line,
+                input_style,
+            );
+        }
+        state.scrollbar().render(
+            buf,
+            Rect::new(inner.right() - 1, editor.y, 1, editor.height),
+            bg,
             theme,
             symbols,
         );
@@ -535,100 +578,36 @@ pub fn render(
         state.scroll_area = Rect::default();
         state.scrollbar_area = Rect::default();
         state.end_scrollbar_drag();
-        let editor_chunks =
-            Layout::horizontal([Constraint::Length(1), Constraint::Min(1)]).split(sections[1]);
-        let display = state.wrapped_display(symbols.cursor, usize::MAX);
-        let line = display
-            .lines
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| symbols.cursor.to_string());
-        frame.render_widget(
-            Paragraph::new(vec![Line::from(Span::styled(line, input_style))])
-                .style(Style::default().bg(theme.bg_raised)),
-            editor_chunks[1],
+        let mut input = TextInput::new(state.current.clone());
+        for _ in state.cursor_pos..state.current.chars().count() {
+            input.move_left();
+        }
+        input.render(
+            buf,
+            Rect::new(editor.x, editor.y, editor.width, 1),
+            input_style,
+            Some((symbols.cursor, Style::default().fg(theme.accent).bg(bg))),
+            symbols.ellipsis,
         );
     }
 
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(Span::styled(
-            if state.is_multiline {
-                format!(
-                    " Enter save {} Alt-Enter newline {} Esc cancel",
-                    symbols.separator, symbols.separator
-                )
-            } else {
-                format!(" Enter save {} Esc cancel", symbols.separator)
-            },
-            hint_style,
-        ))])
-        .style(Style::default().bg(theme.bg_raised)),
-        sections[2],
+    let mut hints = vec![hint("Enter", "save")];
+    if state.is_multiline {
+        hints.push(hint("Alt-Enter", "new line"));
+    }
+    hints.push(hint("Esc", "cancel"));
+    render_hints(
+        buf,
+        Rect::new(
+            inner.x + 1,
+            inner.bottom() - 1,
+            inner.width.saturating_sub(1),
+            1,
+        ),
+        &hints,
+        theme,
+        bg,
     );
-}
-
-fn render_scrollbar(
-    frame: &mut Frame,
-    area: Rect,
-    offset: usize,
-    total: usize,
-    viewport: usize,
-    theme: &Theme,
-    symbols: &Symbols,
-) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let buf = frame.buffer_mut();
-    let track_height = area.height as usize;
-    for row in 0..track_height {
-        buf.set_string(
-            area.x,
-            area.y + row as u16,
-            symbols.box_vertical.to_string(),
-            Style::default().fg(theme.line).bg(theme.bg_raised),
-        );
-    }
-    let Some(metrics) = scrollbar_metrics(area, offset, total, viewport) else {
-        return;
-    };
-    for row in metrics.thumb_top..metrics.thumb_top + metrics.thumb_height {
-        buf.set_string(
-            area.x,
-            area.y + row as u16,
-            symbols.scrollbar_thumb.to_string(),
-            Style::default().fg(theme.fg_mute).bg(theme.bg_raised),
-        );
-    }
-}
-
-fn scrollbar_metrics(
-    area: Rect,
-    offset: usize,
-    total: usize,
-    viewport: usize,
-) -> Option<ScrollbarMetrics> {
-    let track_height = area.height as usize;
-    if area.width == 0 || track_height == 0 || viewport == 0 || total <= viewport {
-        return None;
-    }
-
-    let thumb_height = ((viewport * track_height) / total).max(1).min(track_height);
-    let max_offset = total.saturating_sub(viewport);
-    let max_thumb_top = track_height.saturating_sub(thumb_height);
-    let thumb_top = offset
-        .min(max_offset)
-        .checked_mul(max_thumb_top)
-        .and_then(|value| value.checked_div(max_offset))
-        .unwrap_or(0)
-        .min(max_thumb_top);
-
-    Some(ScrollbarMetrics {
-        track_height,
-        thumb_height,
-        thumb_top,
-        max_thumb_top,
-    })
 }
 
 #[cfg(test)]

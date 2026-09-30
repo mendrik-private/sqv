@@ -41,10 +41,6 @@ pub struct Symbols {
     pub tab_shortcuts: [String; 10],
     pub box_horizontal: char,
     pub box_vertical: char,
-    pub focus_top_left: char,
-    pub focus_top_right: char,
-    pub focus_bottom_left: char,
-    pub focus_bottom_right: char,
     pub tab_top_left: char,
     pub tab_top_right: char,
     pub tab_join_left: char,
@@ -89,10 +85,10 @@ impl Symbols {
             help_icon: if nerd_font { "󰋖" } else { "?" }.to_string(),
             filter_icon: if nerd_font { "󰈲" } else { "[f]" }.to_string(),
             filter_marker: "ƒ".to_string(),
-            folder_open: "📂".to_string(),
-            folder_closed: "📁".to_string(),
-            pk_icon: "🔑".to_string(),
-            fk_icon: "🔗".to_string(),
+            folder_open: if nerd_font { "" } else { "▾" }.to_string(),
+            folder_closed: if nerd_font { "" } else { "▸" }.to_string(),
+            pk_icon: if nerd_font { "󰌆" } else { "PK" }.to_string(),
+            fk_icon: if nerd_font { "󰌷" } else { "FK" }.to_string(),
             tab_shortcuts: [
                 "¹".to_string(),
                 "²".to_string(),
@@ -107,10 +103,6 @@ impl Symbols {
             ],
             box_horizontal: '─',
             box_vertical: '│',
-            focus_top_left: '┌',
-            focus_top_right: '┐',
-            focus_bottom_left: '└',
-            focus_bottom_right: '┘',
             tab_top_left: '╭',
             tab_top_right: '╮',
             tab_join_left: '┘',
@@ -130,16 +122,8 @@ impl Symbols {
         format!(" {} ", self.separator)
     }
 
-    pub fn padded_separator(&self) -> String {
-        format!("  {}  ", self.separator)
-    }
-
     pub fn segment_separator(&self) -> String {
         format!("  {}  ", self.box_vertical)
-    }
-
-    pub fn loading_label(&self, label: &str) -> String {
-        format!(" {label}{}", self.ellipsis)
     }
 }
 
@@ -184,10 +168,6 @@ pub struct SymbolOverrides {
     pub tab_shortcuts: Option<Vec<String>>,
     pub box_horizontal: Option<String>,
     pub box_vertical: Option<String>,
-    pub focus_top_left: Option<String>,
-    pub focus_top_right: Option<String>,
-    pub focus_bottom_left: Option<String>,
-    pub focus_bottom_right: Option<String>,
     pub tab_top_left: Option<String>,
     pub tab_top_right: Option<String>,
     pub tab_join_left: Option<String>,
@@ -289,26 +269,6 @@ impl SymbolOverrides {
             "symbols.box_vertical",
             &mut symbols.box_vertical,
             &self.box_vertical,
-        )?;
-        apply_char_override(
-            "symbols.focus_top_left",
-            &mut symbols.focus_top_left,
-            &self.focus_top_left,
-        )?;
-        apply_char_override(
-            "symbols.focus_top_right",
-            &mut symbols.focus_top_right,
-            &self.focus_top_right,
-        )?;
-        apply_char_override(
-            "symbols.focus_bottom_left",
-            &mut symbols.focus_bottom_left,
-            &self.focus_bottom_left,
-        )?;
-        apply_char_override(
-            "symbols.focus_bottom_right",
-            &mut symbols.focus_bottom_right,
-            &self.focus_bottom_right,
         )?;
         apply_char_override(
             "symbols.tab_top_left",

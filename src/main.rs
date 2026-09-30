@@ -6,9 +6,11 @@ mod event;
 mod export;
 mod filter;
 mod grid;
+mod keymap;
 mod symbols;
 mod theme;
 mod ui;
+mod view_settings;
 
 use std::{io::Write, sync::Arc};
 
@@ -89,6 +91,9 @@ impl Cli {
     }
 }
 
+/// Whether keyboard enhancement flags were pushed and must be popped.
+static KEYBOARD_ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -108,6 +113,19 @@ impl TerminalGuard {
             let _ = crossterm::terminal::disable_raw_mode();
             return Err(err.into());
         }
+        // Lets terminals that support it report Alt-Enter, Ctrl-H and Esc
+        // unambiguously.
+        if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+            && crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            )
+            .is_ok()
+        {
+            KEYBOARD_ENHANCED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(Self)
     }
 }
@@ -119,6 +137,12 @@ impl Drop for TerminalGuard {
 }
 
 fn restore_terminal() {
+    if KEYBOARD_ENHANCED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(
         std::io::stdout(),
@@ -302,7 +326,8 @@ async fn run_event_loop(
 fn print_paths() {
     print_path_line("config", crate::app_dirs::config_file());
     print_path_line("data", crate::app_dirs::data_local_dir());
-    print_path_line("filters", crate::app_dirs::filter_dir());
+    print_path_line("views", crate::app_dirs::view_settings_dir());
+    print_path_line("history", crate::app_dirs::history_file());
 }
 
 fn print_path_line(label: &str, path: Option<std::path::PathBuf>) {

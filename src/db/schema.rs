@@ -1,13 +1,15 @@
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
     pub tables: Vec<TableMeta>,
-    pub views: Vec<String>,
+    /// Views browse like tables but are read-only and have no row identity.
+    pub views: Vec<TableMeta>,
     pub indexes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableMeta {
     pub name: String,
+    pub is_view: bool,
     pub columns: Vec<Column>,
     pub foreign_keys: Vec<ForeignKey>,
     pub row_identity: Option<RowIdentity>,
@@ -16,6 +18,26 @@ pub struct TableMeta {
 impl Schema {
     pub fn table(&self, name: &str) -> Option<&TableMeta> {
         self.tables.iter().find(|table| table.name == name)
+    }
+
+    /// A table or a view.
+    pub fn relation(&self, name: &str) -> Option<&TableMeta> {
+        self.table(name)
+            .or_else(|| self.views.iter().find(|view| view.name == name))
+    }
+
+    /// Foreign keys in any table that point at `table`, as (table, key).
+    pub fn references_to<'a>(
+        &'a self,
+        table: &'a str,
+    ) -> impl Iterator<Item = (&'a TableMeta, &'a ForeignKey)> + 'a {
+        self.tables.iter().flat_map(move |source| {
+            source
+                .foreign_keys
+                .iter()
+                .filter(move |fk| fk.to_table == table)
+                .map(move |fk| (source, fk))
+        })
     }
 }
 

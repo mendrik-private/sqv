@@ -1,407 +1,387 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     Frame,
 };
 
-use super::group_thousands;
-use crate::app::{App, AppMode, FocusPane};
+use super::{
+    popup::{relative_time::relative_label, PopupKind},
+    widgets::{
+        hints::{hint, render_hints, Hint},
+        text::{group_thousands, put, sanitize, text_width, truncate_with_ellipsis},
+    },
+};
+use crate::{
+    app::{App, FocusPane},
+    db::types::SqlValue,
+    grid::SortDir,
+};
+
+/// The mode the badge names: what keys currently do.
+pub(crate) fn mode_label(app: &App) -> &'static str {
+    if app.pending_confirm.is_some() {
+        return "CONFIRM";
+    }
+    match &app.popup {
+        None => "BROWSE",
+        Some(popup) => match popup {
+            PopupKind::TextEditor(_)
+            | PopupKind::ValuePicker(_)
+            | PopupKind::DatePicker(_)
+            | PopupKind::FkPicker(_) => "EDIT",
+            PopupKind::InsertRow(_) => "INSERT",
+            PopupKind::FilterPopup(_) => "FILTER",
+            PopupKind::Find(_) => "FIND",
+            PopupKind::CommandPalette(_) => "COMMAND",
+            PopupKind::Help(_) => "HELP",
+            PopupKind::GoToRow(_) => "GO TO",
+            PopupKind::Record(_) => "RECORD",
+            PopupKind::Schema(_) => "SCHEMA",
+            PopupKind::SqlConsole(_) => "SQL",
+            PopupKind::GlobalSearch(_) => "SEARCH",
+            PopupKind::Export(_) => "EXPORT",
+            PopupKind::References(_) => "REFERENCES",
+            PopupKind::Json(_) => "JSON",
+        },
+    }
+}
 
 pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-
-    let table_name: String = app
-        .active_tab
-        .and_then(|i| app.open_tabs.get(i))
-        .map(|t| t.table_name.clone())
-        .unwrap_or_else(|| app.symbols.empty_placeholder.to_string());
-
-    let (row_num, total_rows, col_num) = app.grid.as_ref().map_or((0i64, 0i64, 0usize), |g| {
-        (
-            g.focused_row as i64 + 1,
-            g.window.total_rows,
-            g.focused_col + 1,
-        )
-    });
-
-    let cell_preview: String = app
-        .grid
-        .as_ref()
-        .and_then(|g| {
-            let abs_row = g.focused_row as i64;
-            let col_idx = g.focused_col;
-            g.window
-                .get_row(abs_row)
-                .and_then(|row| row.get(col_idx))
-                .map(|value| value.to_text().chars().take(50).collect())
-        })
-        .unwrap_or_default();
-
-    let pos_str = if total_rows > 0 {
-        format!(
-            "r {}/{}{}col {}",
-            group_thousands(row_num),
-            group_thousands(total_rows),
-            app.symbols.inline_separator(),
-            col_num
-        )
-    } else {
-        String::new()
-    };
-
     let theme = &app.theme;
+    let symbols = &app.symbols;
+    let bar_bg = theme.bg_soft;
+    let grid = app.grid.as_ref();
 
-    let filter_count = app.grid.as_ref().map_or(0, |g| g.filter.active_count());
-
-    let sort_str = app
-        .grid
-        .as_ref()
-        .and_then(|g| {
-            g.sort.as_ref().and_then(|s| {
-                let col_name = g.columns.get(s.col_idx).map(|c| c.name.as_str())?;
-                let arrow = if s.direction == crate::grid::SortDir::Asc {
-                    app.symbols.sort_asc.to_string()
-                } else {
-                    app.symbols.sort_desc.to_string()
-                };
-                Some(format!("{} {}", arrow, col_name))
-            })
-        })
-        .unwrap_or_default();
-
-    let mut segments: Vec<(String, Style)> = vec![
-        (
-            " BROWSE ".to_string(),
+    let mut segments: Vec<(String, Style)> = vec![(
+        format!(" {} ", mode_label(app)),
+        Style::default()
+            .fg(theme.bg)
+            .bg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.is_readonly_view() {
+        segments.push((
+            " READ-ONLY ".to_string(),
             Style::default()
                 .fg(theme.bg)
-                .bg(theme.accent)
+                .bg(theme.yellow)
                 .add_modifier(Modifier::BOLD),
-        ),
-        (
-            table_name,
-            Style::default()
-                .fg(theme.fg_dim)
-                .bg(theme.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-
-    if filter_count > 0 {
-        segments.push((
-            format!("{} {} filters", app.symbols.filter_icon, filter_count),
-            Style::default().fg(theme.red).bg(theme.bg_soft),
         ));
     }
+    let table_name = app.active_table_name().map_or_else(
+        || symbols.empty_placeholder.to_string(),
+        |name| sanitize(&name).into_owned(),
+    );
+    segments.push((
+        table_name,
+        Style::default()
+            .fg(theme.fg_dim)
+            .bg(bar_bg)
+            .add_modifier(Modifier::BOLD),
+    ));
 
-    if !sort_str.is_empty() {
-        segments.push((
-            sort_str,
-            Style::default().fg(theme.accent).bg(theme.bg_soft),
-        ));
-    }
-
-    if let Some(selection_text) = app.grid.as_ref().and_then(|grid| {
-        let selected = grid.selected_row_count();
-        if selected == 0 {
-            None
-        } else if selected == grid.window.total_rows.max(0) as usize {
-            Some("sel all".to_string())
-        } else {
-            Some(format!("sel {}", group_thousands(selected as i64)))
+    if let Some(grid) = grid {
+        let filters = grid.filter.active_count();
+        if filters > 0 {
+            let noun = if filters == 1 { "filter" } else { "filters" };
+            segments.push((
+                format!("{} {filters} {noun}", symbols.filter_icon),
+                Style::default().fg(theme.fg_dim).bg(bar_bg),
+            ));
         }
-    }) {
-        segments.push((
-            selection_text,
-            Style::default().fg(theme.yellow).bg(theme.bg_soft),
-        ));
-    }
-
-    if !pos_str.is_empty() {
-        segments.push((
-            pos_str,
-            Style::default().fg(theme.fg_mute).bg(theme.bg_soft),
-        ));
+        let sort = grid
+            .sort
+            .iter()
+            .filter_map(|spec| {
+                let name = grid.columns.get(spec.col_idx)?;
+                let arrow = match spec.direction {
+                    SortDir::Asc => symbols.sort_asc,
+                    SortDir::Desc => symbols.sort_desc,
+                };
+                Some(format!("{arrow} {}", sanitize(&name.name)))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !sort.is_empty() {
+            segments.push((sort, Style::default().fg(theme.accent).bg(bar_bg)));
+        }
+        let selected = grid.selected_row_count();
+        if selected > 0 {
+            let text = if selected == grid.window.total_rows.max(0) as usize {
+                "sel all".to_string()
+            } else {
+                format!("sel {}", group_thousands(selected as i64))
+            };
+            segments.push((text, Style::default().fg(theme.yellow).bg(bar_bg)));
+        }
+        if grid.window.total_rows > 0 {
+            let total = if grid.count_known {
+                group_thousands(grid.window.total_rows)
+            } else {
+                format!(
+                    "{}{}",
+                    group_thousands(grid.window.total_rows),
+                    symbols.ellipsis
+                )
+            };
+            segments.push((
+                format!(
+                    "r {}/{}{}col {}",
+                    group_thousands(grid.focused_row as i64 + 1),
+                    total,
+                    symbols.inline_separator(),
+                    grid.display_columns()
+                        .iter()
+                        .position(|&col| col == grid.focused_col)
+                        .map_or(0, |position| position + 1)
+                ),
+                Style::default().fg(theme.fg_mute).bg(bar_bg),
+            ));
+        }
     }
 
     if !app.jump_stack.is_empty() {
-        let current_table = app.grid.as_ref().map_or_else(
-            || app.symbols.empty_placeholder.to_string(),
+        let current = grid.map_or_else(
+            || symbols.empty_placeholder.to_string(),
             |g| g.table_name.clone(),
         );
-        let crumb: String = app
+        let crumb = app
             .jump_stack
             .iter()
-            .map(|f| f.table.as_str())
-            .chain(std::iter::once(current_table.as_str()))
+            .map(|frame| frame.table.as_str())
+            .chain(std::iter::once(current.as_str()))
             .collect::<Vec<_>>()
-            .join(&app.symbols.breadcrumb_separator);
+            .join(&symbols.breadcrumb_separator);
         segments.push((
-            format!("{} {}", app.symbols.breadcrumb_prefix, crumb),
-            Style::default().fg(theme.accent).bg(theme.bg_soft),
+            format!("{} {}", symbols.breadcrumb_prefix, sanitize(&crumb)),
+            Style::default().fg(theme.accent).bg(bar_bg),
         ));
     }
 
-    if let Some(hints) = action_hint_text(app) {
-        segments.push((hints, Style::default().fg(theme.accent).bg(theme.bg_soft)));
-    }
-
     let buf = frame.buffer_mut();
-    buf.set_style(area, Style::default().bg(theme.bg_soft));
+    buf.set_style(area, Style::default().bg(bar_bg));
 
-    let preview =
-        super::truncate_with_ellipsis(&cell_preview, area.width as usize / 3, app.symbols.ellipsis);
-    let preview_width = unicode_width::UnicodeWidthStr::width(preview.as_str()) as u16;
-    let (content_right, preview_x) = preview_layout(area, preview_width);
+    let preview = truncate_with_ellipsis(
+        &cell_preview(app),
+        area.width as usize / 3,
+        symbols.ellipsis,
+    );
+    let (content_right, preview_x) = preview_layout(area, text_width(&preview) as u16);
 
     let mut x = area.x;
-    for (idx, (text, style)) in segments.iter().enumerate() {
+    for (index, (text, style)) in segments.iter().enumerate() {
         if x >= content_right {
             break;
         }
-        x = super::put(buf, x, area.y, content_right, text, *style);
-        if idx + 1 < segments.len() && x < content_right {
-            x = super::put(
+        if index > 0 {
+            x = put(
                 buf,
                 x,
                 area.y,
                 content_right,
-                &app.symbols.segment_separator(),
-                Style::default().fg(theme.line).bg(theme.bg_soft),
+                &symbols.segment_separator(),
+                Style::default().fg(theme.line).bg(bar_bg),
             );
         }
+        x = put(buf, x, area.y, content_right, text, *style);
     }
-
-    if !preview.is_empty() && preview_x < area.x + area.width {
-        let _ = super::put(
+    let hints = action_hints(app);
+    if !hints.is_empty() && x + 2 < content_right {
+        render_hints(
+            buf,
+            Rect::new(x + 2, area.y, content_right - x - 2, 1),
+            &hints,
+            theme,
+            bar_bg,
+        );
+    }
+    if !preview.is_empty() && preview_x < area.right() {
+        put(
             buf,
             preview_x,
             area.y,
-            area.x + area.width,
+            area.right(),
             &preview,
             preview_style(theme),
         );
     }
 }
 
+/// The focused value, with a relative age for dates.
+fn cell_preview(app: &App) -> String {
+    let Some(grid) = app.grid.as_ref() else {
+        return String::new();
+    };
+    let Some(value) = grid
+        .window
+        .get_row(grid.focused_row as i64)
+        .and_then(|row| row.get(grid.focused_col))
+    else {
+        return String::new();
+    };
+    let text: String = sanitize(&value.to_text()).chars().take(80).collect();
+    let temporal = grid
+        .kinds
+        .get(grid.focused_col)
+        .is_some_and(|kind| kind.is_temporal());
+    match value {
+        SqlValue::Text(raw) if temporal => match relative_label(raw) {
+            Some(label) => format!("{text} ({label})"),
+            None => text,
+        },
+        _ => text,
+    }
+}
+
 fn preview_layout(area: Rect, preview_width: u16) -> (u16, u16) {
-    let right = area.x + area.width;
+    let right = area.right();
     if preview_width == 0 {
         return (right, right);
     }
-
     let preview_x = right.saturating_sub(preview_width + 1);
-    let content_right = preview_x.saturating_sub(1);
-    (content_right, preview_x)
+    (preview_x.saturating_sub(1), preview_x)
 }
 
 fn preview_style(theme: &crate::theme::Theme) -> Style {
-    Style::default().fg(Color::Black).bg(theme.accent)
+    Style::default().fg(theme.bg).bg(theme.accent)
 }
 
-fn action_hint_text(app: &App) -> Option<String> {
-    if app.popup.is_some() || app.mode != AppMode::Browse {
-        return None;
+/// Keys that act right now, most useful first; hints that do not fit are
+/// dropped from the end.
+pub(crate) fn action_hints(app: &App) -> Vec<Hint> {
+    if app.pending_confirm.is_some() {
+        return vec![hint("y", "delete"), hint("n / Esc", "keep")];
     }
-
+    match &app.popup {
+        // The staged row is edited inline in the grid, which has no footer.
+        Some(PopupKind::InsertRow(_)) => {
+            return vec![
+                hint("Alt-Enter", "save row"),
+                hint("Tab / Shift-Tab", "next / previous field"),
+                hint("Shift-Del", "reset field"),
+                hint("Esc", "discard"),
+            ];
+        }
+        Some(_) => return Vec::new(),
+        None => {}
+    }
     let mut hints = Vec::new();
-
     match app.focus {
         FocusPane::Sidebar => {
-            hints.push("[enter] open".to_string());
-            hints.push(format!(
-                "[{}/{} h/l] fold",
-                app.symbols.arrow_left, app.symbols.arrow_right
-            ));
-            if app.sidebar_visible {
-                hints.push("[tab] panel".to_string());
+            let selected = app.sidebar.selected_name(&app.schema);
+            let is_index = selected
+                .as_ref()
+                .is_some_and(|name| app.schema.indexes.contains(name));
+            match selected {
+                None => hints.push(hint("Enter", "fold")),
+                Some(_) if is_index => hints.push(hint("Enter", "schema")),
+                Some(_) => {
+                    hints.push(hint("Enter", "open"));
+                    hints.push(hint("i", "schema"));
+                }
+            }
+            if app.active_tab.is_some() {
+                hints.push(hint("Tab", "table"));
             }
         }
         FocusPane::Grid => {
-            if app.grid.is_some() && !app.readonly {
-                hints.push("[enter] open".to_string());
-                hints.push("[e] modify".to_string());
-            }
-            if app.grid.is_some() {
-                hints.push("[s] sort".to_string());
-                hints.push("[f] filter".to_string());
-                hints.push("[ctrl-f] find".to_string());
-            }
-            if app.sidebar_visible {
-                hints.push("[tab] panel".to_string());
+            if let Some(grid) = app.grid.as_ref() {
+                if !app.is_readonly_view() {
+                    hints.push(hint("Enter", "edit"));
+                }
+                if grid.fk_cols.get(grid.focused_col).copied().unwrap_or(false) {
+                    hints.push(hint("j", "follow link"));
+                }
+                if !app.jump_stack.is_empty() {
+                    hints.push(hint("Backspace", "back"));
+                }
+                hints.push(hint("v", "record"));
+                hints.push(hint("f", "filter"));
+                hints.push(hint("s", "sort"));
+                hints.push(hint("Ctrl-F", "find"));
             }
         }
     }
-
-    hints.push("[ctrl-h] help".to_string());
-    hints.push("[ctrl-q] quit".to_string());
-
-    Some(hints.join("  "))
+    hints.push(hint("?", "help"));
+    hints.push(hint("Ctrl-P", "commands"));
+    hints
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use super::*;
 
-    use r2d2_sqlite::SqliteConnectionManager;
-    use ratatui::style::Color;
-    use tokio::sync::mpsc;
+    fn labels(hints: &[Hint]) -> Vec<String> {
+        hints
+            .iter()
+            .map(|h| format!("{} {}", h.keys, h.label))
+            .collect()
+    }
 
-    use super::{action_hint_text, preview_layout, preview_style};
-    use crate::{
-        app::{App, FocusPane},
-        config::Config,
-        db::{self, schema::Column, types::SqlValue},
-        grid::{GridInit, GridState},
-    };
-
-    fn make_test_app() -> App {
-        let manager = SqliteConnectionManager::memory();
-        let pool = Arc::new(
+    fn test_app() -> App {
+        let pool = std::sync::Arc::new(
             r2d2::Pool::builder()
                 .max_size(1)
-                .build(manager)
-                .expect("test pool"),
+                .build(r2d2_sqlite::SqliteConnectionManager::memory())
+                .expect("pool"),
         );
-        let conn = pool.get().expect("test conn");
-        conn.execute_batch(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, email TEXT);",
-        )
-        .expect("seed schema");
-        let schema = db::load_schema(&conn).expect("load schema");
+        let conn = pool.get().expect("conn");
+        conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+            .expect("schema");
+        let schema = crate::db::load_schema(&conn).expect("load");
         drop(conn);
-
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             schema,
-            Config::default(),
+            crate::config::Config::default(),
             pool,
             tx,
             false,
-            ":memory:".to_string(),
+            ":memory:".into(),
         )
     }
 
-    fn make_grid() -> GridState {
-        let columns = vec![
-            Column {
-                name: "id".to_string(),
-                col_type: "INTEGER".to_string(),
-                not_null: false,
-                default_value: None,
-                is_pk: true,
-                pk_position: 1,
-                writable: true,
-            },
-            Column {
-                name: "name".to_string(),
-                col_type: "TEXT".to_string(),
-                not_null: false,
-                default_value: None,
-                is_pk: false,
-                pk_position: 0,
-                writable: true,
-            },
-        ];
-        GridState::new(GridInit {
-            table_name: "users".to_string(),
-            columns,
-            fk_cols: vec![false; 2],
-            enumerated_values: vec![Vec::new(); 2],
-            rows: vec![vec![
-                SqlValue::Integer(1),
-                SqlValue::Text("Alice".to_string()),
-            ]],
-            width_sample_rows: vec![],
-            total_rows: 1,
-            area_width: 40,
-        })
+    #[test]
+    fn sidebar_hints_follow_the_selected_row() {
+        let mut app = test_app();
+        assert!(labels(&action_hints(&app)).contains(&"Enter fold".to_string()));
+        app.sidebar.move_down(&app.schema);
+        let hints = labels(&action_hints(&app));
+        assert!(hints.contains(&"Enter open".to_string()));
+        assert!(hints.contains(&"i schema".to_string()));
+        assert!(hints.contains(&"? help".to_string()));
     }
 
     #[test]
-    fn grid_hints_focus_on_primary_actions() {
-        let mut app = make_test_app();
-        app.grid = Some(make_grid());
+    fn read_only_mode_hides_edit_hints_and_shows_the_badge_mode() {
+        let mut app = test_app();
+        app.readonly = true;
         app.focus = FocusPane::Grid;
-
-        let hints = action_hint_text(&app).expect("grid hints");
-
-        assert!(hints.contains("[enter] open"));
-        assert!(hints.contains("[e] modify"));
-        assert!(hints.contains("[f] filter"));
-        assert!(hints.contains("[ctrl-f] find"));
-        assert!(hints.contains("[ctrl-h] help"));
-        assert!(!hints.contains("[n] set null"));
-        assert!(!hints.contains("[i] add row"));
-        assert!(!hints.contains("[d] delete row"));
-    }
-
-    #[test]
-    fn grid_hints_leave_secondary_actions_in_help_dialog() {
-        let mut app = make_test_app();
-        let mut grid = make_grid();
-        grid.window.rows[0][1] = SqlValue::Null;
-        grid.focused_col = 1;
-        app.grid = Some(grid);
-        app.focus = FocusPane::Grid;
-
-        let hints = action_hint_text(&app).expect("grid hints");
-
-        assert!(!hints.contains("[y]"));
-        assert!(!hints.contains("[Y]"));
-        assert!(!hints.contains("[n] set null"));
-    }
-
-    #[test]
-    fn sidebar_hints_include_ctrl_h_help() {
-        let mut app = make_test_app();
-        app.focus = FocusPane::Sidebar;
-
-        let hints = action_hint_text(&app).expect("sidebar hints");
-
-        assert!(hints.contains("[ctrl-h] help"));
-        assert!(hints.contains("[enter] open"));
+        assert!(!labels(&action_hints(&app))
+            .iter()
+            .any(|h| h.starts_with("Enter")));
+        assert!(app.is_readonly_view());
+        assert_eq!(mode_label(&app), "BROWSE");
     }
 
     #[test]
     fn preview_layout_reserves_gap_before_preview_text() {
-        let (content_right, preview_x) = preview_layout(
-            ratatui::layout::Rect {
-                x: 0,
-                y: 0,
-                width: 20,
-                height: 1,
-            },
-            5,
-        );
-
-        assert_eq!(content_right, 13);
-        assert_eq!(preview_x, 14);
+        assert_eq!(preview_layout(Rect::new(0, 0, 20, 1), 5), (13, 14));
     }
 
     #[test]
     fn preview_layout_uses_full_width_when_preview_is_empty() {
-        let (content_right, preview_x) = preview_layout(
-            ratatui::layout::Rect {
-                x: 3,
-                y: 0,
-                width: 20,
-                height: 1,
-            },
-            0,
-        );
-
-        assert_eq!(content_right, 23);
-        assert_eq!(preview_x, 23);
+        assert_eq!(preview_layout(Rect::new(3, 0, 20, 1), 0), (23, 23));
     }
 
     #[test]
-    fn preview_style_uses_black_text_on_accent_background() {
+    fn preview_text_uses_the_canvas_colour_on_accent() {
         let theme = crate::theme::Theme::default();
         let style = preview_style(&theme);
-
-        assert_eq!(style.fg, Some(Color::Black));
+        assert_eq!(style.fg, Some(theme.bg));
         assert_eq!(style.bg, Some(theme.accent));
     }
 }

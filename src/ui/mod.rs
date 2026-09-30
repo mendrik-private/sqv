@@ -3,6 +3,7 @@ pub mod sidebar;
 pub mod statusbar;
 pub mod tabbar;
 pub mod toast;
+pub mod widgets;
 
 use crate::app::{App, FocusPane};
 use ratatui::{
@@ -85,21 +86,23 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         } else {
             app.theme.line
         };
-        let filter_count = grid.filter.active_count();
         let meta = {
-            let mut parts = vec![format!("{} rows", group_thousands(grid.window.total_rows))];
-            if filter_count > 0 {
-                parts.push(format!("{} filters", filter_count));
+            let rows = widgets::text::group_thousands(grid.window.total_rows);
+            let noun = if grid.window.total_rows == 1 {
+                "row"
+            } else {
+                "rows"
+            };
+            let mut parts = vec![if grid.count_known {
+                format!(" {rows} {noun} ")
+            } else {
+                format!(" {rows}{} {noun} ", app.symbols.ellipsis)
+            }];
+            if !grid.hidden.is_empty() {
+                parts.push(format!(" {} hidden ", grid.hidden.len()));
             }
-            if let Some(sort) = &grid.sort {
-                if let Some(col) = grid.columns.get(sort.col_idx) {
-                    let arrow = if sort.direction == crate::grid::SortDir::Asc {
-                        app.symbols.sort_asc.to_string()
-                    } else {
-                        app.symbols.sort_desc.to_string()
-                    };
-                    parts.push(format!("sort: {} {}", col.name, arrow));
-                }
+            if grid.frozen {
+                parts.push(" first column frozen ".to_string());
             }
             parts.join(&app.symbols.inline_separator())
         };
@@ -128,7 +131,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.grid_outer_area = Some(body_area);
         app.grid_inner_area = Some(inner);
         frame.render_widget(block, body_area);
-        let msg = format!(" Loading {}...", tab.table_name);
+        let msg = format!(
+            " Loading {}{}",
+            widgets::text::sanitize(&tab.table_name),
+            app.symbols.ellipsis
+        );
         frame.render_widget(
             ratatui::widgets::Paragraph::new(msg).style(
                 ratatui::style::Style::default()
@@ -158,59 +165,5 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     crate::ui::toast::render_toasts(frame, area, &app.toast, &app.theme);
     if let Some(ref confirm) = app.pending_confirm {
         crate::ui::toast::render_confirm(frame, area, &confirm.message, &app.theme);
-    }
-}
-
-/// The longest prefix of `text` that fits in `max_width` terminal cells.
-pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
-    let mut used = 0usize;
-    text.chars()
-        .take_while(|ch| {
-            used += unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(1);
-            used <= max_width
-        })
-        .collect()
-}
-
-/// Like [`truncate_to_width`], ending in `ellipsis` when text was cut off.
-pub(crate) fn truncate_with_ellipsis(text: &str, max_width: usize, ellipsis: char) -> String {
-    if unicode_width::UnicodeWidthStr::width(text) <= max_width {
-        return text.to_string();
-    }
-    if max_width <= 1 {
-        return truncate_to_width(text, max_width);
-    }
-    let mut out = truncate_to_width(text, max_width - 1);
-    out.push(ellipsis);
-    out
-}
-
-/// Writes `text` from `x` without passing `right`, returning where it ended.
-pub(crate) fn put(
-    buf: &mut ratatui::buffer::Buffer,
-    x: u16,
-    y: u16,
-    right: u16,
-    text: &str,
-    style: ratatui::style::Style,
-) -> u16 {
-    buf.set_stringn(x, y, text, right.saturating_sub(x) as usize, style)
-        .0
-}
-
-/// Groups digits in threes with narrow no-break spaces.
-pub(crate) fn group_thousands(n: i64) -> String {
-    let s = n.abs().to_string();
-    let chars: Vec<char> = s.chars().collect();
-    let grouped = chars
-        .rchunks(3)
-        .rev()
-        .map(|chunk| chunk.iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\u{202F}");
-    if n < 0 {
-        format!("-{}", grouped)
-    } else {
-        grouped
     }
 }

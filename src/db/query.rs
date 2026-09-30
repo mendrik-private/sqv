@@ -17,12 +17,12 @@ pub struct OrderBy {
     pub ascending: bool,
 }
 
-/// A table as the user currently sees it: an optional sort column and a compiled
-/// filter predicate. Row offsets are only meaningful relative to one view.
+/// A table as the user currently sees it: sort columns in priority order and a
+/// compiled filter predicate. Row offsets are only meaningful relative to one view.
 #[derive(Debug, Clone, Default)]
 pub struct ViewQuery {
     pub table: String,
-    pub order_by: Option<OrderBy>,
+    pub order_by: Vec<OrderBy>,
     /// WHERE predicate without the keyword, using `?1..?N` for `where_params`.
     pub where_clause: String,
     pub where_params: Vec<Value>,
@@ -49,26 +49,30 @@ impl ViewQuery {
         }
     }
 
-    /// The user's sort followed by the row identity, which makes every offset
+    /// The user's sort keys followed by the row identity, which makes every offset
     /// deterministic even when sort values repeat.
-    pub(crate) fn order_terms(&self, identity: &RowIdentity) -> String {
+    pub(crate) fn order_terms(&self, identity: Option<&RowIdentity>) -> String {
         let identity_terms = match identity {
-            RowIdentity::RowidAlias(alias) => quote_identifier(alias),
-            RowIdentity::PrimaryKey(columns) => columns
+            Some(RowIdentity::RowidAlias(alias)) => quote_identifier(alias),
+            Some(RowIdentity::PrimaryKey(columns)) => columns
                 .iter()
                 .map(|column| format!("{} ASC", quote_identifier(column)))
                 .collect::<Vec<_>>()
                 .join(", "),
+            None => String::new(),
         };
-        match &self.order_by {
-            Some(order) => format!(
-                "{} {}, {}",
-                quote_identifier(&order.column),
-                if order.ascending { "ASC" } else { "DESC" },
-                identity_terms
-            ),
-            None => identity_terms,
-        }
+        self.order_by
+            .iter()
+            .map(|order| {
+                format!(
+                    "{} {}",
+                    quote_identifier(&order.column),
+                    if order.ascending { "ASC" } else { "DESC" }
+                )
+            })
+            .chain((!identity_terms.is_empty()).then_some(identity_terms))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Parameters for the view predicate followed by `extra`, together with the

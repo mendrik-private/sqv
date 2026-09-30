@@ -58,16 +58,84 @@ pub fn load_schema(conn: &Connection) -> anyhow::Result<Schema> {
         let columns = load_columns(conn, name)?;
         tables.push(TableMeta {
             name: name.clone(),
+            is_view: false,
             foreign_keys: load_foreign_keys(conn, name)?,
             row_identity: load_row_identity(conn, name, &columns)?,
             columns,
         });
     }
+    let mut views = Vec::new();
+    for name in load_object_names(conn, "view")? {
+        // A view whose definition no longer compiles still gets listed.
+        let columns = load_columns(conn, &name).unwrap_or_default();
+        views.push(TableMeta {
+            name,
+            is_view: true,
+            columns,
+            foreign_keys: Vec::new(),
+            row_identity: None,
+        });
+    }
     Ok(Schema {
         tables,
-        views: load_object_names(conn, "view")?,
+        views,
         indexes: load_index_names(conn, &table_names)?,
     })
+}
+
+/// The `CREATE` statement of a table, view or index.
+pub fn load_ddl(conn: &Connection, name: &str) -> anyhow::Result<Option<String>> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE name = ?1 AND sql IS NOT NULL LIMIT 1",
+        [name],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("loading schema definition")
+}
+
+/// An index of a table: its name, whether it is unique and its columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexInfo {
+    pub name: String,
+    pub unique: bool,
+    pub columns: Vec<String>,
+}
+
+pub fn load_indexes(conn: &Connection, table: &str) -> anyhow::Result<Vec<IndexInfo>> {
+    let mut list = conn.prepare(&format!("PRAGMA index_list({})", quote_identifier(table)))?;
+    let entries = list
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut indexes = Vec::with_capacity(entries.len());
+    for (name, unique) in entries {
+        let mut info = conn.prepare(&format!("PRAGMA index_info({})", quote_identifier(&name)))?;
+        let columns = info
+            .query_map([], |row| row.get::<_, Option<String>>(2))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|column| column.unwrap_or_else(|| "<expression>".to_string()))
+            .collect();
+        indexes.push(IndexInfo {
+            name,
+            unique,
+            columns,
+        });
+    }
+    Ok(indexes)
+}
+
+/// The table an index belongs to.
+pub fn index_table(conn: &Connection, index: &str) -> anyhow::Result<Option<String>> {
+    conn.query_row(
+        "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [index],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("resolving index table")
 }
 
 fn load_object_names(conn: &Connection, obj_type: &str) -> anyhow::Result<Vec<String>> {
@@ -101,14 +169,17 @@ pub fn load_row_identity(
     table: &str,
     columns: &[Column],
 ) -> anyhow::Result<Option<RowIdentity>> {
-    let without_rowid: bool = conn
+    let (kind, without_rowid): (String, bool) = conn
         .query_row(
-            "SELECT wr != 0 FROM pragma_table_list WHERE schema = 'main' AND name = ?1 LIMIT 1",
+            "SELECT type, wr != 0 FROM pragma_table_list WHERE schema = 'main' AND name = ?1 LIMIT 1",
             [table],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
-        .unwrap_or(false);
+        .unwrap_or_else(|| ("table".to_string(), false));
+    if kind != "table" {
+        return Ok(None);
+    }
 
     if !without_rowid {
         for alias in ["rowid", "_rowid_", "oid"] {
@@ -203,6 +274,17 @@ fn stable_identity(
         .ok_or_else(|| anyhow::anyhow!("table {:?} has no stable row identity", table))
 }
 
+/// The ` ORDER BY` clause for reading `view`; empty for a view without sort keys
+/// or row identity, whose row order SQLite then chooses.
+fn order_clause(view: &ViewQuery, identity: Option<&RowIdentity>) -> String {
+    let terms = view.order_terms(identity);
+    if terms.is_empty() {
+        String::new()
+    } else {
+        format!(" ORDER BY {terms}")
+    }
+}
+
 fn mutable_rowid_alias(identity: &RowIdentity, table: &str) -> anyhow::Result<String> {
     match identity {
         RowIdentity::RowidAlias(alias) => Ok(alias.clone()),
@@ -257,7 +339,7 @@ pub fn count_rows_before_letter(
 ) -> anyhow::Result<i64> {
     let order = view
         .order_by
-        .as_ref()
+        .first()
         .ok_or_else(|| anyhow::anyhow!("letter navigation requires a sorted column"))?;
     let column = quote_identifier(&order.column);
     let upper = letter.to_uppercase().next().unwrap_or(letter);
@@ -327,10 +409,10 @@ fn select_rows(
     if columns.is_empty() {
         return Ok(0);
     }
-    let identity = stable_identity(conn, &view.table, columns)?;
+    let identity = load_row_identity(conn, &view.table, columns)?;
     let rowid_alias = match &identity {
-        RowIdentity::RowidAlias(alias) => Some(alias.as_str()),
-        RowIdentity::PrimaryKey(_) => None,
+        Some(RowIdentity::RowidAlias(alias)) => Some(alias.as_str()),
+        _ => None,
     };
     let selections = rowid_alias
         .into_iter()
@@ -340,10 +422,10 @@ fn select_rows(
         .join(", ");
     let (params, first) = view.params_with([Value::Integer(limit), Value::Integer(offset)]);
     let query = format!(
-        "SELECT {selections} FROM {}{} ORDER BY {} LIMIT ?{first} OFFSET ?{}",
+        "SELECT {selections} FROM {}{}{} LIMIT ?{first} OFFSET ?{}",
         view.quoted_table(),
         view.where_part(),
-        view.order_terms(&identity),
+        order_clause(view, identity.as_ref()),
         first + 1,
     );
     let value_start = usize::from(rowid_alias.is_some());
@@ -410,7 +492,7 @@ pub fn fetch_offset_for_rowid(
             FROM {table}{where_part}
         ) WHERE {rowid} = ?{rowid_param} LIMIT 1",
         rowid = quote_identifier(alias),
-        order_terms = view.order_terms(&identity),
+        order_terms = view.order_terms(Some(&identity)),
         table = view.quoted_table(),
         where_part = view.where_part(),
     );
@@ -448,7 +530,7 @@ pub fn fetch_rowids_at_offsets(
             FROM {table}{where_part}
          )
          SELECT {rowid} FROM visible WHERE visible_offset IN ({offset_list})",
-        order = view.order_terms(&identity),
+        order = view.order_terms(Some(&identity)),
         table = view.quoted_table(),
         where_part = view.where_part(),
     );
@@ -472,7 +554,7 @@ pub fn fetch_rows_at_offsets(
     let Some(offset_list) = offset_list(offsets).filter(|_| !columns.is_empty()) else {
         return Ok(Vec::new());
     };
-    let identity = stable_identity(conn, &view.table, columns)?;
+    let identity = load_row_identity(conn, &view.table, columns)?;
     let inner_columns = columns
         .iter()
         .map(|column| quote_identifier(&column.name))
@@ -486,12 +568,12 @@ pub fn fetch_rows_at_offsets(
     let offset_alias = quote_identifier(&unused_column_alias(columns, "__sqview_offset"));
     let query = format!(
         "WITH visible AS (
-            SELECT {inner_columns}, ROW_NUMBER() OVER (ORDER BY {order}) - 1 AS {offset_alias}
+            SELECT {inner_columns}, ROW_NUMBER() OVER ({order}) - 1 AS {offset_alias}
             FROM {table}{where_part}
          )
          SELECT {outer_columns} FROM visible
          WHERE visible.{offset_alias} IN ({offset_list}) ORDER BY visible.{offset_alias}",
-        order = view.order_terms(&identity),
+        order = order_clause(view, identity.as_ref()).trim_start(),
         table = view.quoted_table(),
         where_part = view.where_part(),
     );
@@ -502,6 +584,220 @@ pub fn fetch_rows_at_offsets(
     )?;
     rows.collect::<Result<Vec<_>, _>>()
         .context("fetching selected rows")
+}
+
+/// A row of a view that matched a search, with its position in the view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub offset: i64,
+    pub rowid: Option<i64>,
+    pub values: Vec<SqlValue>,
+}
+
+/// Rows of `view` in which any of `columns` contains `needle` (case-insensitive
+/// for ASCII), in view order, at most `limit`. An empty needle returns the first
+/// rows. Each hit carries its offset in the view so callers can jump to it.
+pub fn search_view(
+    conn: &Connection,
+    view: &ViewQuery,
+    columns: &[Column],
+    needle: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<SearchHit>> {
+    if columns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let identity = load_row_identity(conn, &view.table, columns)?;
+    let offset_alias = quote_identifier(&unused_column_alias(columns, "__sqview_offset"));
+    let rowid_alias = quote_identifier(&unused_column_alias(columns, "__sqview_rowid"));
+    let rowid_source = match &identity {
+        Some(RowIdentity::RowidAlias(alias)) => quote_identifier(alias),
+        _ => "NULL".to_string(),
+    };
+    let names = columns
+        .iter()
+        .map(|column| quote_identifier(&column.name))
+        .collect::<Vec<_>>();
+    let mut extra = Vec::new();
+    let matcher = if needle.is_empty() {
+        String::new()
+    } else {
+        let placeholder = view.where_params.len() + 1;
+        extra.push(Value::Text(format!("%{}%", escape_like(needle))));
+        let tests = names
+            .iter()
+            .map(|name| format!("CAST(visible.{name} AS TEXT) LIKE ?{placeholder} ESCAPE '\\'"))
+            .collect::<Vec<_>>();
+        format!(" WHERE {}", tests.join(" OR "))
+    };
+    extra.push(Value::Integer(limit));
+    let (params, first) = view.params_with(extra);
+    let limit_param = first + usize::from(!needle.is_empty());
+    let query = format!(
+        "WITH visible AS (
+            SELECT {rowid_source} AS {rowid_alias}, {cols},
+                   ROW_NUMBER() OVER ({order}) - 1 AS {offset_alias}
+            FROM {table}{where_part}
+         )
+         SELECT visible.{offset_alias}, visible.{rowid_alias}, {outer} FROM visible{matcher}
+         ORDER BY visible.{offset_alias} LIMIT ?{limit_param}",
+        cols = names.join(", "),
+        outer = names
+            .iter()
+            .map(|name| format!("visible.{name}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        order = order_clause(view, identity.as_ref()).trim_start(),
+        table = view.quoted_table(),
+        where_part = view.where_part(),
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let hits = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(SearchHit {
+            offset: row.get(0)?,
+            rowid: row.get(1)?,
+            values: decode_values_from(row, 2, columns.len())?,
+        })
+    })?;
+    hits.collect::<Result<Vec<_>, _>>()
+        .context("searching rows")
+}
+
+fn escape_like(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// The result of a statement typed into the SQL console.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlOutcome {
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<SqlValue>>,
+        /// Whether rows beyond the limit were left out.
+        truncated: bool,
+    },
+    Changed(usize),
+}
+
+/// Runs one statement. Queries return up to `limit` rows; statements that
+/// modify the database are refused unless `allow_writes`.
+pub fn run_sql(
+    conn: &Connection,
+    sql: &str,
+    limit: usize,
+    allow_writes: bool,
+) -> anyhow::Result<SqlOutcome> {
+    let sql = sql.trim().trim_end_matches(';');
+    if sql.is_empty() {
+        anyhow::bail!("Type a statement to run");
+    }
+    let mut stmt = conn.prepare(sql)?;
+    if !allow_writes && !stmt.readonly() {
+        anyhow::bail!("The database is read-only; only queries can run");
+    }
+    if stmt.column_count() == 0 {
+        return Ok(SqlOutcome::Changed(stmt.execute([])?));
+    }
+    let columns: Vec<String> = stmt
+        .column_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    let count = columns.len();
+    let mut rows = Vec::new();
+    let mut cursor = stmt.query([])?;
+    let mut truncated = false;
+    while let Some(row) = cursor.next()? {
+        if rows.len() == limit {
+            truncated = true;
+            break;
+        }
+        rows.push(decode_row_values(row, count)?);
+    }
+    Ok(SqlOutcome::Rows {
+        columns,
+        rows,
+        truncated,
+    })
+}
+
+/// Rows scanned per table to judge which columns are enum-like.
+pub const ENUM_SAMPLE_ROWS: i64 = 5000;
+const ENUM_MAX_VALUES: i64 = 16;
+const ENUM_MAX_LENGTH: i64 = 24;
+const ENUM_MIN_VALUES: i64 = 8;
+
+/// The value set of every enum-like column among `columns`: few, short
+/// distinct values that actually repeat within the first rows, and no unique
+/// index. Other columns get an empty set. One bounded scan decides for all
+/// columns; qualifying columns then read their distinct values.
+pub fn enum_value_sets(
+    conn: &Connection,
+    table: &str,
+    columns: &[Column],
+) -> anyhow::Result<Vec<Vec<String>>> {
+    let mut sets = vec![Vec::new(); columns.len()];
+    if columns.is_empty() {
+        return Ok(sets);
+    }
+    let unique: Vec<String> = load_indexes(conn, table)?
+        .into_iter()
+        .filter(|index| index.unique && index.columns.len() == 1)
+        .flat_map(|index| index.columns)
+        .collect();
+    let names: Vec<String> = columns
+        .iter()
+        .map(|column| quote_identifier(&column.name))
+        .collect();
+    let stats = names
+        .iter()
+        .map(|name| format!("COUNT({name}), COUNT(DISTINCT {name}), MAX(LENGTH({name}))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sample = format!(
+        "(SELECT {} FROM {} LIMIT {ENUM_SAMPLE_ROWS})",
+        names.join(", "),
+        quote_identifier(table)
+    );
+    let counts: Vec<(i64, i64, i64)> =
+        conn.query_row(&format!("SELECT {stats} FROM {sample}"), [], |row| {
+            (0..columns.len())
+                .map(|i| {
+                    Ok((
+                        row.get(i * 3)?,
+                        row.get(i * 3 + 1)?,
+                        row.get::<_, Option<i64>>(i * 3 + 2)?.unwrap_or(0),
+                    ))
+                })
+                .collect()
+        })?;
+    for (index, (non_null, distinct, max_length)) in counts.into_iter().enumerate() {
+        let enum_like = distinct <= ENUM_MAX_VALUES
+            && non_null >= ENUM_MIN_VALUES
+            && distinct * 10 <= non_null * 3
+            && max_length <= ENUM_MAX_LENGTH
+            && !unique.iter().any(|name| name == &columns[index].name);
+        if !enum_like {
+            continue;
+        }
+        let name = &names[index];
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT {name} FROM {sample} WHERE {name} IS NOT NULL ORDER BY 1 LIMIT {ENUM_MAX_VALUES}"
+        ))?;
+        sets[index] = stmt
+            .query_map([], |row| {
+                Ok(SqlValue::from(row.get_ref(0)?).to_text().into_owned())
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    Ok(sets)
 }
 
 /// Resolves the rowid of the first row whose `column` equals `value`, e.g. the
@@ -567,10 +863,10 @@ mod tests {
     /// `items` sorted by `created_at` descending, excluding name 'a'.
     fn filtered_view() -> ViewQuery {
         ViewQuery {
-            order_by: Some(query::OrderBy {
+            order_by: vec![query::OrderBy {
                 column: "created_at".to_string(),
                 ascending: false,
-            }),
+            }],
             where_clause: "\"name\" != ?1".to_string(),
             where_params: vec![Value::Text("a".to_string())],
             ..ViewQuery::table("items")
@@ -646,10 +942,10 @@ mod tests {
 
         let columns = vec![text_column("name")];
         let view = ViewQuery {
-            order_by: Some(query::OrderBy {
+            order_by: vec![query::OrderBy {
                 column: "name".to_string(),
                 ascending: true,
-            }),
+            }],
             ..ViewQuery::table("items")
         };
         let fetched = fetch_rows(&conn, &view, &columns, 0, 1).expect("row fetch");
@@ -753,10 +1049,10 @@ mod tests {
         )
         .expect("seed rows");
         let view = ViewQuery {
-            order_by: Some(query::OrderBy {
+            order_by: vec![query::OrderBy {
                 column: "name".to_string(),
                 ascending: true,
-            }),
+            }],
             where_clause: "\"category\" = ?1".to_string(),
             where_params: vec![Value::Text("kept".to_string())],
             ..ViewQuery::table("items")
@@ -765,6 +1061,99 @@ mod tests {
         let offset = count_rows_before_letter(&conn, &view, 'c').expect("count offset");
 
         assert_eq!(offset, 1);
+    }
+
+    #[test]
+    fn search_returns_view_offsets_of_matching_rows() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE items (name TEXT, qty INTEGER);
+             INSERT INTO items VALUES ('Apple', 5), ('banana', 50), ('Cherry', 7), ('50% off', 1);",
+        )
+        .expect("seed rows");
+        let columns = load_columns(&conn, "items").expect("columns");
+        let view = ViewQuery::table("items");
+
+        let hits = search_view(&conn, &view, &columns, "AN", 10).expect("search");
+        assert_eq!(
+            hits.iter().map(|hit| hit.offset).collect::<Vec<_>>(),
+            vec![1]
+        );
+        let numbers = search_view(&conn, &view, &columns, "50", 10).expect("search");
+        assert_eq!(numbers.len(), 2, "numbers match as text");
+        let literal = search_view(&conn, &view, &columns, "50%", 10).expect("search");
+        assert_eq!(literal.len(), 1, "wildcards in the needle are literal");
+        assert_eq!(literal[0].rowid, Some(4));
+        assert_eq!(
+            search_view(&conn, &view, &columns, "", 2)
+                .expect("search")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn enum_detection_needs_repetition_and_skips_unique_columns() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE t (status TEXT, fax TEXT, code TEXT UNIQUE);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40)
+             INSERT INTO t SELECT CASE i % 3 WHEN 0 THEN 'new' WHEN 1 THEN 'open' ELSE 'done' END,
+                                  CASE WHEN i < 12 THEN 'fax-' || i END,
+                                  CASE i % 2 WHEN 0 THEN 'a' || i END FROM n;",
+        )
+        .expect("seed rows");
+        let columns = load_columns(&conn, "t").expect("columns");
+        let sets = enum_value_sets(&conn, "t", &columns).expect("enum sets");
+        assert_eq!(sets[0], vec!["done", "new", "open"]);
+        assert!(
+            sets[1].is_empty(),
+            "values that never repeat are not an enum"
+        );
+        assert!(sets[2].is_empty(), "unique columns are not an enum");
+    }
+
+    #[test]
+    fn views_are_listed_with_columns_and_read_without_identity() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE t (a INTEGER, b TEXT);
+             INSERT INTO t VALUES (1, 'x'), (2, 'y');
+             CREATE VIEW v AS SELECT b, a * 10 AS scaled FROM t;",
+        )
+        .expect("seed rows");
+        let schema = load_schema(&conn).expect("schema");
+        let view = schema.relation("v").expect("view");
+        assert!(view.is_view && view.row_identity.is_none());
+        let fetched =
+            fetch_rows(&conn, &ViewQuery::table("v"), &view.columns, 0, 10).expect("rows");
+        assert_eq!(fetched.rows.len(), 2);
+        assert_eq!(fetched.rowids, vec![None, None]);
+        assert_eq!(count_rows(&conn, &ViewQuery::table("v")).expect("count"), 2);
+    }
+
+    #[test]
+    fn sql_console_runs_queries_and_guards_writes() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2), (3);")
+            .expect("seed");
+        match run_sql(&conn, "SELECT a FROM t ORDER BY a;", 2, false).expect("query") {
+            SqlOutcome::Rows {
+                columns,
+                rows,
+                truncated,
+            } => {
+                assert_eq!(columns, vec!["a"]);
+                assert_eq!(rows.len(), 2);
+                assert!(truncated);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(run_sql(&conn, "DELETE FROM t", 10, false).is_err());
+        assert_eq!(
+            run_sql(&conn, "DELETE FROM t WHERE a > 1", 10, true).expect("delete"),
+            SqlOutcome::Changed(2)
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod features;
 mod input;
 
 use std::{collections::VecDeque, sync::Arc};
@@ -11,21 +12,22 @@ use crate::{
         self,
         query::ViewQuery,
         schema::{Column, Schema},
-        types::{affinity, temporal_kind, ColAffinity, SqlValue, TemporalKind},
-        DbPool,
+        types::{ColumnKind, SqlValue},
+        DbPool, SearchHit, SqlOutcome,
     },
-    export::ExportFormat,
-    grid::{GridState, RowSelection, SortDir, SortSpec},
+    grid::{GridInit, GridState, RowSelection},
     symbols::Symbols,
     theme::Theme,
     ui::{
         popup::{
-            CommandPaletteState, DatePickerState, FilterPopupState, FindState, FkPickerState,
-            HelpState, InsertRowState, PaletteCommand, PopupKind, TextEditorState,
+            command_palette::CopyFormat, global_search::GlobalHit, schema_view::SchemaLine,
+            CommandPaletteState, DatePickerState, FilterPopupState, HelpState, InsertRowState,
+            PaletteCommand, PopupKind, TextEditorState, ValuePickerState,
         },
         sidebar::SidebarState,
         toast::{ToastKind, ToastState},
     },
+    view_settings,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,8 +55,20 @@ pub struct PendingJumpTarget {
     pub col: Option<usize>,
 }
 
+/// An open tab. Inactive tabs keep their grid (focus, scroll, selection,
+/// sort, filters and columns) so switching back restores it.
 pub struct TableTab {
     pub table_name: String,
+    saved: Option<GridState>,
+}
+
+impl TableTab {
+    pub fn new(table_name: String) -> Self {
+        Self {
+            table_name,
+            saved: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -96,17 +110,12 @@ pub struct PendingConfirm {
 }
 
 struct GridScrollbarDrag {
-    grab_offset: i64,
+    grab_offset: u16,
 }
 
 const VALUE_PICKER_DISTINCT_LIMIT: usize = 100;
-const ENUM_COLOR_DISTINCT_LIMIT: usize = 20;
 const UNDO_HISTORY_LIMIT: usize = 100;
-/// Rows loaded when a table opens; they also seed column widths and enum colors.
-const INITIAL_ROW_LIMIT: i64 = 50;
-const FK_PICKER_ROW_LIMIT: i64 = 200;
-const FIND_ROW_LIMIT: i64 = 10_000;
-const CONFIRM_TIMEOUT_SECS: u64 = 5;
+pub(crate) const CONFIRM_TIMEOUT_SECS: u64 = 8;
 
 struct FocusedCellContext {
     col: Column,
@@ -127,11 +136,19 @@ pub struct App {
     pub open_tabs: Vec<TableTab>,
     pub active_tab: Option<usize>,
     pub sidebar_visible: bool,
-    pub grid: Option<crate::grid::GridState>,
+    /// The grid of the active tab.
+    pub grid: Option<GridState>,
     pub mode: AppMode,
     pub popup: Option<PopupKind>,
+    /// Popups suspended under the current one (help over an editor, the JSON
+    /// viewer over a record); closing the top popup restores the next.
+    popup_stack: Vec<PopupKind>,
     pub toast: ToastState,
+    /// Whether writes are refused.
     pub readonly: bool,
+    /// Started with `--readonly`: the pool itself cannot write, so read-only
+    /// mode cannot be switched off.
+    pub readonly_locked: bool,
     pub jump_stack: Vec<JumpFrame>,
     pub db_path: String,
     pub undo_stack: VecDeque<UndoFrame>,
@@ -152,6 +169,8 @@ pub struct App {
     navigation_request_serial: u64,
     write_in_flight: bool,
     popup_request_serial: u64,
+    /// `'` was pressed; the next letter jumps in a text-sorted column.
+    letter_jump_armed: bool,
 }
 
 #[derive(Debug)]
@@ -161,29 +180,23 @@ pub enum Message {
     Mouse(crossterm::event::MouseEvent),
     Resize,
     Tick,
-    OpenTable(String),
-    CloseTab(usize),
-    ActivateTab(usize),
-    GridDataReady {
-        request_id: u64,
-        table: String,
-        columns: Vec<Column>,
-        fk_cols: Vec<bool>,
-        fetched: db::FetchedRows,
-        total_rows: i64,
-    },
     WindowReady {
         request_id: u64,
         table: String,
         offset: i64,
         rows: Vec<Vec<SqlValue>>,
         rowids: Vec<Option<i64>>,
-        total_rows: i64,
+        /// The row count, when it had to be recounted.
+        total_rows: Option<i64>,
     },
     GridReadFailed {
         request_id: u64,
         table: String,
         error: String,
+    },
+    EnumValuesReady {
+        table: String,
+        sets: Vec<Vec<String>>,
     },
     ScrollDown(usize),
     ScrollUp(usize),
@@ -224,30 +237,20 @@ pub enum Message {
         original: SqlValue,
         error: String,
     },
-    JumpToFk,
-    FkRowsReady {
+    /// Results for the Find or foreign-key picker search.
+    SearchReady {
         request_id: u64,
-        target_table: String,
-        rows: Vec<Vec<SqlValue>>,
+        hits: Vec<SearchHit>,
     },
-    FkRowsFailed {
+    SearchFailed {
         request_id: u64,
-        target_table: String,
         error: String,
     },
-    JumpBack,
-    JumpToTargetRow {
-        table: String,
-        rowid: i64,
-        col: Option<usize>,
-    },
-    CycleSort,
-    JumpToLetter(char),
-    JumpToSortedOffset {
+    GlobalSearchReady {
         request_id: u64,
-        table: String,
-        offset: i64,
+        hits: Vec<GlobalHit>,
     },
+    JumpToFk,
     FkJumpReady {
         request_id: u64,
         frame: JumpFrame,
@@ -258,10 +261,29 @@ pub enum Message {
         request_id: u64,
         error: String,
     },
+    JumpBack,
+    JumpOffsetReady {
+        request_id: u64,
+        table: String,
+        offset: Option<i64>,
+        col: Option<usize>,
+    },
+    CycleSort,
+    AddSortKey,
+    JumpToLetter(char),
+    JumpToSortedOffset {
+        request_id: u64,
+        table: String,
+        offset: i64,
+    },
     OpenFilterPopup,
     ClearFilters,
     InsertRow,
     DeleteRow,
+    ConfirmReady {
+        message: String,
+        kind: ConfirmKind,
+    },
     ConfirmDelete,
     CancelConfirm,
     UndoAction,
@@ -288,34 +310,36 @@ pub enum Message {
     },
     OpenCommandPalette,
     OpenHelp,
-    ExecuteCommand(PaletteCommand),
     ExportDone {
         path: String,
         count: u64,
     },
     ExportFailed(String),
-    ReloadSchema,
     SchemaReady(Schema),
     SchemaLoadFailed {
         external: bool,
         error: String,
     },
     CopyCell,
-    CopyRowJson,
+    CopyRows(CopyFormat),
+    CopyReady {
+        text: String,
+        message: String,
+    },
+    /// A background task finished with something to tell the user.
+    Notify(String, ToastKind),
     FileChanged,
     ExternalRefresh(Schema),
     OpenFind,
-    FindReady {
-        request_id: u64,
-        table: String,
-        rows: Vec<Vec<SqlValue>>,
+    SchemaViewReady {
+        name: String,
+        ddl: String,
+        lines: Vec<SchemaLine>,
     },
-    FindFailed {
+    SqlDone {
         request_id: u64,
-        table: String,
-        error: String,
+        result: Result<SqlOutcome, String>,
     },
-    CommitFind,
 }
 
 impl App {
@@ -347,8 +371,10 @@ impl App {
             grid: None,
             mode: AppMode::Browse,
             popup: None,
+            popup_stack: Vec::new(),
             toast: ToastState::new(),
             readonly,
+            readonly_locked: readonly,
             jump_stack: Vec::new(),
             db_path,
             undo_stack: VecDeque::new(),
@@ -369,6 +395,7 @@ impl App {
             navigation_request_serial: 0,
             write_in_flight: false,
             popup_request_serial: 0,
+            letter_jump_armed: false,
         }
     }
 
@@ -384,46 +411,7 @@ impl App {
                 self.dirty = true;
                 self.handle_mouse(ev);
             }
-            Message::Tick => {
-                self.toast.tick();
-                if let Some(grid) = self.grid.as_mut() {
-                    grid.window.tick_count = grid.window.tick_count.wrapping_add(1);
-                }
-                self.fetch_window_if_needed();
-                if self.grid.as_ref().is_some_and(|g| g.window.fetch_in_flight) {
-                    self.dirty = true;
-                }
-                let expired = self
-                    .pending_confirm
-                    .as_ref()
-                    .is_some_and(|c| c.created.elapsed().as_secs() >= CONFIRM_TIMEOUT_SECS);
-                if expired {
-                    self.pending_confirm = None;
-                    self.dirty = true;
-                }
-            }
-            Message::OpenTable(name) => self.open_table(name),
-            Message::CloseTab(idx) => self.close_tab(idx),
-            Message::ActivateTab(idx) => self.activate_tab(idx),
-            Message::GridDataReady {
-                request_id,
-                table,
-                columns,
-                fk_cols,
-                fetched,
-                total_rows,
-            } => {
-                if request_id != self.grid_request_serial {
-                    return;
-                }
-                self.on_grid_data_ready(table.clone(), columns, fk_cols, fetched, total_rows);
-                if let Some(pending_target) = self.pending_jump_target.clone() {
-                    if pending_target.table == table {
-                        self.pending_jump_target = None;
-                        self.jump_to_rowid(table, pending_target.rowid, pending_target.col);
-                    }
-                }
-            }
+            Message::Tick => self.tick(),
             Message::WindowReady {
                 request_id,
                 table,
@@ -435,18 +423,7 @@ impl App {
                 if request_id != self.grid_request_serial {
                     return;
                 }
-                if let Some(grid) = self.grid.as_mut().filter(|grid| grid.table_name == table) {
-                    let fetch_was_queued = grid.needs_fetch;
-                    grid.window.offset = offset;
-                    grid.window.rows = rows;
-                    grid.window.rowids = rowids;
-                    grid.window.total_rows = total_rows;
-                    grid.window.fetch_in_flight = false;
-                    grid.clamp_to_total_rows();
-                    grid.needs_fetch =
-                        fetch_was_queued && grid.window.needs_prefetch(grid.focused_row as i64);
-                }
-                self.dirty = true;
+                self.on_window_ready(table, offset, rows, rowids, total_rows);
             }
             Message::GridReadFailed {
                 request_id,
@@ -454,13 +431,22 @@ impl App {
                 error,
             } => {
                 if request_id == self.grid_request_serial {
-                    if let Some(grid) = self.grid.as_mut().filter(|grid| grid.table_name == table) {
+                    if let Some(grid) = self.grid_for(&table) {
                         grid.window.fetch_in_flight = false;
                         grid.needs_fetch = false;
+                        grid.load_error = Some(error.clone());
                     }
                     self.toast.push(error, ToastKind::Error);
                     self.dirty = true;
                 }
+            }
+            Message::EnumValuesReady { table, sets } => {
+                if let Some(grid) = self.grid_for(&table) {
+                    if sets.len() == grid.columns.len() {
+                        grid.set_enum_values(sets);
+                    }
+                }
+                self.dirty = true;
             }
             Message::ScrollDown(n) => self.scroll_grid_down(n),
             Message::ScrollUp(n) => self.scroll_grid_up(n),
@@ -481,18 +467,18 @@ impl App {
                 grid.scroll_to_end();
             }),
             Message::OpenPopup => {
+                self.dirty = true;
                 if !self.ensure_writable() {
                     return;
                 }
-                self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
                 if let Some(cell) = self.focused_cell_context() {
                     if !(cell.is_fk && self.open_fk_picker(&cell)) {
                         self.open_cell_editor(cell);
                     }
                 }
-                self.dirty = true;
             }
             Message::OpenDirectEdit => {
+                self.dirty = true;
                 if !self.ensure_writable() {
                     return;
                 }
@@ -505,9 +491,9 @@ impl App {
                         cell.cell_value,
                     );
                 }
-                self.dirty = true;
             }
             Message::SetFocusedCellNull => {
+                self.dirty = true;
                 if !self.ensure_writable() {
                     return;
                 }
@@ -515,7 +501,7 @@ impl App {
                     if cell.col.not_null {
                         self.toast.push("Column is NOT NULL", ToastKind::Error);
                     } else if cell.cell_value == SqlValue::Null {
-                        self.toast.push("Cell is already NULL", ToastKind::Error);
+                        self.toast.push("Cell is already NULL", ToastKind::Info);
                     } else {
                         self.submit_cell_edit(
                             cell.table_name,
@@ -526,73 +512,12 @@ impl App {
                         );
                     }
                 }
-                self.dirty = true;
             }
             Message::ClosePopup => {
                 self.finish_popup();
                 self.dirty = true;
             }
-            Message::CommitEdit => {
-                self.dirty = true;
-                if !self.ensure_writable() {
-                    self.finish_popup();
-                    return;
-                }
-                if let Some(PopupKind::TextEditor(state)) = self.popup.as_ref() {
-                    if !state.valid {
-                        self.toast.push(
-                            format!("Invalid value for {}", state.col_type),
-                            ToastKind::Error,
-                        );
-                        return;
-                    }
-                }
-                let write_info = self.popup.as_ref().and_then(|p| match p {
-                    PopupKind::TextEditor(s) => Some((
-                        s.table.clone(),
-                        s.col_name.clone(),
-                        s.rowid,
-                        s.as_sql_value().ok()?,
-                        s.original.clone(),
-                    )),
-                    PopupKind::ValuePicker(s) => s.selected_sql_value().map(|v| {
-                        (
-                            s.table.clone(),
-                            s.col_name.clone(),
-                            s.rowid,
-                            v,
-                            s.original.clone(),
-                        )
-                    }),
-                    PopupKind::DatePicker(s) => Some((
-                        s.table.clone(),
-                        s.col_name.clone(),
-                        s.rowid,
-                        s.as_sql_value(),
-                        s.original.clone(),
-                    )),
-                    PopupKind::FkPicker(s) => s.selected_value().cloned().map(|v| {
-                        (
-                            s.source_table.clone(),
-                            s.source_col.clone(),
-                            s.source_rowid,
-                            v,
-                            s.original.clone(),
-                        )
-                    }),
-                    PopupKind::InsertRow(_)
-                    | PopupKind::FilterPopup(_)
-                    | PopupKind::CommandPalette(_)
-                    | PopupKind::Help(_)
-                    | PopupKind::Find(_) => None,
-                });
-                if let Some((table, col, rowid, value, original)) = write_info {
-                    self.submit_cell_edit(table, col, rowid, value, original);
-                } else {
-                    self.toast
-                        .push("No value selected to save", ToastKind::Error);
-                }
-            }
+            Message::CommitEdit => self.commit_edit(),
             Message::EditCommitted {
                 rowid,
                 table,
@@ -607,18 +532,14 @@ impl App {
                     cols: vec![(col, original)],
                 });
                 if !self.finish_popup() {
-                    if let Some(grid) = self.grid.as_mut() {
-                        grid.window.rows.clear();
-                        grid.window.rowids.clear();
-                    }
-                    self.fetch_window_around_focus();
+                    self.refresh_grid_rows();
                 }
                 self.toast.push("Cell updated", ToastKind::Success);
                 self.dirty = true;
             }
             Message::EditFailed(err) => {
                 self.write_in_flight = false;
-                self.toast.push(format!("Error: {}", err), ToastKind::Error);
+                self.toast.push(format!("Error: {err}"), ToastKind::Error);
                 self.dirty = true;
             }
             Message::DistinctValuesReady {
@@ -634,16 +555,14 @@ impl App {
                 }
                 if self.focused_cell_is(&table, rowid, &col.name) {
                     if should_use_value_picker(&values) {
-                        self.open_popup(PopupKind::ValuePicker(
-                            crate::ui::popup::ValuePickerState::new(
-                                table,
-                                rowid,
-                                col.name,
-                                col.col_type,
-                                values,
-                                original,
-                            ),
-                        ));
+                        self.open_popup(PopupKind::ValuePicker(ValuePickerState::new(
+                            table,
+                            rowid,
+                            col.name,
+                            col.col_type,
+                            values,
+                            original,
+                        )));
                     } else {
                         self.open_text_editor(table, rowid, col.name, col.col_type, original);
                     }
@@ -668,40 +587,20 @@ impl App {
                 }
                 self.dirty = true;
             }
-            Message::FkRowsReady {
-                request_id,
-                target_table,
-                rows,
-            } => {
-                if request_id != self.popup_request_serial {
-                    return;
+            Message::SearchReady { request_id, hits } => {
+                if request_id == self.popup_request_serial {
+                    self.on_search_ready(hits);
                 }
-                if let Some(PopupKind::FkPicker(state)) = &mut self.popup {
-                    if state.target_table == target_table {
-                        state.rows = rows;
-                        state.loading = false;
-                    }
-                }
-                self.dirty = true;
             }
-            Message::FkRowsFailed {
-                request_id,
-                target_table,
-                error,
-            } => {
-                if request_id != self.popup_request_serial {
-                    return;
+            Message::SearchFailed { request_id, error } => {
+                if request_id == self.popup_request_serial {
+                    self.on_search_failed(error);
                 }
-                if let Some(PopupKind::FkPicker(state)) = &mut self.popup {
-                    if state.target_table == target_table {
-                        state.loading = false;
-                        self.toast.push(
-                            format!("Foreign-key lookup failed: {error}"),
-                            ToastKind::Error,
-                        );
-                    }
+            }
+            Message::GlobalSearchReady { request_id, hits } => {
+                if request_id == self.popup_request_serial {
+                    self.on_global_search_ready(hits);
                 }
-                self.dirty = true;
             }
             Message::JumpToFk => {
                 self.jump_to_foreign_key();
@@ -715,12 +614,7 @@ impl App {
             } => {
                 if request_id == self.navigation_request_serial {
                     self.jump_stack.push(frame);
-                    self.pending_jump_target = Some(PendingJumpTarget {
-                        table: table.clone(),
-                        rowid,
-                        col: None,
-                    });
-                    self.open_table(table);
+                    self.open_table_at(table, rowid, None);
                 }
                 self.dirty = true;
             }
@@ -731,32 +625,32 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Message::JumpToTargetRow { table, rowid, col } => {
-                self.next_navigation_request();
-                self.jump_to_rowid(table, rowid, col)
-            }
-            Message::CycleSort => {
-                self.next_navigation_request();
-                if let Some(grid) = self.grid.as_mut() {
-                    let col_idx = grid.focused_col;
-                    grid.sort = match &grid.sort {
-                        Some(s) if s.col_idx == col_idx && s.direction == SortDir::Asc => {
-                            Some(SortSpec {
-                                col_idx,
-                                direction: SortDir::Desc,
-                            })
-                        }
-                        Some(s) if s.col_idx == col_idx => None,
-                        _ => Some(SortSpec {
-                            col_idx,
-                            direction: SortDir::Asc,
-                        }),
-                    };
-                    grid.reset_to_top();
-                    self.fetch_window_around_focus();
+            Message::JumpOffsetReady {
+                request_id,
+                table,
+                offset,
+                col,
+            } => {
+                if request_id != self.navigation_request_serial {
+                    return;
+                }
+                match offset {
+                    Some(row) if self.grid.as_ref().is_some_and(|g| g.table_name == table) => {
+                        self.update_grid(|grid| {
+                            let col = col.unwrap_or(grid.focused_col);
+                            grid.focus_cell(row as usize, col);
+                        });
+                    }
+                    Some(_) => {}
+                    None => self.toast.push(
+                        "Row not found in the current view; a filter may hide it",
+                        ToastKind::Error,
+                    ),
                 }
                 self.dirty = true;
             }
+            Message::CycleSort => self.change_sort(false),
+            Message::AddSortKey => self.change_sort(true),
             Message::JumpToSortedOffset {
                 request_id,
                 table,
@@ -775,48 +669,18 @@ impl App {
                         grid.scroll_to_row(offset);
                     });
                 }
-                self.dirty = true;
             }
             Message::JumpToLetter(letter) => {
-                let view = self
-                    .grid
-                    .as_ref()
-                    .filter(|grid| grid.sort.is_some())
-                    .map(GridState::view_query);
-                match view {
-                    Some(Ok(view)) => {
-                        let request_id = self.next_navigation_request();
-                        let table = view.table.clone();
-                        self.spawn_db(
-                            move |conn| db::count_rows_before_letter(conn, &view, letter),
-                            move |result| match result {
-                                Ok(offset) => Message::JumpToSortedOffset {
-                                    request_id,
-                                    table,
-                                    offset,
-                                },
-                                Err(error) => Message::NavigationFailed { request_id, error },
-                            },
-                        );
-                    }
-                    Some(Err(error)) => self.toast.push(error.to_string(), ToastKind::Error),
-                    None => {}
-                }
+                self.jump_to_letter(letter);
                 self.dirty = true;
             }
             Message::JumpBack => {
                 if let Some(frame) = self.jump_stack.pop() {
-                    let _ = self.tx.send(Message::OpenTable(frame.table.clone()));
-                    let _ = self.tx.send(Message::JumpToTargetRow {
-                        table: frame.table,
-                        rowid: frame.rowid,
-                        col: Some(frame.col),
-                    });
+                    self.open_table_at(frame.table, frame.rowid, Some(frame.col));
                 }
                 self.dirty = true;
             }
             Message::OpenFilterPopup => {
-                self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
                 let popup = self.grid.as_ref().and_then(|grid| {
                     let col = grid.columns.get(grid.focused_col)?;
                     let col_filter = grid
@@ -838,166 +702,62 @@ impl App {
             }
             Message::ClearFilters => {
                 self.next_navigation_request();
-                if let Some(grid) = self.grid.as_mut() {
+                let cleared = self.grid.as_mut().is_some_and(|grid| {
+                    let had_filters = !grid.filter.is_empty();
                     grid.filter = crate::filter::FilterSet::default();
                     grid.reset_to_top();
-                    let table = grid.table_name.clone();
-                    if let Err(error) =
-                        crate::filter::save_filter(&grid.filter, &self.db_path, &table)
-                    {
-                        self.toast.push(
-                            format!("Could not clear saved filter: {error}"),
-                            ToastKind::Error,
-                        );
-                    }
-                    self.fetch_window_around_focus();
-                }
-                self.finish_popup();
-                self.dirty = true;
-            }
-            Message::InsertRow => {
-                if !self.ensure_writable() {
-                    return;
-                }
-                let insert_is_undoable = self.grid.as_ref().is_some_and(|grid| {
-                    self.schema
-                        .table(&grid.table_name)
-                        .is_some_and(|table| table.has_mutable_rowid())
+                    had_filters
                 });
-                if !insert_is_undoable {
-                    self.toast.push(
-                        "This table has no rowid that can support insert undo",
-                        ToastKind::Error,
-                    );
-                    self.dirty = true;
-                    return;
-                }
-                if let Some(grid) = self.grid.as_mut() {
-                    let insert_position = if grid.window.total_rows <= 0 {
-                        0
-                    } else {
-                        (grid.focused_row + 1).min(grid.window.total_rows as usize)
-                    };
-                    grid.clear_row_selection();
-                    let mut state = InsertRowState::new(
-                        grid.table_name.clone(),
-                        grid.columns.clone(),
-                        insert_position,
-                    );
-                    state.start_editing();
-                    grid.focus_cell(grid.focused_row, state.selected);
-                    Self::ensure_inline_insert_visible(grid, insert_position);
-                    self.open_popup(PopupKind::InsertRow(state));
-                    self.toast.push("Alt-Enter commits", ToastKind::Info);
-                }
-                self.dirty = true;
-            }
-            Message::CommitInsertRow => {
-                self.dirty = true;
-                if !self.ensure_writable() {
-                    return;
-                }
-                let insert_spec = match &self.popup {
-                    Some(PopupKind::InsertRow(state)) => match state.build_insert_values() {
-                        Ok(values) => Some((state.table.clone(), values)),
-                        Err(err) => {
-                            self.toast.push(err.to_string(), ToastKind::Error);
-                            None
-                        }
-                    },
-                    _ => None,
-                };
-                if let Some((table, values)) = insert_spec {
-                    if !self.begin_write() {
-                        return;
+                if self.grid.is_some() {
+                    self.save_view_settings();
+                    self.fetch_window_around_focus();
+                    if cleared {
+                        self.toast.push("Filters cleared", ToastKind::Info);
                     }
-                    let job_table = table.clone();
-                    self.spawn_db(
-                        move |conn| db::write::insert_row(conn, &job_table, &values),
-                        move |result| match result {
-                            Ok(rowid) => Message::RowInserted { table, rowid },
-                            Err(error) => Message::EditFailed(error),
-                        },
-                    );
                 }
+                if matches!(self.popup, Some(PopupKind::FilterPopup(_))) {
+                    self.finish_popup();
+                }
+                self.dirty = true;
             }
+            Message::InsertRow => self.start_insert_row(),
+            Message::CommitInsertRow => self.commit_insert_row(),
             Message::RowInserted { table, rowid } => {
                 self.write_in_flight = false;
                 self.invalidate_grid_requests();
-                if let Some(grid) = self.grid.as_mut().filter(|grid| grid.table_name == table) {
+                if let Some(grid) = self.grid_for(&table) {
                     grid.window.total_rows += 1;
                     grid.invalidate_window();
-                    self.push_undo(UndoFrame {
-                        op: UndoOp::Insert,
-                        table,
-                        rowid,
-                        cols: Vec::new(),
-                    });
                 }
+                self.push_undo(UndoFrame {
+                    op: UndoOp::Insert,
+                    table,
+                    rowid,
+                    cols: Vec::new(),
+                });
                 self.finish_popup();
                 self.toast.push("Row inserted", ToastKind::Success);
                 self.dirty = true;
             }
             Message::DeleteRow => {
-                if !self.ensure_writable() {
-                    return;
+                if self.ensure_writable() {
+                    self.request_delete_confirmation();
                 }
-                self.request_delete_confirmation();
                 self.dirty = true;
             }
-            Message::ConfirmDelete => {
+            Message::ConfirmReady { message, kind } => {
+                self.pending_confirm = Some(PendingConfirm {
+                    message,
+                    kind,
+                    created: std::time::Instant::now(),
+                });
                 self.dirty = true;
-                let Some(confirm) = self.pending_confirm.take() else {
-                    return;
-                };
-                if !self.begin_write() {
-                    self.pending_confirm = Some(confirm);
-                    return;
-                }
-                match confirm.kind {
-                    ConfirmKind::DeleteRow { table, rowid } => {
-                        let columns = self
-                            .grid
-                            .as_ref()
-                            .map(|g| g.columns.clone())
-                            .unwrap_or_default();
-                        let job_table = table.clone();
-                        self.spawn_db(
-                            move |conn| {
-                                db::write::delete_row_with_backup(conn, &job_table, &columns, rowid)
-                            },
-                            move |result| match result {
-                                Ok(cols) => Message::RowDeleted { table, rowid, cols },
-                                Err(error) => Message::EditFailed(error),
-                            },
-                        );
-                    }
-                    ConfirmKind::DeleteSelectedRows { table, rowids } => {
-                        let job_table = table.clone();
-                        self.spawn_db(
-                            move |conn| db::write::delete_rows_by_rowids(conn, &job_table, &rowids),
-                            move |result| match result {
-                                Ok(count) => Message::RowsDeleted { table, count },
-                                Err(error) => Message::EditFailed(error),
-                            },
-                        );
-                    }
-                    ConfirmKind::ClearTable { table, keep } => {
-                        let job_table = table.clone();
-                        self.spawn_db(
-                            move |conn| db::write::clear_table(conn, &job_table, &keep),
-                            move |result| match result {
-                                Ok(count) => Message::RowsDeleted { table, count },
-                                Err(error) => Message::EditFailed(error),
-                            },
-                        );
-                    }
-                }
             }
+            Message::ConfirmDelete => self.confirm_delete(),
             Message::RowDeleted { table, rowid, cols } => {
                 self.write_in_flight = false;
                 self.invalidate_grid_requests();
-                if let Some(grid) = self.grid.as_mut().filter(|grid| grid.table_name == table) {
+                if let Some(grid) = self.grid_for(&table) {
                     grid.rows_removed(1);
                 }
                 self.push_undo(UndoFrame {
@@ -1012,76 +772,27 @@ impl App {
             Message::RowsDeleted { table, count } => {
                 self.write_in_flight = false;
                 self.invalidate_grid_requests();
-                if let Some(grid) = self.grid.as_mut().filter(|grid| grid.table_name == table) {
+                if let Some(grid) = self.grid_for(&table) {
                     grid.rows_removed(count);
                 }
                 let message = match count {
                     0 => "No rows deleted".to_string(),
                     1 => "1 row deleted".to_string(),
-                    _ => format!("{} rows deleted", count),
+                    _ => format!("{count} rows deleted"),
                 };
                 self.toast.push(message, ToastKind::Success);
                 self.dirty = true;
             }
             Message::CancelConfirm => {
                 self.pending_confirm = None;
+                self.toast.push("Deletion cancelled", ToastKind::Info);
                 self.dirty = true;
             }
-            Message::UndoAction => {
-                if self.readonly {
-                    self.toast.push("Read-only: cannot undo", ToastKind::Error);
-                    return;
-                }
-                if self.undo_stack.is_empty() {
-                    self.toast.push("Nothing to undo", ToastKind::Info);
-                    self.dirty = true;
-                    return;
-                }
-                if !self.begin_write() {
-                    return;
-                }
-                let Some(frame) = self.undo_stack.pop_back() else {
-                    return;
-                };
-                let message = match &frame.op {
-                    UndoOp::Update => format!("Undo: restored row {}", frame.rowid),
-                    UndoOp::Insert => format!("Undo: deleted inserted row {}", frame.rowid),
-                    UndoOp::Delete => format!("Undo: restored deleted row {}", frame.rowid),
-                };
-                let work = frame.clone();
-                self.spawn_db(
-                    move |conn| match work.op {
-                        UndoOp::Update => {
-                            for (column, value) in &work.cols {
-                                db::write::commit_cell_edit(
-                                    conn,
-                                    &work.table,
-                                    column,
-                                    work.rowid,
-                                    value,
-                                )?;
-                            }
-                            Ok(())
-                        }
-                        UndoOp::Insert => db::write::delete_row(conn, &work.table, work.rowid),
-                        UndoOp::Delete => {
-                            db::write::reinsert_row(conn, &work.table, work.rowid, &work.cols)
-                        }
-                    },
-                    move |result| match result {
-                        Ok(()) => Message::UndoCompleted {
-                            table: frame.table,
-                            message,
-                        },
-                        Err(error) => Message::UndoFailed { frame, error },
-                    },
-                );
-                self.dirty = true;
-            }
+            Message::UndoAction => self.undo(),
             Message::UndoCompleted { table, message } => {
                 self.write_in_flight = false;
                 self.invalidate_grid_requests();
-                if let Some(grid) = self.grid.as_mut().filter(|grid| grid.table_name == table) {
+                if let Some(grid) = self.grid_for(&table) {
                     grid.invalidate_window();
                 }
                 self.toast.push(message, ToastKind::Info);
@@ -1095,23 +806,25 @@ impl App {
                 self.dirty = true;
             }
             Message::OpenCommandPalette => {
-                let table_names = self.schema.tables.iter().map(|t| t.name.clone()).collect();
+                let table_names = self
+                    .schema
+                    .tables
+                    .iter()
+                    .chain(&self.schema.views)
+                    .map(|t| t.name.clone())
+                    .collect();
                 self.open_popup(PopupKind::CommandPalette(CommandPaletteState::new(
                     table_names,
                 )));
                 self.dirty = true;
             }
             Message::OpenHelp => {
-                self.open_popup(PopupKind::Help(HelpState::new()));
-                self.dirty = true;
-            }
-            Message::ExecuteCommand(cmd) => {
-                self.execute_palette_command(cmd);
+                self.toggle_help();
                 self.dirty = true;
             }
             Message::ExportDone { path, count } => {
                 self.toast.push(
-                    format!("Exported {} rows to {}", count, path),
+                    format!("Exported {count} rows to {path}"),
                     ToastKind::Success,
                 );
                 self.dirty = true;
@@ -1121,14 +834,10 @@ impl App {
                     .push(format!("Export failed: {error}"), ToastKind::Error);
                 self.dirty = true;
             }
-            Message::ReloadSchema => {
-                self.spawn_schema_load(false);
-                self.dirty = true;
-            }
             Message::SchemaReady(schema) => {
                 self.schema = schema;
+                self.clamp_sidebar_selection();
                 self.refresh_active_grid_schema();
-                self.sidebar.tables_expanded = true;
                 self.toast.push("Schema reloaded", ToastKind::Success);
                 self.dirty = true;
             }
@@ -1141,19 +850,19 @@ impl App {
                 self.dirty = true;
             }
             Message::CopyCell => {
-                let text = self.grid.as_ref().and_then(|g| {
-                    g.window
-                        .get_row(g.focused_row as i64)?
-                        .get(g.focused_col)
-                        .map(|value| value.to_text().into_owned())
-                });
-                if let Some(text) = text {
-                    self.copy_to_clipboard(&text, "Copied to clipboard");
-                }
+                self.copy_cell();
                 self.dirty = true;
             }
-            Message::CopyRowJson => {
-                self.copy_row_as_json();
+            Message::CopyRows(format) => {
+                self.copy_rows(format);
+                self.dirty = true;
+            }
+            Message::CopyReady { text, message } => {
+                self.copy_to_clipboard(&text, &message);
+                self.dirty = true;
+            }
+            Message::Notify(message, kind) => {
+                self.toast.push(message, kind);
                 self.dirty = true;
             }
             Message::FileChanged => {
@@ -1167,10 +876,8 @@ impl App {
                 // Refresh data now, but never underneath an open popup.
                 if self.mode == AppMode::Edit {
                     self.pending_external_refresh = true;
-                } else if let Some(grid) = self.grid.as_mut() {
-                    grid.window.fetch_in_flight = false;
-                    grid.needs_fetch = true;
-                    self.invalidate_grid_requests();
+                } else if self.grid.is_some() {
+                    self.refresh_grid_rows();
                 } else if let Some(table) = self.active_table_name() {
                     self.request_table_view(&table);
                 }
@@ -1179,10 +886,7 @@ impl App {
             Message::ExternalRefresh(new_schema) => {
                 if self.schema != new_schema {
                     self.schema = new_schema;
-                    let total = self.sidebar.visible_count(&self.schema);
-                    if self.sidebar.selected >= total {
-                        self.sidebar.selected = total.saturating_sub(1);
-                    }
+                    self.clamp_sidebar_selection();
                     self.toast.push("Schema changed", ToastKind::Info);
                     if self.mode == AppMode::Edit {
                         self.pending_external_refresh = true;
@@ -1194,84 +898,16 @@ impl App {
                 self.dirty = true;
             }
             Message::OpenFind => {
-                let Some(grid) = self.grid.as_ref() else {
-                    return;
-                };
-                let columns = grid.columns.clone();
-                let view = match grid.view_query() {
-                    Ok(view) => view,
-                    Err(error) => {
-                        self.toast.push(error.to_string(), ToastKind::Error);
-                        return;
-                    }
-                };
-                let table = view.table.clone();
-                let request_id = self.open_popup(PopupKind::Find(FindState::new(
-                    table.clone(),
-                    columns.clone(),
-                )));
-                self.dirty = true;
-                self.spawn_db(
-                    move |conn| Ok(db::fetch_rows(conn, &view, &columns, 0, FIND_ROW_LIMIT)?.rows),
-                    move |result| match result {
-                        Ok(rows) => Message::FindReady {
-                            request_id,
-                            table,
-                            rows,
-                        },
-                        Err(error) => Message::FindFailed {
-                            request_id,
-                            table,
-                            error,
-                        },
-                    },
-                );
-            }
-            Message::FindReady {
-                request_id,
-                table,
-                rows,
-            } => {
-                if request_id != self.popup_request_serial {
-                    return;
-                }
-                if let Some(PopupKind::Find(state)) = &mut self.popup {
-                    if state.table_name == table {
-                        state.set_rows(rows);
-                        self.dirty = true;
-                    }
-                }
-            }
-            Message::FindFailed {
-                request_id,
-                table,
-                error,
-            } => {
-                if request_id != self.popup_request_serial {
-                    return;
-                }
-                if let Some(PopupKind::Find(state)) = &mut self.popup {
-                    if state.table_name == table {
-                        state.loading = false;
-                        self.toast
-                            .push(format!("Find failed: {error}"), ToastKind::Error);
-                    }
-                }
+                self.open_find();
                 self.dirty = true;
             }
-            Message::CommitFind => {
-                let hit = match &self.popup {
-                    Some(PopupKind::Find(state)) => state
-                        .hits()
-                        .get(state.selected)
-                        .map(|h| (h.abs_row_index, h.first_match_col)),
-                    _ => None,
-                };
-                if let (Some((abs_row, col)), Some(grid)) = (hit, self.grid.as_mut()) {
-                    grid.focus_cell(abs_row, col);
-                }
-                if !self.finish_popup() {
-                    self.fetch_window_if_needed();
+            Message::SchemaViewReady { name, ddl, lines } => {
+                self.show_schema_view(name, ddl, lines);
+                self.dirty = true;
+            }
+            Message::SqlDone { request_id, result } => {
+                if request_id == self.popup_request_serial {
+                    self.on_sql_done(result);
                 }
                 self.dirty = true;
             }
@@ -1282,112 +918,183 @@ impl App {
         crate::ui::render(frame, self);
     }
 
+    fn tick(&mut self) {
+        self.toast.tick();
+        if let Some(grid) = self.grid.as_mut() {
+            grid.window.tick_count = grid.window.tick_count.wrapping_add(1);
+        }
+        self.fetch_window_if_needed();
+        if self.grid.as_ref().is_some_and(|g| g.window.fetch_in_flight) {
+            self.dirty = true;
+        }
+        let expired = self
+            .pending_confirm
+            .as_ref()
+            .is_some_and(|c| c.created.elapsed().as_secs() >= CONFIRM_TIMEOUT_SECS);
+        if expired {
+            self.pending_confirm = None;
+            self.toast
+                .push("Deletion not confirmed; nothing deleted", ToastKind::Info);
+            self.dirty = true;
+        }
+    }
+
     fn execute_palette_command(&mut self, cmd: PaletteCommand) {
+        let needs_grid = !matches!(
+            cmd,
+            PaletteCommand::SqlConsole
+                | PaletteCommand::SearchAllTables
+                | PaletteCommand::ShowSchema
+                | PaletteCommand::NextTab
+                | PaletteCommand::PrevTab
+                | PaletteCommand::CloseTab
+                | PaletteCommand::ReloadSchema
+                | PaletteCommand::ToggleSidebar
+                | PaletteCommand::ToggleReadonly
+                | PaletteCommand::Help
+                | PaletteCommand::Quit
+                | PaletteCommand::SwitchTable(_)
+        );
+        if needs_grid && self.grid.is_none() {
+            self.toast.push("Open a table first", ToastKind::Info);
+            return;
+        }
         match cmd {
-            PaletteCommand::ExportCsv => self.export_view(ExportFormat::Csv),
-            PaletteCommand::ExportJson => self.export_view(ExportFormat::Json),
-            PaletteCommand::ExportSql => self.export_view(ExportFormat::Sql),
-            PaletteCommand::SwitchTable(name) => {
-                let _ = self.tx.send(Message::OpenTable(name));
+            PaletteCommand::Export(format) => self.open_export(format),
+            PaletteCommand::CopyCell => self.copy_cell(),
+            PaletteCommand::CopyRows(format) => self.copy_rows(format),
+            PaletteCommand::CopyColumn => self.copy_column(),
+            PaletteCommand::Find => self.open_find(),
+            PaletteCommand::GoToRow => self.open_goto(),
+            PaletteCommand::SqlConsole => self.open_sql_console(),
+            PaletteCommand::SearchAllTables => self.open_global_search(),
+            PaletteCommand::ShowRecord => self.open_record(),
+            PaletteCommand::ShowSchema => {
+                let name = match self.focus {
+                    FocusPane::Sidebar => self.sidebar.selected_name(&self.schema),
+                    FocusPane::Grid => None,
+                }
+                .or_else(|| self.active_table_name());
+                match name {
+                    Some(name) => self.open_schema(name),
+                    None => self.toast.push("Select a table first", ToastKind::Info),
+                }
             }
-            PaletteCommand::ToggleSidebar => {
-                self.sidebar_visible = !self.sidebar_visible;
-            }
-            PaletteCommand::ToggleReadonly => {
-                self.readonly = !self.readonly;
-                let msg = if self.readonly {
-                    "Read-only mode enabled"
+            PaletteCommand::ReferencingRows => self.open_references(),
+            PaletteCommand::FilterColumn => self.update(Message::OpenFilterPopup),
+            PaletteCommand::ClearFilters => self.update(Message::ClearFilters),
+            PaletteCommand::SortColumn => self.change_sort(false),
+            PaletteCommand::ShowHiddenColumns => {
+                let hidden = self.grid.as_ref().map_or(0, |g| g.hidden.len());
+                if hidden == 0 {
+                    self.toast.push("No columns are hidden", ToastKind::Info);
                 } else {
-                    "Read-only mode disabled"
-                };
-                self.toast.push(msg, ToastKind::Info);
+                    self.update_grid(GridState::show_all_columns);
+                    self.save_view_settings();
+                    self.toast
+                        .push(format!("Showing {hidden} hidden columns"), ToastKind::Info);
+                }
             }
-            PaletteCommand::ClearFilters => {
-                let _ = self.tx.send(Message::ClearFilters);
-                self.toast.push("Filters cleared", ToastKind::Info);
+            PaletteCommand::ToggleFreezeColumn => {
+                self.update_grid(GridState::toggle_frozen);
+                self.save_view_settings();
             }
-            PaletteCommand::ReloadSchema => {
-                let _ = self.tx.send(Message::ReloadSchema);
+            PaletteCommand::InsertRow => self.start_insert_row(),
+            PaletteCommand::DeleteRows => self.update(Message::DeleteRow),
+            PaletteCommand::Undo => self.undo(),
+            PaletteCommand::NextTab => self.cycle_tab(true),
+            PaletteCommand::PrevTab => self.cycle_tab(false),
+            PaletteCommand::CloseTab => {
+                if let Some(index) = self.active_tab {
+                    self.close_tab(index);
+                }
             }
-            PaletteCommand::CopyCell => {
-                let _ = self.tx.send(Message::CopyCell);
-            }
-            PaletteCommand::CopyRowJson => {
-                let _ = self.tx.send(Message::CopyRowJson);
-            }
-            PaletteCommand::Quit => {
-                self.should_quit = true;
-            }
+            PaletteCommand::ReloadSchema => self.spawn_schema_load(false),
+            PaletteCommand::ToggleSidebar => self.toggle_sidebar(),
+            PaletteCommand::ToggleReadonly => self.toggle_readonly(),
+            PaletteCommand::Help => self.toggle_help(),
+            PaletteCommand::Quit => self.should_quit = true,
+            PaletteCommand::SwitchTable(name) => self.open_table(name),
         }
     }
 
-    fn copy_row_as_json(&mut self) {
-        match self.row_json_text() {
-            Ok(Some((text, copied_selected_rows))) => {
-                let success_message = if copied_selected_rows {
-                    "Copied selected rows JSON to clipboard"
-                } else {
-                    "Copied row JSON to clipboard"
-                };
-                self.copy_to_clipboard(&text, success_message);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                self.toast.push(err.to_string(), ToastKind::Error);
-            }
+    fn toggle_readonly(&mut self) {
+        if self.readonly_locked {
+            self.toast.push(
+                "Opened with --readonly; restart without it to edit",
+                ToastKind::Error,
+            );
+            return;
         }
-    }
-
-    fn row_json_text(&self) -> anyhow::Result<Option<(String, bool)>> {
-        let Some(grid) = self.grid.as_ref() else {
-            return Ok(None);
-        };
-        let view = grid.view_query()?;
-        let conn = self.pool.get()?;
-        let copying_selection = grid.has_row_selection();
-        let rows = match &grid.row_selection {
-            RowSelection::All { except } => db::fetch_rows(
-                &conn,
-                &view,
-                &grid.columns,
-                0,
-                grid.window.total_rows.max(0),
-            )?
-            .rows
-            .into_iter()
-            .enumerate()
-            .filter(|(offset, _)| !except.contains(offset))
-            .map(|(_, row)| row)
-            .collect(),
-            _ if copying_selection => {
-                let offsets = grid
-                    .selected_rows()
-                    .into_iter()
-                    .map(|offset| offset as i64)
-                    .collect::<Vec<_>>();
-                db::fetch_rows_at_offsets(&conn, &view, &grid.columns, &offsets)?
-            }
-            _ => db::fetch_rows(&conn, &view, &grid.columns, grid.focused_row as i64, 1)?.rows,
-        };
-        if rows.is_empty() {
-            return Ok(None);
-        }
-
-        let to_json = |row: &Vec<SqlValue>| crate::export::row_to_json(&grid.columns, row);
-        let json = if copying_selection {
-            serde_json::to_string(&rows.iter().map(to_json).collect::<Vec<_>>())?
+        self.readonly = !self.readonly;
+        let message = if self.readonly {
+            "Read-only mode on"
         } else {
-            serde_json::to_string(&to_json(&rows[0]))?
+            "Read-only mode off"
         };
-        Ok(Some((json, copying_selection)))
+        self.toast.push(message, ToastKind::Info);
+    }
+
+    pub(crate) fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        if !self.sidebar_visible {
+            self.focus = FocusPane::Grid;
+        }
+    }
+
+    /// Opens help, or closes it when it is showing. Help stacks over an open
+    /// popup, which comes back when help closes.
+    fn toggle_help(&mut self) {
+        if matches!(self.popup, Some(PopupKind::Help(_))) {
+            self.finish_popup();
+        } else {
+            self.push_popup(PopupKind::Help(HelpState::new()));
+        }
+    }
+
+    /// Whether writes to the current view are refused, by read-only mode or
+    /// because the view cannot be edited (a view, or a table without rowid).
+    pub fn is_readonly_view(&self) -> bool {
+        self.readonly || self.grid.as_ref().is_some_and(|grid| grid.readonly)
+    }
+
+    fn ensure_writable(&mut self) -> bool {
+        if self.readonly {
+            let message = if self.readonly_locked {
+                "Opened with --readonly; writes are disabled"
+            } else {
+                "Read-only mode is on; turn it off in the command palette"
+            };
+            self.toast.push(message, ToastKind::Error);
+            return false;
+        }
+        if let Some(grid) = self.grid.as_ref().filter(|grid| grid.readonly) {
+            let message = if self
+                .schema
+                .relation(&grid.table_name)
+                .is_some_and(|meta| meta.is_view)
+            {
+                "Views are read-only"
+            } else {
+                "This table has no rowid, so its rows cannot be edited safely"
+            };
+            self.toast.push(message, ToastKind::Error);
+            return false;
+        }
+        true
     }
 
     fn copy_to_clipboard(&mut self, text: &str, success_message: &str) {
-        use std::io::Write;
-        let encoded = base64_encode(text.as_bytes());
-        let osc52 = format!("\x1b]52;c;{}\x07", encoded);
-        let _ = std::io::stdout().write_all(osc52.as_bytes());
-        let _ = std::io::stdout().flush();
+        let osc52 = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+        // Tests must not set the clipboard of the terminal running them.
+        #[cfg(not(test))]
+        {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(osc52.as_bytes());
+            let _ = std::io::stdout().flush();
+        }
+        #[cfg(test)]
+        let _ = osc52;
         self.toast.push(success_message, ToastKind::Success);
     }
 
@@ -1422,7 +1129,56 @@ impl App {
         });
     }
 
-    fn ensure_inline_insert_visible(grid: &mut crate::grid::GridState, insert_position: usize) {
+    fn change_sort(&mut self, add_key: bool) {
+        self.next_navigation_request();
+        let Some(grid) = self.grid.as_mut() else {
+            return;
+        };
+        let col = grid.focused_col;
+        if add_key {
+            grid.add_sort_key(col);
+        } else {
+            grid.cycle_sort(col);
+        }
+        grid.reset_to_top();
+        self.save_view_settings();
+        self.fetch_window_around_focus();
+        self.dirty = true;
+    }
+
+    fn jump_to_letter(&mut self, letter: char) {
+        let view = match self.grid.as_ref() {
+            Some(grid) if grid.is_text_sorted() => grid.view_query(),
+            Some(_) => {
+                self.toast
+                    .push("Sort a text column (s) to jump by letter", ToastKind::Info);
+                return;
+            }
+            None => return,
+        };
+        let view = match view {
+            Ok(view) => view,
+            Err(error) => {
+                self.toast.push(error.to_string(), ToastKind::Error);
+                return;
+            }
+        };
+        let request_id = self.next_navigation_request();
+        let table = view.table.clone();
+        self.spawn_db(
+            move |conn| db::count_rows_before_letter(conn, &view, letter),
+            move |result| match result {
+                Ok(offset) => Message::JumpToSortedOffset {
+                    request_id,
+                    table,
+                    offset,
+                },
+                Err(error) => Message::NavigationFailed { request_id, error },
+            },
+        );
+    }
+
+    fn ensure_inline_insert_visible(grid: &mut GridState, insert_position: usize) {
         let viewport_rows = grid.window.viewport_rows.max(1) as i64;
         let insert_position = insert_position as i64;
         let current_display_start = if insert_position < grid.viewport_start {
@@ -1446,6 +1202,166 @@ impl App {
         };
         let max_start = (grid.window.total_rows - viewport_rows + 1).max(0);
         grid.viewport_start = target_real_start.clamp(0, max_start);
+    }
+
+    fn start_insert_row(&mut self) {
+        self.dirty = true;
+        if !self.ensure_writable() {
+            return;
+        }
+        let Some(grid) = self.grid.as_mut() else {
+            return;
+        };
+        let insert_position = if grid.window.total_rows <= 0 {
+            0
+        } else {
+            (grid.focused_row + 1).min(grid.window.total_rows as usize)
+        };
+        grid.clear_row_selection();
+        let state = InsertRowState::new(
+            grid.table_name.clone(),
+            grid.columns.clone(),
+            insert_position,
+        );
+        grid.focus_cell(grid.focused_row, state.selected);
+        Self::ensure_inline_insert_visible(grid, insert_position);
+        self.open_popup(PopupKind::InsertRow(state));
+    }
+
+    fn commit_insert_row(&mut self) {
+        self.dirty = true;
+        if !self.ensure_writable() {
+            return;
+        }
+        let insert_spec = match &self.popup {
+            Some(PopupKind::InsertRow(state)) => match state.build_insert_values() {
+                Ok(values) => Some((state.table.clone(), values)),
+                Err(err) => {
+                    self.toast.push(err.to_string(), ToastKind::Error);
+                    None
+                }
+            },
+            _ => None,
+        };
+        let Some((table, values)) = insert_spec else {
+            return;
+        };
+        if !self.begin_write() {
+            return;
+        }
+        let job_table = table.clone();
+        self.spawn_db(
+            move |conn| db::write::insert_row(conn, &job_table, &values),
+            move |result| match result {
+                Ok(rowid) => Message::RowInserted { table, rowid },
+                Err(error) => Message::EditFailed(error),
+            },
+        );
+    }
+
+    fn commit_edit(&mut self) {
+        self.dirty = true;
+        if !self.ensure_writable() {
+            self.finish_popup();
+            return;
+        }
+        if let Some(PopupKind::TextEditor(state)) = self.popup.as_ref() {
+            if !state.valid {
+                self.toast.push(
+                    format!("Invalid value for {}", state.col_type),
+                    ToastKind::Error,
+                );
+                return;
+            }
+        }
+        let write_info = self.popup.as_ref().and_then(|p| match p {
+            PopupKind::TextEditor(s) => Some((
+                s.table.clone(),
+                s.col_name.clone(),
+                s.rowid,
+                s.as_sql_value().ok()?,
+                s.original.clone(),
+            )),
+            PopupKind::ValuePicker(s) => s.selected_sql_value().map(|v| {
+                (
+                    s.table.clone(),
+                    s.col_name.clone(),
+                    s.rowid,
+                    v,
+                    s.original.clone(),
+                )
+            }),
+            PopupKind::DatePicker(s) => Some((
+                s.table.clone(),
+                s.col_name.clone(),
+                s.rowid,
+                s.as_sql_value(),
+                s.original.clone(),
+            )),
+            PopupKind::FkPicker(s) => s.selected_value().map(|v| {
+                (
+                    s.source_table.clone(),
+                    s.source_col.clone(),
+                    s.source_rowid,
+                    v,
+                    s.original.clone(),
+                )
+            }),
+            _ => None,
+        });
+        match write_info {
+            Some((table, col, rowid, value, original)) => {
+                self.submit_cell_edit(table, col, rowid, value, original);
+            }
+            None => self
+                .toast
+                .push("No value selected to save", ToastKind::Error),
+        }
+    }
+
+    fn undo(&mut self) {
+        self.dirty = true;
+        if self.readonly {
+            self.toast.push("Read-only: cannot undo", ToastKind::Error);
+            return;
+        }
+        if self.undo_stack.is_empty() {
+            self.toast.push("Nothing to undo", ToastKind::Info);
+            return;
+        }
+        if !self.begin_write() {
+            return;
+        }
+        let Some(frame) = self.undo_stack.pop_back() else {
+            return;
+        };
+        let message = match &frame.op {
+            UndoOp::Update => format!("Undo: restored row {}", frame.rowid),
+            UndoOp::Insert => format!("Undo: deleted inserted row {}", frame.rowid),
+            UndoOp::Delete => format!("Undo: restored deleted row {}", frame.rowid),
+        };
+        let work = frame.clone();
+        self.spawn_db(
+            move |conn| match work.op {
+                UndoOp::Update => {
+                    for (column, value) in &work.cols {
+                        db::write::commit_cell_edit(conn, &work.table, column, work.rowid, value)?;
+                    }
+                    Ok(())
+                }
+                UndoOp::Insert => db::write::delete_row(conn, &work.table, work.rowid),
+                UndoOp::Delete => {
+                    db::write::reinsert_row(conn, &work.table, work.rowid, &work.cols)
+                }
+            },
+            move |result| match result {
+                Ok(()) => Message::UndoCompleted {
+                    table: frame.table,
+                    message,
+                },
+                Err(error) => Message::UndoFailed { frame, error },
+            },
+        );
     }
 
     fn focused_cell_context(&mut self) -> Option<FocusedCellContext> {
@@ -1495,7 +1411,7 @@ impl App {
     }
 
     pub(crate) fn focused_cell_can_be_set_null(&self) -> bool {
-        if self.readonly {
+        if self.is_readonly_view() {
             return false;
         }
         let Some(grid) = self.grid.as_ref() else {
@@ -1514,8 +1430,9 @@ impl App {
             .is_some_and(|value| *value != SqlValue::Null)
     }
 
-    /// Opens the editor that fits the column type and current value. Plain values
-    /// first look up the column's distinct values to decide on a value picker.
+    /// Opens the editor that fits the column kind and current value. Plain
+    /// values first look up the column's distinct values to decide on a value
+    /// picker.
     fn open_cell_editor(&mut self, cell: FocusedCellContext) {
         let FocusedCellContext {
             col,
@@ -1524,34 +1441,21 @@ impl App {
             cell_value: original,
             ..
         } = cell;
-        let upper = col.col_type.to_uppercase();
-        let looks_like_epoch_datetime = (upper.contains("INT") || upper.contains("NUM")) && {
-            let name = col.name.to_lowercase();
-            name.ends_with("_at")
-                || name.contains("timestamp")
-                || name.contains("created_at")
-                || name.contains("updated_at")
-        };
-        let temporal = temporal_kind(&col.col_type);
-        if temporal == Some(TemporalKind::Datetime)
-            || looks_like_epoch_datetime
+        let kind = ColumnKind::of(&col.col_type, &col.name);
+        if matches!(kind, ColumnKind::Datetime | ColumnKind::EpochDatetime)
             || DatePickerState::supports_datetime(&original)
         {
             self.open_popup(PopupKind::DatePicker(DatePickerState::datetime(
                 table_name, rowid, col.name, original,
             )));
-        } else if temporal == Some(TemporalKind::Date) || DatePickerState::supports_date(&original)
-        {
+        } else if kind == ColumnKind::Date || DatePickerState::supports_date(&original) {
             self.open_popup(PopupKind::DatePicker(DatePickerState::date(
                 table_name, rowid, col.name, original,
             )));
-        } else if matches!(&original, SqlValue::Blob(_))
-            || matches!(affinity(&col.col_type), ColAffinity::Blob)
-        {
+        } else if matches!(&original, SqlValue::Blob(_)) || kind == ColumnKind::Blob {
             self.open_text_editor(table_name, rowid, col.name, col.col_type, original);
         } else {
-            self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
-            let request_id = self.popup_request_serial;
+            let request_id = self.next_popup_request();
             let (job_table, job_column) = (table_name.clone(), col.name.clone());
             self.spawn_db(
                 move |conn| {
@@ -1581,67 +1485,7 @@ impl App {
                     },
                 },
             );
-            self.toast.push("Loading distinct values", ToastKind::Info);
         }
-    }
-
-    /// Opens the foreign-key picker for `cell` and loads candidate rows; false when
-    /// the column's reference cannot be resolved in the schema.
-    fn open_fk_picker(&mut self, cell: &FocusedCellContext) -> bool {
-        let Some(fk) = self
-            .schema
-            .table(&cell.table_name)
-            .and_then(|table| table.foreign_key(&cell.col.name))
-            .cloned()
-        else {
-            return false;
-        };
-        let target_columns = self
-            .schema
-            .table(&fk.to_table)
-            .map(|table| table.columns.as_slice())
-            .unwrap_or_default();
-        let Some(key_column) = target_columns.iter().find(|c| c.name == fk.to_col) else {
-            return false;
-        };
-        let display_columns = target_columns
-            .iter()
-            .filter(|c| c.name != fk.to_col)
-            .cloned()
-            .collect::<Vec<_>>();
-        // The picker expects the referenced key first, then the descriptive columns.
-        let fetch_columns = std::iter::once(key_column.clone())
-            .chain(display_columns.iter().cloned())
-            .collect::<Vec<_>>();
-        let request_id = self.open_popup(PopupKind::FkPicker(FkPickerState::new(
-            fk.to_table.clone(),
-            fk.to_col.clone(),
-            display_columns.into_iter().map(|c| c.name).collect(),
-            cell.table_name.clone(),
-            cell.col.name.clone(),
-            cell.rowid,
-            cell.cell_value.clone(),
-        )));
-        let target_table = fk.to_table;
-        let view = ViewQuery::table(&target_table);
-        self.spawn_db(
-            move |conn| {
-                Ok(db::fetch_rows(conn, &view, &fetch_columns, 0, FK_PICKER_ROW_LIMIT)?.rows)
-            },
-            move |result| match result {
-                Ok(rows) => Message::FkRowsReady {
-                    request_id,
-                    target_table,
-                    rows,
-                },
-                Err(error) => Message::FkRowsFailed {
-                    request_id,
-                    target_table,
-                    error,
-                },
-            },
-        );
-        true
     }
 
     fn jump_to_foreign_key(&mut self) {
@@ -1665,8 +1509,14 @@ impl App {
             Some((frame, fk.to_table.clone(), fk.to_col.clone(), value))
         });
         let Some((frame, to_table, to_col, value)) = jump else {
+            self.toast
+                .push("The focused cell is not a link", ToastKind::Info);
             return;
         };
+        if value == SqlValue::Null {
+            self.toast.push("The link is NULL", ToastKind::Info);
+            return;
+        }
         let request_id = self.next_navigation_request();
         let job_table = to_table.clone();
         self.spawn_db(
@@ -1692,15 +1542,23 @@ impl App {
             return;
         };
         let table = grid.table_name.clone();
-        let (message, kind) = match &grid.row_selection {
+        let view = match grid.view_query() {
+            Ok(view) => view,
+            Err(error) => {
+                self.toast.push(error.to_string(), ToastKind::Error);
+                return;
+            }
+        };
+        match &grid.row_selection {
             RowSelection::None => {
                 let Some(rowid) = grid.window.get_rowid(grid.focused_row as i64) else {
                     return;
                 };
-                (
-                    format!("Delete row #{}? [y/n]", grid.focused_row + 1),
-                    ConfirmKind::DeleteRow { table, rowid },
-                )
+                let message = format!("Delete row #{}? [y/n]", grid.focused_row + 1);
+                self.update(Message::ConfirmReady {
+                    message,
+                    kind: ConfirmKind::DeleteRow { table, rowid },
+                });
             }
             RowSelection::Rows(_) => {
                 let offsets = grid
@@ -1711,120 +1569,90 @@ impl App {
                 if offsets.is_empty() {
                     return;
                 }
-                let rowids = match self.resolve_selected_rowids(grid, &offsets) {
-                    Ok(rowids) if rowids.len() == offsets.len() => rowids,
-                    Ok(_) => {
-                        self.toast
-                            .push("Some selected rows no longer exist", ToastKind::Error);
-                        return;
-                    }
-                    Err(error) => {
-                        self.toast.push(error.to_string(), ToastKind::Error);
-                        return;
-                    }
-                };
-                let noun = if rowids.len() == 1 { "row" } else { "rows" };
-                (
-                    format!("Delete {} selected {}? [y/n]", rowids.len(), noun),
-                    ConfirmKind::DeleteSelectedRows { table, rowids },
-                )
+                self.spawn_db(
+                    move |conn| {
+                        let rowids = db::fetch_rowids_at_offsets(conn, &view, &offsets)?;
+                        if rowids.len() != offsets.len() {
+                            anyhow::bail!("Some selected rows no longer exist");
+                        }
+                        Ok(rowids)
+                    },
+                    move |result| match result {
+                        Ok(rowids) => {
+                            let noun = if rowids.len() == 1 { "row" } else { "rows" };
+                            Message::ConfirmReady {
+                                message: format!("Delete {} selected {noun}? [y/n]", rowids.len()),
+                                kind: ConfirmKind::DeleteSelectedRows { table, rowids },
+                            }
+                        }
+                        Err(error) => Message::Notify(error, ToastKind::Error),
+                    },
+                );
             }
             RowSelection::All { except } => {
                 let except = except.iter().map(|&row| row as i64).collect::<Vec<_>>();
-                let counted = self
-                    .resolve_selected_rowids(grid, &except)
-                    .and_then(|keep| {
-                        let conn = self.pool.get()?;
-                        Ok((db::count_rows(&conn, &ViewQuery::table(&table))?, keep))
-                    });
-                let (total_rows, keep) = match counted {
-                    Ok(counted) => counted,
-                    Err(error) => {
-                        self.toast.push(error.to_string(), ToastKind::Error);
-                        return;
-                    }
-                };
-                let deleting = total_rows - keep.len() as i64;
-                if deleting <= 0 {
-                    self.toast.push("Nothing to delete", ToastKind::Info);
-                    return;
-                }
-                let message = if keep.is_empty() {
-                    format!("Delete all {total_rows} rows from {table}? [y/n]")
-                } else {
-                    format!(
-                        "Delete {deleting} rows from {table}, keeping {} deselected? [y/n]",
-                        keep.len()
-                    )
-                };
-                (message, ConfirmKind::ClearTable { table, keep })
+                let filtered = !grid.filter.is_empty();
+                let columns = grid.columns.clone();
+                self.spawn_db(
+                    move |conn| delete_all_confirmation(conn, &view, &columns, &except, filtered),
+                    move |result| match result {
+                        Ok(Some((message, kind))) => Message::ConfirmReady { message, kind },
+                        Ok(None) => Message::Notify("Nothing to delete".into(), ToastKind::Info),
+                        Err(error) => Message::Notify(error, ToastKind::Error),
+                    },
+                );
             }
-        };
-        self.pending_confirm = Some(PendingConfirm {
-            message,
-            kind,
-            created: std::time::Instant::now(),
-        });
+        }
     }
 
-    fn resolve_selected_rowids(
-        &self,
-        grid: &GridState,
-        offsets: &[i64],
-    ) -> anyhow::Result<Vec<i64>> {
-        let view = grid.view_query()?;
-        let conn = self.pool.get()?;
-        db::fetch_rowids_at_offsets(&conn, &view, offsets)
-    }
-
-    fn export_view(&mut self, format: ExportFormat) {
-        let Some(grid) = self.grid.as_ref() else {
+    fn confirm_delete(&mut self) {
+        self.dirty = true;
+        let Some(confirm) = self.pending_confirm.take() else {
             return;
         };
-        let columns = grid.columns.clone();
-        let view = match grid.view_query() {
-            Ok(view) => view,
-            Err(error) => {
-                self.toast
-                    .push(format!("Export failed: {error}"), ToastKind::Error);
-                return;
+        if !self.begin_write() {
+            self.pending_confirm = Some(confirm);
+            return;
+        }
+        match confirm.kind {
+            ConfirmKind::DeleteRow { table, rowid } => {
+                let columns = self
+                    .schema
+                    .table(&table)
+                    .map(|meta| meta.columns.clone())
+                    .unwrap_or_default();
+                let job_table = table.clone();
+                self.spawn_db(
+                    move |conn| {
+                        db::write::delete_row_with_backup(conn, &job_table, &columns, rowid)
+                    },
+                    move |result| match result {
+                        Ok(cols) => Message::RowDeleted { table, rowid, cols },
+                        Err(error) => Message::EditFailed(error),
+                    },
+                );
             }
-        };
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let safe_table = view
-            .table
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        let export_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        let path = format!(
-            "{home}/sqview_{safe_table}_{export_id}.{}",
-            format.extension()
-        );
-        let job_path = path.clone();
-        self.spawn_db(
-            move |conn| {
-                crate::export::export(
-                    conn,
-                    format,
-                    &view,
-                    &columns,
-                    std::path::Path::new(&job_path),
-                )
-            },
-            move |result| match result {
-                Ok(count) => Message::ExportDone { path, count },
-                Err(error) => Message::ExportFailed(error),
-            },
-        );
+            ConfirmKind::DeleteSelectedRows { table, rowids } => {
+                let job_table = table.clone();
+                self.spawn_db(
+                    move |conn| db::write::delete_rows_by_rowids(conn, &job_table, &rowids),
+                    move |result| match result {
+                        Ok(count) => Message::RowsDeleted { table, count },
+                        Err(error) => Message::EditFailed(error),
+                    },
+                );
+            }
+            ConfirmKind::ClearTable { table, keep } => {
+                let job_table = table.clone();
+                self.spawn_db(
+                    move |conn| db::write::clear_table(conn, &job_table, &keep),
+                    move |result| match result {
+                        Ok(count) => Message::RowsDeleted { table, count },
+                        Err(error) => Message::EditFailed(error),
+                    },
+                );
+            }
+        }
     }
 
     /// Runs blocking database work off the UI thread and reports its outcome,
@@ -1864,6 +1692,13 @@ impl App {
         }
     }
 
+    fn clamp_sidebar_selection(&mut self) {
+        let total = self.sidebar.visible_count(&self.schema);
+        if self.sidebar.selected >= total {
+            self.sidebar.selected = total.saturating_sub(1);
+        }
+    }
+
     /// Starts a new grid read, making every older read response stale.
     fn next_grid_request(&mut self) -> u64 {
         self.grid_request_serial = self.grid_request_serial.wrapping_add(1);
@@ -1879,20 +1714,30 @@ impl App {
         self.navigation_request_serial
     }
 
-    /// Shows `popup`, invalidating lookups started for any previous popup, and
-    /// returns the request id for loading its content.
-    fn open_popup(&mut self, popup: PopupKind) -> u64 {
+    /// Makes lookups started for the current popup stale and returns the id
+    /// for a new one.
+    fn next_popup_request(&mut self) -> u64 {
         self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
-        self.popup = Some(popup);
-        self.mode = AppMode::Edit;
         self.popup_request_serial
     }
 
-    fn ensure_writable(&mut self) -> bool {
-        if self.readonly {
-            self.toast.push("Read-only database", ToastKind::Error);
+    /// Shows `popup` in place of any open popup and returns the request id for
+    /// loading its content.
+    fn open_popup(&mut self, popup: PopupKind) -> u64 {
+        self.popup_stack.clear();
+        self.popup = Some(popup);
+        self.mode = AppMode::Edit;
+        self.next_popup_request()
+    }
+
+    /// Shows `popup` over the open one, which returns when `popup` closes.
+    fn push_popup(&mut self, popup: PopupKind) -> u64 {
+        if let Some(current) = self.popup.take() {
+            self.popup_stack.push(current);
         }
-        !self.readonly
+        self.popup = Some(popup);
+        self.mode = AppMode::Edit;
+        self.next_popup_request()
     }
 
     /// Admits one database write at a time; its completion message releases the gate.
@@ -1913,9 +1758,14 @@ impl App {
         self.undo_stack.push_back(frame);
     }
 
+    /// Closes the top popup, restoring a popup suspended under it. Returns
+    /// whether a deferred external refresh ran.
     fn finish_popup(&mut self) -> bool {
-        self.popup_request_serial = self.popup_request_serial.wrapping_add(1);
-        self.popup = None;
+        self.next_popup_request();
+        self.popup = self.popup_stack.pop();
+        if self.popup.is_some() {
+            return false;
+        }
         self.mode = AppMode::Browse;
         if let Some(grid) = self.grid.as_mut() {
             grid.clamp_to_total_rows();
@@ -1937,7 +1787,7 @@ impl App {
         col_type: String,
         original: SqlValue,
     ) {
-        let readonly = self.readonly;
+        let readonly = self.is_readonly_view();
         self.open_popup(PopupKind::TextEditor(TextEditorState::new(
             table, rowid, col_name, col_type, original, readonly,
         )));
@@ -1970,119 +1820,206 @@ impl App {
         );
     }
 
-    fn active_table_name(&self) -> Option<String> {
+    pub(crate) fn active_table_name(&self) -> Option<String> {
         self.active_tab
             .and_then(|index| self.open_tabs.get(index))
             .map(|tab| tab.table_name.clone())
     }
 
+    /// The active grid, when it shows `table`.
+    fn grid_for(&mut self, table: &str) -> Option<&mut GridState> {
+        self.grid.as_mut().filter(|grid| grid.table_name == table)
+    }
+
+    // ── tabs ─────────────────────────────────────────────────────────────
+
     fn open_table(&mut self, name: String) {
+        if self.schema.relation(&name).is_none() {
+            self.toast
+                .push(format!("{name:?} does not exist"), ToastKind::Error);
+            return;
+        }
         self.focus = FocusPane::Grid;
-        let index = match self.open_tabs.iter().position(|t| t.table_name == name) {
-            Some(index) => index,
+        match self.open_tabs.iter().position(|t| t.table_name == name) {
+            Some(index) if Some(index) == self.active_tab && self.grid.is_some() => {}
+            Some(index) => self.activate_tab(index),
             None => {
-                self.open_tabs.push(TableTab {
-                    table_name: name.clone(),
-                });
-                self.open_tabs.len() - 1
+                self.stash_active_grid();
+                self.open_tabs.push(TableTab::new(name.clone()));
+                self.active_tab = Some(self.open_tabs.len() - 1);
+                self.request_table_view(&name);
             }
-        };
-        self.active_tab = Some(index);
-        self.request_table_view(&name);
+        }
         self.dirty = true;
     }
 
+    /// Opens `table` and focuses the row with `rowid` once it is loaded.
+    fn open_table_at(&mut self, table: String, rowid: i64, col: Option<usize>) {
+        self.open_table(table.clone());
+        self.jump_to_rowid(table, rowid, col);
+    }
+
+    /// Keeps the active grid in its tab so switching back restores it.
+    fn stash_active_grid(&mut self) {
+        let (Some(index), Some(grid)) = (self.active_tab, self.grid.take()) else {
+            return;
+        };
+        if let Some(tab) = self.open_tabs.get_mut(index) {
+            if tab.table_name == grid.table_name {
+                tab.saved = Some(grid);
+            }
+        }
+    }
+
+    fn activate_tab(&mut self, idx: usize) {
+        if idx >= self.open_tabs.len() {
+            return;
+        }
+        self.focus = FocusPane::Grid;
+        if self.active_tab == Some(idx) && self.grid.is_some() {
+            return;
+        }
+        self.stash_active_grid();
+        self.active_tab = Some(idx);
+        self.show_active_tab();
+        self.dirty = true;
+    }
+
+    fn cycle_tab(&mut self, forward: bool) {
+        let count = self.open_tabs.len();
+        let Some(active) = self.active_tab.filter(|_| count > 1) else {
+            return;
+        };
+        let next = if forward {
+            (active + 1) % count
+        } else {
+            (active + count - 1) % count
+        };
+        self.activate_tab(next);
+    }
+
+    /// Shows the active tab's saved grid, refreshing its rows, or loads it.
+    fn show_active_tab(&mut self) {
+        let Some(index) = self.active_tab else {
+            self.grid = None;
+            return;
+        };
+        let name = self.open_tabs[index].table_name.clone();
+        match self.open_tabs[index].saved.take() {
+            Some(grid) if self.schema.relation(&name).is_some() => {
+                self.next_navigation_request();
+                self.invalidate_grid_requests();
+                self.grid = Some(grid);
+                self.refresh_active_grid_schema();
+            }
+            _ => self.request_table_view(&name),
+        }
+    }
+
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.open_tabs.len() {
+            return;
+        }
+        let closing_active = self.active_tab == Some(idx);
+        let next_active =
+            next_active_tab_after_close(self.active_tab, idx, self.open_tabs.len() - 1);
+        self.open_tabs.remove(idx);
+        self.active_tab = next_active;
+        if closing_active {
+            self.grid = None;
+            self.show_active_tab();
+        }
+        if self.active_tab.is_none() {
+            self.focus = FocusPane::Sidebar;
+            self.sidebar_visible = true;
+        }
+        self.dirty = true;
+    }
+
+    // ── grid loading ─────────────────────────────────────────────────────
+
+    /// Builds the grid for a table or view from the schema, applies its saved
+    /// view settings and starts loading rows and enum colours.
     fn request_table_view(&mut self, name: &str) {
         self.next_navigation_request();
         self.invalidate_grid_requests();
         self.grid = None;
-        if let Some(table) = self.schema.table(name) {
-            let (columns, fk_cols) = (table.columns.clone(), table.foreign_key_flags());
-            self.spawn_grid_fetch(name.to_string(), columns, fk_cols);
-        }
+        let Some(meta) = self.schema.relation(name) else {
+            self.toast
+                .push(format!("{name:?} no longer exists"), ToastKind::Error);
+            return;
+        };
+        let columns = meta.columns.clone();
+        let mut grid = GridState::new(GridInit {
+            table_name: name.to_string(),
+            fk_cols: meta.foreign_key_flags(),
+            enumerated_values: Vec::new(),
+            columns: columns.clone(),
+            rows: Vec::new(),
+            width_sample_rows: Vec::new(),
+            total_rows: 0,
+            area_width: self.grid_inner_area.map_or(0, |area| area.width),
+        });
+        grid.readonly = meta.is_view || !meta.has_mutable_rowid();
+        grid.apply_settings(view_settings::load(&self.db_path, name));
+        grid.count_known = false;
+        self.grid = Some(grid);
+        self.fetch_window_around_focus();
+
+        let table = name.to_string();
+        let job_table = table.clone();
+        self.spawn_db(
+            move |conn| db::enum_value_sets(conn, &job_table, &columns),
+            move |result| match result {
+                Ok(sets) => Message::EnumValuesReady { table, sets },
+                // Colours are a nicety; a failed scan leaves values uncoloured.
+                Err(_) => Message::EnumValuesReady {
+                    table,
+                    sets: Vec::new(),
+                },
+            },
+        );
     }
 
+    /// Brings the active grid in line with the schema, keeping its focus,
+    /// sort, filters and column settings for columns that still exist, and
+    /// reloads its rows.
     fn refresh_active_grid_schema(&mut self) {
         self.next_navigation_request();
-        let Some(current_grid) = self.grid.as_ref() else {
+        let Some(table) = self.grid.as_ref().map(|grid| grid.table_name.clone()) else {
             if let Some(table) = self.active_table_name() {
                 self.request_table_view(&table);
             }
             return;
         };
-        let table = current_grid.table_name.clone();
-        let Some(table_meta) = self.schema.table(&table) else {
+        let Some(meta) = self.schema.relation(&table) else {
             self.invalidate_grid_requests();
             self.grid = None;
-            self.toast.push(
-                format!("Table {table:?} no longer exists"),
-                ToastKind::Error,
-            );
+            self.toast
+                .push(format!("{table:?} no longer exists"), ToastKind::Error);
             return;
         };
-
-        let columns = table_meta.columns.clone();
-        let fk_cols = table_meta.foreign_key_flags();
-        let sort = current_grid.order_by().and_then(|order| {
-            let col_idx = columns
-                .iter()
-                .position(|column| column.name == order.column)?;
-            let direction = if order.ascending {
-                SortDir::Asc
-            } else {
-                SortDir::Desc
-            };
-            Some(SortSpec { col_idx, direction })
-        });
-        let mut filter = current_grid.filter.clone();
-        filter
-            .columns
-            .retain(|name, _| columns.iter().any(|column| &column.name == name));
-
+        let columns = meta.columns.clone();
+        let fk_cols = meta.foreign_key_flags();
+        let readonly = meta.is_view || !meta.has_mutable_rowid();
         let Some(grid) = self.grid.as_mut() else {
             return;
         };
-        grid.columns = columns;
-        grid.fk_cols = fk_cols;
-        grid.enumerated_values = vec![Vec::new(); grid.columns.len()];
-        grid.width_sample_rows.clear();
-        grid.focused_col = grid.focused_col.min(grid.columns.len().saturating_sub(1));
-        grid.h_scroll = 0;
-        grid.sort = sort;
-        grid.filter = filter;
-        grid.reset_to_top();
-        grid.window.total_rows = 0;
-        grid.recompute_col_widths(grid.avail_col_width);
-        self.fetch_window_around_focus();
+        if grid.columns != columns || grid.fk_cols != fk_cols {
+            grid.set_columns(columns, fk_cols);
+        }
+        grid.readonly = readonly;
+        self.refresh_grid_rows();
     }
 
-    fn spawn_grid_fetch(&mut self, table: String, columns: Vec<Column>, fk_cols: Vec<bool>) {
-        let request_id = self.next_grid_request();
-        let job_table = table.clone();
-        let job_columns = columns.clone();
-        self.spawn_db(
-            move |conn| {
-                let view = ViewQuery::table(&job_table);
-                let total = db::count_rows(conn, &view)?;
-                let fetched = db::fetch_rows(conn, &view, &job_columns, 0, INITIAL_ROW_LIMIT)?;
-                Ok((fetched, total))
-            },
-            move |result| match result {
-                Ok((fetched, total_rows)) => Message::GridDataReady {
-                    request_id,
-                    table,
-                    columns,
-                    fk_cols,
-                    fetched,
-                    total_rows,
-                },
-                Err(error) => Message::GridReadFailed {
-                    request_id,
-                    table,
-                    error,
-                },
-            },
-        );
+    /// Reloads the visible rows and the row count, keeping the rows on screen
+    /// until the new ones arrive.
+    fn refresh_grid_rows(&mut self) {
+        if let Some(grid) = self.grid.as_mut() {
+            grid.count_known = false;
+            grid.window.fetch_in_flight = false;
+            self.fetch_window_around_focus();
+        }
     }
 
     /// Starts a window fetch around the focused row unless one is already running.
@@ -2096,7 +2033,8 @@ impl App {
         }
     }
 
-    /// Reads the window around the focused row, superseding any read in flight.
+    /// Reads the window around the focused row, superseding any read in
+    /// flight. The row count is only recounted when the view changed.
     fn fetch_window_around_focus(&mut self) {
         let Some(grid) = self.grid.as_mut() else {
             return;
@@ -2112,12 +2050,17 @@ impl App {
         };
         grid.window.fetch_in_flight = true;
         let (offset, limit) = grid.window.fetch_params(grid.focused_row as i64);
+        let recount = !grid.count_known;
         let columns = grid.columns.clone();
         let table = view.table.clone();
         let request_id = self.next_grid_request();
         self.spawn_db(
             move |conn| {
-                let total = db::count_rows(conn, &view)?;
+                let total = if recount {
+                    Some(db::count_rows(conn, &view)?)
+                } else {
+                    None
+                };
                 let fetched = db::fetch_rows(conn, &view, &columns, offset, limit)?;
                 Ok((fetched, total))
             },
@@ -2140,115 +2083,155 @@ impl App {
         self.dirty = true;
     }
 
-    fn on_grid_data_ready(
+    fn on_window_ready(
         &mut self,
         table: String,
-        columns: Vec<Column>,
-        fk_cols: Vec<bool>,
-        fetched: db::FetchedRows,
-        total_rows: i64,
+        offset: i64,
+        rows: Vec<Vec<SqlValue>>,
+        rowids: Vec<Option<i64>>,
+        total_rows: Option<i64>,
     ) {
-        if self.active_table_name().as_deref() == Some(table.as_str()) {
-            let mut grid = GridState::new(crate::grid::GridInit {
-                table_name: table.clone(),
-                enumerated_values: (0..columns.len())
-                    .map(|column| inferred_enumerated_values(&fetched.rows, column, total_rows))
-                    .collect(),
-                columns,
-                fk_cols,
-                width_sample_rows: fetched.rows.clone(),
-                rows: fetched.rows,
-                total_rows,
-                area_width: self.grid_inner_area.map_or(0, |area| area.width),
-            });
-            grid.window.rowids = fetched.rowids;
-            let saved_filter = crate::filter::load_filter(&self.db_path, &table)
-                .ok()
-                .filter(|filter| !filter.is_empty());
-            let filtered = saved_filter.is_some();
-            if let Some(filter) = saved_filter {
-                grid.filter = filter;
+        let counted = total_rows.is_some();
+        if let Some(grid) = self.grid_for(&table) {
+            if grid.width_sample_rows.is_empty() && !rows.is_empty() {
+                grid.set_width_sample(rows.clone());
             }
-            self.grid = Some(grid);
-            if filtered {
-                self.fetch_window_around_focus();
+            grid.window.offset = offset;
+            grid.window.rows = rows;
+            grid.window.rowids = rowids;
+            if let Some(total) = total_rows {
+                grid.window.total_rows = total;
+                grid.count_known = true;
+            }
+            grid.window.fetch_in_flight = false;
+            grid.load_error = None;
+            grid.clamp_to_total_rows();
+            grid.needs_fetch = false;
+            grid.check_needs_fetch();
+        }
+        if counted {
+            if let Some(target) = self
+                .pending_jump_target
+                .clone()
+                .filter(|t| t.table == table)
+            {
+                self.pending_jump_target = None;
+                self.jump_to_rowid(target.table, target.rowid, target.col);
             }
         }
         self.dirty = true;
     }
 
+    /// Focuses the row with `rowid` in `table`'s current view. Waits for the
+    /// table to be open and counted when it is not yet.
     fn jump_to_rowid(&mut self, table: String, rowid: i64, col: Option<usize>) {
-        let target = self
+        let ready = self
             .grid
             .as_ref()
-            .filter(|grid| grid.table_name == table)
-            .map(|grid| (grid.view_query(), col.unwrap_or(grid.focused_col)));
-        let Some((view, target_col)) = target else {
-            self.pending_jump_target = Some(PendingJumpTarget { table, rowid, col });
-            self.dirty = true;
+            .filter(|grid| grid.table_name == table && grid.count_known)
+            .map(GridState::view_query);
+        let view = match ready {
+            None => {
+                self.pending_jump_target = Some(PendingJumpTarget { table, rowid, col });
+                return;
+            }
+            Some(Err(error)) => {
+                self.toast.push(error.to_string(), ToastKind::Error);
+                return;
+            }
+            Some(Ok(view)) => view,
+        };
+        let request_id = self.next_navigation_request();
+        self.spawn_db(
+            move |conn| db::fetch_offset_for_rowid(conn, &view, rowid),
+            move |result| match result {
+                Ok(offset) => Message::JumpOffsetReady {
+                    request_id,
+                    table,
+                    offset,
+                    col,
+                },
+                Err(error) => Message::NavigationFailed { request_id, error },
+            },
+        );
+    }
+
+    fn save_view_settings(&mut self) {
+        let Some(grid) = self.grid.as_ref() else {
             return;
         };
-        let offset = view.and_then(|view| {
-            let conn = self.pool.get()?;
-            db::fetch_offset_for_rowid(&conn, &view, rowid)
-        });
-        match offset {
-            Ok(Some(target_row)) => {
-                self.update_grid(|grid| grid.focus_cell(target_row as usize, target_col));
-            }
-            Ok(None) => self
-                .toast
-                .push("Row not found in current view", ToastKind::Error),
-            Err(err) => self
-                .toast
-                .push(format!("Row lookup failed: {}", err), ToastKind::Error),
+        if let Err(error) = view_settings::save(&grid.settings(), &self.db_path, &grid.table_name) {
+            self.toast.push(
+                format!("Could not save the view settings: {error}"),
+                ToastKind::Error,
+            );
         }
-        self.dirty = true;
     }
 
     fn apply_column_filter(&mut self, col_name: String, col_filter: crate::filter::ColumnFilter) {
         self.next_navigation_request();
         if let Some(grid) = self.grid.as_mut() {
-            if col_filter.rules.iter().any(|rule| rule.enabled) {
+            if !col_filter.rules.is_empty() {
                 grid.filter.columns.insert(col_name, col_filter);
             } else {
                 grid.filter.columns.remove(&col_name);
             }
             grid.reset_to_top();
-            if let Err(error) =
-                crate::filter::save_filter(&grid.filter, &self.db_path, &grid.table_name)
-            {
-                self.toast
-                    .push(format!("Could not save filter: {error}"), ToastKind::Error);
-            }
+            self.save_view_settings();
             self.fetch_window_around_focus();
         }
         self.dirty = true;
     }
+}
 
-    fn close_tab(&mut self, idx: usize) {
-        if idx < self.open_tabs.len() {
-            let next_active =
-                next_active_tab_after_close(self.active_tab, idx, self.open_tabs.len() - 1);
-            self.open_tabs.remove(idx);
-            self.active_tab = next_active;
-            if let Some(table) = self.active_table_name() {
-                self.request_table_view(&table);
-            } else {
-                self.grid = None;
-            }
-            self.dirty = true;
+/// The confirmation for deleting an all-rows selection. Without filters the
+/// table is cleared except the deselected rows; with filters only the rows of
+/// the filtered view are deleted.
+fn delete_all_confirmation(
+    conn: &rusqlite::Connection,
+    view: &ViewQuery,
+    columns: &[Column],
+    except: &[i64],
+    filtered: bool,
+) -> anyhow::Result<Option<(String, ConfirmKind)>> {
+    let table = view.table.clone();
+    if filtered {
+        let except: std::collections::BTreeSet<i64> = except.iter().copied().collect();
+        let fetched = db::fetch_rows(conn, view, columns, 0, i64::MAX)?;
+        let rowids: Vec<i64> = fetched
+            .rowids
+            .into_iter()
+            .enumerate()
+            .filter(|(offset, _)| !except.contains(&(*offset as i64)))
+            .filter_map(|(_, rowid)| rowid)
+            .collect();
+        if rowids.is_empty() {
+            return Ok(None);
         }
+        let message = format!(
+            "Delete the {} rows matching the filters? [y/n]",
+            rowids.len()
+        );
+        return Ok(Some((
+            message,
+            ConfirmKind::DeleteSelectedRows { table, rowids },
+        )));
     }
-
-    fn activate_tab(&mut self, idx: usize) {
-        if idx < self.open_tabs.len() {
-            self.active_tab = Some(idx);
-            let table = self.open_tabs[idx].table_name.clone();
-            self.request_table_view(&table);
-            self.dirty = true;
-        }
+    let keep = db::fetch_rowids_at_offsets(conn, view, except)?;
+    let total_rows = db::count_rows(conn, &ViewQuery::table(&table))?;
+    let deleting = total_rows - keep.len() as i64;
+    if deleting <= 0 {
+        return Ok(None);
     }
+    let message = if keep.is_empty() {
+        format!("Delete all {total_rows} rows from {table}? [y/n]")
+    } else {
+        format!(
+            "Delete {deleting} rows from {table}, keeping {} deselected? [y/n]",
+            keep.len()
+        )
+    };
+    Ok(Some((message, ConfirmKind::ClearTable { table, keep })))
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -2276,38 +2259,6 @@ fn base64_encode(data: &[u8]) -> String {
 
 fn should_use_value_picker(values: &[String]) -> bool {
     !values.is_empty() && values.len() <= VALUE_PICKER_DISTINCT_LIMIT
-}
-
-fn normalize_enumerated_values(values: Vec<String>, total_rows: i64) -> Vec<String> {
-    if values.is_empty()
-        || values.len() >= ENUM_COLOR_DISTINCT_LIMIT
-        || values.iter().any(|value| value.chars().count() > 20)
-        || (total_rows > 0 && values.len() as i64 == total_rows)
-    {
-        Vec::new()
-    } else {
-        values
-    }
-}
-
-fn inferred_enumerated_values(
-    rows: &[Vec<SqlValue>],
-    column: usize,
-    total_rows: i64,
-) -> Vec<String> {
-    let mut values = rows
-        .iter()
-        .filter_map(|row| row.get(column))
-        .filter_map(|value| match value {
-            SqlValue::Null | SqlValue::Blob(_) => None,
-            SqlValue::Integer(value) => Some(value.to_string()),
-            SqlValue::Real(value) => Some(value.to_string()),
-            SqlValue::Text(value) => Some(value.clone()),
-        })
-        .collect::<Vec<_>>();
-    values.sort();
-    values.dedup();
-    normalize_enumerated_values(values, total_rows)
 }
 
 fn next_active_tab_after_close(

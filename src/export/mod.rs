@@ -31,86 +31,111 @@ impl ExportFormat {
     }
 }
 
-/// Streams every row of `view` into `path`, replacing it atomically, and returns
+/// Which rows an export writes.
+pub enum ExportRows<'a> {
+    /// Every row of the view, streamed.
+    View(&'a ViewQuery),
+    /// Rows already read, e.g. a selection.
+    Given(&'a [Vec<SqlValue>]),
+}
+
+/// Writes `rows` of `table` into `path`, replacing it atomically, and returns
 /// the number of exported rows.
 pub fn export(
     conn: &Connection,
     format: ExportFormat,
-    view: &ViewQuery,
+    table: &str,
     columns: &[Column],
+    rows: ExportRows<'_>,
     path: &Path,
 ) -> anyhow::Result<u64> {
-    atomic_export(path, |file| match format {
-        ExportFormat::Csv => write_csv(conn, view, columns, file),
-        ExportFormat::Json => write_json(conn, view, columns, file),
-        ExportFormat::Sql => write_sql(conn, view, columns, file),
+    atomic_export(path, |file| {
+        write_rows(format, table, columns, file, |emit| match rows {
+            ExportRows::View(view) => visit_rows(conn, view, columns, |row| emit(&row)),
+            ExportRows::Given(rows) => emit_all(rows, emit),
+        })
     })
 }
 
-fn write_csv(
-    conn: &Connection,
-    view: &ViewQuery,
+/// `rows` as text in `format`, for the clipboard.
+pub fn rows_to_text(
+    format: ExportFormat,
+    table: &str,
     columns: &[Column],
-    file: File,
-) -> anyhow::Result<u64> {
-    let mut writer = csv::Writer::from_writer(file);
-    writer.write_record(columns.iter().map(|column| column.name.as_str()))?;
-    let count = visit_rows(conn, view, columns, |row| {
-        writer.write_record(row.iter().map(val_to_str))?;
-        Ok(())
+    rows: &[Vec<SqlValue>],
+) -> anyhow::Result<String> {
+    let mut out = Vec::new();
+    write_rows(format, table, columns, &mut out, |emit| {
+        emit_all(rows, emit)
     })?;
-    writer.flush()?;
-    Ok(count)
+    Ok(String::from_utf8(out)?)
 }
 
-fn write_json(
-    conn: &Connection,
-    view: &ViewQuery,
+type Emit<'a> = dyn FnMut(&[SqlValue]) -> anyhow::Result<()> + 'a;
+
+fn emit_all(rows: &[Vec<SqlValue>], emit: &mut Emit<'_>) -> anyhow::Result<u64> {
+    for row in rows {
+        emit(row)?;
+    }
+    Ok(rows.len() as u64)
+}
+
+/// Writes the rows that `drive` feeds to its emitter in `format`.
+fn write_rows<W: Write>(
+    format: ExportFormat,
+    table: &str,
     columns: &[Column],
-    file: File,
+    out: W,
+    drive: impl FnOnce(&mut Emit<'_>) -> anyhow::Result<u64>,
 ) -> anyhow::Result<u64> {
-    let mut out = BufWriter::new(file);
-    out.write_all(b"[")?;
-    let mut first = true;
-    let count = visit_rows(conn, view, columns, |row| {
-        if !first {
-            out.write_all(b",")?;
+    match format {
+        ExportFormat::Csv => {
+            let mut writer = csv::Writer::from_writer(out);
+            writer.write_record(columns.iter().map(|column| column.name.as_str()))?;
+            let count = drive(&mut |row| {
+                writer.write_record(row.iter().map(val_to_str))?;
+                Ok(())
+            })?;
+            writer.flush()?;
+            Ok(count)
         }
-        first = false;
-        serde_json::to_writer(&mut out, &row_to_json(columns, &row))?;
-        Ok(())
-    })?;
-    out.write_all(b"]\n")?;
-    out.flush()?;
-    Ok(count)
-}
-
-fn write_sql(
-    conn: &Connection,
-    view: &ViewQuery,
-    columns: &[Column],
-    file: File,
-) -> anyhow::Result<u64> {
-    let col_names = columns
-        .iter()
-        .map(|column| quote_identifier(&column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let quoted_table = view.quoted_table();
-    let mut out = BufWriter::new(file);
-    let count = visit_rows(conn, view, columns, |row| {
-        let values = row.iter().map(val_to_sql_literal).collect::<Vec<_>>();
-        writeln!(
-            out,
-            "INSERT INTO {} ({}) VALUES ({});",
-            quoted_table,
-            col_names,
-            values.join(", ")
-        )?;
-        Ok(())
-    })?;
-    out.flush()?;
-    Ok(count)
+        ExportFormat::Json => {
+            let mut out = BufWriter::new(out);
+            out.write_all(b"[")?;
+            let mut first = true;
+            let count = drive(&mut |row| {
+                if !first {
+                    out.write_all(b",")?;
+                }
+                first = false;
+                serde_json::to_writer(&mut out, &row_to_json(columns, row))?;
+                Ok(())
+            })?;
+            out.write_all(b"]\n")?;
+            out.flush()?;
+            Ok(count)
+        }
+        ExportFormat::Sql => {
+            let col_names = columns
+                .iter()
+                .map(|column| quote_identifier(&column.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let quoted_table = quote_identifier(table);
+            let mut out = BufWriter::new(out);
+            let count = drive(&mut |row| {
+                let values = row.iter().map(val_to_sql_literal).collect::<Vec<_>>();
+                writeln!(
+                    out,
+                    "INSERT INTO {quoted_table} ({col_names}) VALUES ({});",
+                    values.join(", ")
+                )?;
+                Ok(())
+            })?;
+            out.flush()?;
+            Ok(count)
+        }
+    }
 }
 
 /// One row as a JSON object keyed by column name. BLOBs have no JSON
@@ -237,10 +262,10 @@ mod tests {
     fn sorted_view(column: &str, ascending: bool, filter: &FilterSet) -> ViewQuery {
         let (where_clause, where_params) = filter_to_sql(filter).expect("compile filter");
         ViewQuery {
-            order_by: Some(OrderBy {
+            order_by: vec![OrderBy {
                 column: column.to_string(),
                 ascending,
-            }),
+            }],
             where_clause,
             where_params,
             ..ViewQuery::table("items")
@@ -282,7 +307,15 @@ again');
         let view = sorted_view("id", false, &filter);
         let path = temp_export_path("csv");
 
-        let count = export(&conn, ExportFormat::Csv, &view, &columns, &path).expect("export csv");
+        let count = export(
+            &conn,
+            ExportFormat::Csv,
+            &view.table,
+            &columns,
+            ExportRows::View(&view),
+            &path,
+        )
+        .expect("export csv");
         let content = read_export(&path);
         let mut reader = csv::Reader::from_reader(content.as_bytes());
 
@@ -337,7 +370,15 @@ next line', X'00FF');
         let view = sorted_view("id", true, &FilterSet::default());
         let path = temp_export_path("json");
 
-        let count = export(&conn, ExportFormat::Json, &view, &columns, &path).expect("export json");
+        let count = export(
+            &conn,
+            ExportFormat::Json,
+            &view.table,
+            &columns,
+            ExportRows::View(&view),
+            &path,
+        )
+        .expect("export json");
         let content = read_export(&path);
         let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid json");
 
@@ -374,8 +415,9 @@ next line', X'00FF');
         let count = export(
             &conn,
             ExportFormat::Sql,
-            &ViewQuery::table("items"),
+            "items",
             &columns,
+            ExportRows::View(&ViewQuery::table("items")),
             &path,
         )
         .expect("export sql");
@@ -385,6 +427,19 @@ next line', X'00FF');
         assert_eq!(
             content,
             "INSERT INTO \"items\" (\"id\", \"note\", \"payload\") VALUES (7, 'O''Reilly', X'00FF10');\n"
+        );
+    }
+
+    #[test]
+    fn given_rows_become_clipboard_text() {
+        let columns = vec![column("id", "INTEGER"), column("name", "TEXT")];
+        let rows = vec![vec![SqlValue::Integer(1), SqlValue::Text("a,b".into())]];
+        let csv = rows_to_text(ExportFormat::Csv, "t", &columns, &rows).expect("csv");
+        assert_eq!(csv, "id,name\n1,\"a,b\"\n");
+        let sql = rows_to_text(ExportFormat::Sql, "t", &columns, &rows).expect("sql");
+        assert_eq!(
+            sql,
+            "INSERT INTO \"t\" (\"id\", \"name\") VALUES (1, 'a,b');\n"
         );
     }
 }

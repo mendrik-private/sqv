@@ -3,8 +3,8 @@ use ratatui::{
     style::{Modifier, Style},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
 
+use super::widgets::text::{put, sanitize, text_width};
 use crate::app::{App, FocusPane};
 
 pub enum TabMouseAction {
@@ -12,59 +12,108 @@ pub enum TabMouseAction {
     Close(usize),
 }
 
-pub fn superscript_for_tab(app: &App, idx: usize) -> Option<&str> {
-    app.symbols.tab_shortcut(idx)
+/// Where one tab is drawn, laid out as `│ name[sup] × │`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabSlot {
+    index: usize,
+    x: u16,
+    width: u16,
+    /// Column of the close glyph.
+    close_x: u16,
 }
 
-/// The display width of a tab's name plus shortcut, and of the whole tab laid
-/// out as `│ name[sup] × │`, whose close glyph sits at offset `3 + label`.
-fn tab_widths(app: &App, idx: usize) -> (u16, u16) {
-    let name = app
-        .open_tabs
-        .get(idx)
-        .map_or(0, |tab| UnicodeWidthStr::width(tab.table_name.as_str()));
-    let shortcut = superscript_for_tab(app, idx).map_or(0, UnicodeWidthStr::width);
-    let label = (name + shortcut) as u16;
-    (label, label + 6)
+/// The tabs that fit, scrolled so the active tab is always visible, and
+/// whether tabs are hidden to the left or right. Shared by drawing and
+/// hit-testing so the two cannot disagree.
+struct TabLayout {
+    slots: Vec<TabSlot>,
+    more_left: bool,
+    more_right: bool,
+}
+
+/// Label width (name plus shortcut) and whole tab width of each tab.
+fn tab_widths(app: &App) -> Vec<(u16, u16)> {
+    app.open_tabs
+        .iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            let name = text_width(&sanitize(&tab.table_name));
+            let shortcut = app.symbols.tab_shortcut(index).map_or(0, text_width);
+            let label = (name + shortcut) as u16;
+            (label, label + 6)
+        })
+        .collect()
+}
+
+fn layout(area: Rect, app: &App) -> TabLayout {
+    let widths = tab_widths(app);
+    let active = app
+        .active_tab
+        .unwrap_or(0)
+        .min(widths.len().saturating_sub(1));
+    // Scroll right until the active tab fits, leaving room for the left marker.
+    let mut first = 0;
+    while first < active {
+        let marker = u16::from(first > 0);
+        let used: u16 = widths[first..=active].iter().map(|(_, w)| *w).sum();
+        if marker + used <= area.width.saturating_sub(1) {
+            break;
+        }
+        first += 1;
+    }
+    let more_left = first > 0;
+    let mut x = area.x + u16::from(more_left);
+    let right = area.right();
+    let mut slots = Vec::new();
+    let mut more_right = false;
+    for (index, &(label, width)) in widths.iter().enumerate().skip(first) {
+        let reserve = u16::from(index + 1 < widths.len());
+        if x + width + reserve > right && !slots.is_empty() {
+            more_right = true;
+            break;
+        }
+        slots.push(TabSlot {
+            index,
+            x,
+            width: width.min(right.saturating_sub(x)),
+            close_x: x + 3 + label,
+        });
+        x += width;
+    }
+    TabLayout {
+        slots,
+        more_left,
+        more_right,
+    }
 }
 
 pub fn render_tabbar(frame: &mut Frame, area: Rect, app: &App) {
-    if area.width == 0 || area.height == 0 {
+    if area.width == 0 || area.height == 0 || app.open_tabs.is_empty() {
         return;
     }
-
     let theme = &app.theme;
+    let symbols = &app.symbols;
     let buf = frame.buffer_mut();
     buf.set_style(area, Style::default().bg(theme.bg));
 
     let top_y = area.y;
-    let label_y = area.y + if area.height > 1 { 1 } else { 0 };
-    let join_y = area.y + area.height.saturating_sub(1);
+    let label_y = area.y + u16::from(area.height > 1);
+    let join_y = area.bottom() - 1;
     let has_roof = label_y > top_y;
     let has_join = area.height >= 3;
-
-    let mut x = area.x;
-    let right = area.x + area.width;
-
-    if app.open_tabs.is_empty() {
-        buf.set_string(
-            x,
-            label_y,
-            " sqview ",
-            Style::default()
-                .fg(theme.accent)
-                .bg(theme.bg_soft)
-                .add_modifier(Modifier::BOLD),
-        );
-        return;
+    let right = area.right();
+    let tabs = layout(area, app);
+    let marker_style = Style::default().fg(theme.fg_mute).bg(theme.bg);
+    if tabs.more_left {
+        put(buf, area.x, label_y, right, "‹", marker_style);
+    }
+    if tabs.more_right {
+        put(buf, right - 1, label_y, right, "›", marker_style);
     }
 
-    for (idx, tab) in app.open_tabs.iter().enumerate() {
-        if x >= right {
-            break;
-        }
-
-        let is_active = app.active_tab == Some(idx);
+    for slot in &tabs.slots {
+        let tab = &app.open_tabs[slot.index];
+        let is_active = app.active_tab == Some(slot.index);
         let is_focused_active = is_active && matches!(app.focus, FocusPane::Grid);
         let border_style = Style::default()
             .fg(if is_focused_active {
@@ -81,114 +130,83 @@ pub fn render_tabbar(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::default().fg(theme.fg_dim).bg(theme.bg_soft)
         };
-        let close_style = if is_focused_active {
-            base.fg(theme.accent)
+        let close_style = base.fg(if is_focused_active {
+            theme.accent
         } else {
-            base.fg(theme.fg_mute)
-        };
+            theme.fg_mute
+        });
         let num_style = Style::default().fg(theme.fg_mute).bg(if is_active {
             theme.bg_raised
         } else {
             theme.bg_soft
         });
-
-        let sup = superscript_for_tab(app, idx);
-        let (_, tab_width) = tab_widths(app, idx);
-        let tab_x = x;
+        let end = (slot.x + slot.width).min(right);
+        let inner = slot.width.saturating_sub(2) as usize;
 
         if has_roof {
-            let mut roof_x = tab_x;
-            roof_x = super::put(
-                buf,
-                roof_x,
-                top_y,
-                right,
-                &app.symbols.tab_top_left.to_string(),
-                border_style,
+            let roof = format!(
+                "{}{}{}",
+                symbols.tab_top_left,
+                symbols.box_horizontal.to_string().repeat(inner),
+                symbols.tab_top_right
             );
-            if tab_width > 2 {
-                roof_x = super::put(
-                    buf,
-                    roof_x,
-                    top_y,
-                    right,
-                    &app.symbols
-                        .box_horizontal
-                        .to_string()
-                        .repeat(tab_width.saturating_sub(2) as usize),
-                    border_style,
-                );
-            }
-            super::put(
-                buf,
-                roof_x,
-                top_y,
-                right,
-                &app.symbols.tab_top_right.to_string(),
-                border_style,
-            );
+            put(buf, slot.x, top_y, end, &roof, border_style);
         }
 
-        let mut label_x = tab_x;
-        label_x = super::put(
+        let mut x = put(
             buf,
-            label_x,
+            slot.x,
             label_y,
-            right,
-            &app.symbols.box_vertical.to_string(),
+            end,
+            &symbols.box_vertical.to_string(),
             border_style,
         );
-        label_x = super::put(buf, label_x, label_y, right, " ", base);
-        label_x = super::put(buf, label_x, label_y, right, &tab.table_name, base);
-        if let Some(s) = sup {
-            label_x = super::put(buf, label_x, label_y, right, s, num_style);
+        x = put(buf, x, label_y, end, " ", base);
+        x = put(buf, x, label_y, end, &sanitize(&tab.table_name), base);
+        if let Some(shortcut) = symbols.tab_shortcut(slot.index) {
+            x = put(buf, x, label_y, end, shortcut, num_style);
         }
-        label_x = super::put(buf, label_x, label_y, right, " ", base);
-        label_x = super::put(
+        x = put(buf, x, label_y, end, " ", base);
+        x = put(
             buf,
-            label_x,
+            x,
             label_y,
-            right,
-            &app.symbols.tab_close.to_string(),
+            end,
+            &symbols.tab_close.to_string(),
             close_style,
         );
-        label_x = super::put(buf, label_x, label_y, right, " ", base);
-        super::put(
+        x = put(buf, x, label_y, end, " ", base);
+        put(
             buf,
-            label_x,
+            x,
             label_y,
-            right,
-            &app.symbols.box_vertical.to_string(),
+            end,
+            &symbols.box_vertical.to_string(),
             border_style,
         );
 
         if is_active && has_join {
-            let mut join_x = tab_x;
-            let left_join = if tab_x == area.x {
-                app.symbols.box_vertical.to_string()
+            let left_join = if slot.x == area.x {
+                symbols.box_vertical
             } else {
-                app.symbols.tab_join_left.to_string()
+                symbols.tab_join_left
             };
-            let right_join = if tab_x.saturating_add(tab_width) >= right {
-                app.symbols.box_vertical.to_string()
+            let right_join = if slot.x + slot.width >= right {
+                symbols.box_vertical
             } else {
-                app.symbols.tab_join_right.to_string()
+                symbols.tab_join_right
             };
-            join_x = super::put(buf, join_x, join_y, right, &left_join, border_style);
-            if tab_width > 2 {
-                join_x = super::put(
-                    buf,
-                    join_x,
-                    join_y,
-                    right,
-                    &" ".repeat(tab_width.saturating_sub(2) as usize),
-                    base,
-                );
-            }
-            super::put(buf, join_x, join_y, right, &right_join, border_style);
+            let x = put(
+                buf,
+                slot.x,
+                join_y,
+                end,
+                &left_join.to_string(),
+                border_style,
+            );
+            let x = put(buf, x, join_y, end, &" ".repeat(inner), base);
+            put(buf, x, join_y, end, &right_join.to_string(), border_style);
         }
-
-        x = tab_x.saturating_add(tab_width).min(right);
     }
 }
 
@@ -199,33 +217,16 @@ pub fn hit_test(
     y: u16,
     middle_click: bool,
 ) -> Option<TabMouseAction> {
-    if area.width == 0
-        || area.height == 0
-        || y < area.y
-        || y >= area.y + area.height
-        || x < area.x
-        || x >= area.x + area.width
-    {
+    if !area.contains(ratatui::layout::Position { x, y }) {
         return None;
     }
-
-    let mut cursor = area.x;
-    let right = area.x + area.width;
-    for idx in 0..app.open_tabs.len() {
-        if cursor >= right {
-            break;
-        }
-        let (label_w, tab_width) = tab_widths(app, idx);
-        let tab_end = cursor.saturating_add(tab_width).min(right);
-        if x >= cursor && x < tab_end {
-            let close_x = cursor + 3 + label_w;
-            if middle_click || x == close_x {
-                return Some(TabMouseAction::Close(idx));
-            }
-            return Some(TabMouseAction::Activate(idx));
-        }
-        cursor = tab_end;
+    let slot = layout(area, app)
+        .slots
+        .into_iter()
+        .find(|slot| x >= slot.x && x < slot.x + slot.width)?;
+    if middle_click || x == slot.close_x {
+        Some(TabMouseAction::Close(slot.index))
+    } else {
+        Some(TabMouseAction::Activate(slot.index))
     }
-
-    None
 }

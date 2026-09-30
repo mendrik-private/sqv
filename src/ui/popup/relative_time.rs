@@ -1,21 +1,19 @@
+//! How far a date or datetime value is from now, for the status-bar preview.
+
 use chrono::{Local, NaiveDate, NaiveDateTime};
 
 use super::date_picker::{parse_date, parse_datetime};
 
-pub(crate) fn format_search_result_text(value: &str) -> String {
-    format_search_result_text_at(value, Local::now().naive_local())
+/// "yesterday", "3h ago", "in 7d"… for date and datetime text, else `None`.
+pub(crate) fn relative_label(value: &str) -> Option<String> {
+    relative_label_at(value, Local::now().naive_local())
 }
 
-fn format_search_result_text_at(value: &str, now: NaiveDateTime) -> String {
+fn relative_label_at(value: &str, now: NaiveDateTime) -> Option<String> {
     if let Some(dt) = parse_datetime(value) {
-        return format!("{} ({})", format_relative_datetime(dt, now), value);
+        return Some(format_relative_datetime(dt, now));
     }
-
-    if let Some(date) = parse_date(value) {
-        return format!("{} ({})", format_relative_date(date, now.date()), value);
-    }
-
-    value.to_string()
+    parse_date(value).map(|date| format_relative_date(date, now.date()))
 }
 
 fn format_relative_date(date: NaiveDate, today: NaiveDate) -> String {
@@ -78,7 +76,7 @@ fn compact_days(days: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_search_result_text_at;
+    use super::relative_label_at;
     use chrono::NaiveDate;
 
     #[test]
@@ -89,12 +87,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            format_search_result_text_at("2026-04-25", now),
-            "yesterday (2026-04-25)"
+            relative_label_at("2026-04-25", now).as_deref(),
+            Some("yesterday")
         );
         assert_eq!(
-            format_search_result_text_at("2026-05-03", now),
-            "in 7d (2026-05-03)"
+            relative_label_at("2026-05-03", now).as_deref(),
+            Some("in 7d")
         );
     }
 
@@ -106,12 +104,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            format_search_result_text_at("2026-04-26T10:30:00", now),
-            "1h ago (2026-04-26T10:30:00)"
+            relative_label_at("2026-04-26T10:30:00", now).as_deref(),
+            Some("1h ago")
         );
         assert_eq!(
-            format_search_result_text_at("2026-04-26T15:00:00", now),
-            "in 3h (2026-04-26T15:00:00)"
+            relative_label_at("2026-04-26T15:00:00", now).as_deref(),
+            Some("in 3h")
         );
     }
 
@@ -122,6 +120,6 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .unwrap();
 
-        assert_eq!(format_search_result_text_at("Alice", now), "Alice");
+        assert_eq!(relative_label_at("Alice", now), None);
     }
 }
